@@ -517,7 +517,7 @@ function setHiddenBatch(nodes, edges, on) {
   const nn = nodes || [], ee = edges || [];
   let cn = 0, ce = 0;
   for (let k = 0; k < nn.length && k < HID_MAX; k++) { const i = nn[k]; if (i >= 0 && i < G.n && nHid[i] !== (on ? 1 : 0)) { nHid[i] = on ? 1 : 0; cn++; } }
-  for (let k = 0; k < ee.length && k < HID_MAX; k++) { const e = ee[k]; if (e >= 0 && e < G.e && eHid[e] !== (on ? 1 : 0)) { eHid[e] = on ? 1 : 0; ce++; } }
+  for (let k = 0; k < ee.length && k < HID_MAX; k++) { const e = ee[k]; if (e >= 0 && e < G.e && eHid[e] !== (on ? 1 : 0)) { eHid[e] = on ? 1 : 0; histEdgeDirty = 1; ce++; } }
   if (!cn && !ce) { unSnapshot(); return { nodes: 0, edges: 0 }; }
   markDirty();
   if (ce) afterEdgeParamChange(ee.slice(0, Math.min(ee.length, HID_MAX)));
@@ -545,7 +545,7 @@ function hiddenCount() {
 function showAllHidden() {
   let n = 0, e = 0;
   for (let i = 0; i < G.n; i++) if (nHid[i]) { nHid[i] = 0; n++; }
-  for (let k = 0; k < G.e; k++) if (eHid[k]) { eHid[k] = 0; e++; }
+  for (let k = 0; k < G.e; k++) if (eHid[k]) { eHid[k] = 0; e++; histEdgeDirty = 1; }
   if (!n && !e) return { nodes: 0, edges: 0 };
   markDirty(); rebuildScene(); refreshAll();
   return { nodes: n, edges: e };
@@ -1178,6 +1178,7 @@ function expandBlock(b, maxW) {
     const rest = blockGroupMembers(sgWas);
     if (rest.length === 1) blocks[rest[0]].sg = 0;
   }
+  histEdgeDirty = 1; histWDirty = 1;
   ensureEdgeCapacity(want + 8);
   for (let i = 0; i < b.k; i++) {
     for (let j = 0; j < b.n; j++) {
@@ -1224,9 +1225,40 @@ function histChunkSize(cap) {
 }
 /* 一列 = 一个平铺数组；stride = 每个对象占几个元素，count() = 当前有几个对象 */
 const HIST = { cols: [] };
-function histReg(arr, stride, count, getArr) {
+/* ---- 快照的「登记」快速路 ---------------------------------------------------
+   判断「这一列从上一格到现在变过没有」原本只有一招：整列逐元素比一遍。那招是构造上正确的，
+   但要读满整列——born-wired-cortex 上六个边列 1681 万条，一趟就是 600 MB 内存流量（实测一格
+   225 ms，而且是纯带宽打满，跟分块宽度无关：1024 和 32768 的块各量一遍，差不出 20%）。
+   所以加了第二招：**边数组的每个写入点都打一个标记**，没打标记的组不扫，直接把上一格的分块表
+   整张沿用（内容一模一样，共享同一份内存，这就是结构共享本来该有的样子）。
+   登记漏一处＝静默丢改动，所以两招不是二选一：登记是快速路，比对是**裁判**。
+   HIST_VERIFY 打开时（自测 / 排障 / NF.histVerify(true)）每一次快照都照样整列比一遍，
+   只要发现「登记说没动、其实动了」就记一次 miss —— 漏打的钩子会当场变成可读的报错，
+   而不是几个月后某次撤销莫名其妙回错一格。
+   钩子在源码里长这样：histEdgeDirty = 1;（写成赋值而不是函数调用：它可能落在逐边的热循环里，
+   函数调用要按边数付钱）。改完可以用 node prototype/check_histhook.mjs 静态复查一遍：
+   它会列出「写边数组的地方却找不到钩子」的行号。 */
+let histEdgeDirty = 1;   /* 连接列（eSrc/eDst/eW/eLock/eId/eHid）可能变过：1 = 要扫 */
+let histSelDirty = 1;    /* 连接选中列（selE）可能变过：1 = 要扫。它是 G.e 长度的，大模型上比神经元列贵得多 */
+let histWDirty = 1;      /* 权值列（eW）可能变过：1 = 要扫。**跟拓扑分开**：调参 / 学习 / 剪枝归零都只动这一列，
+                            大模型上单扫它 26 ms，扫「拓扑 + 权重」六列要 236 ms —— 最常见的那个动作不该陪着拓扑一起付钱 */
+let HIST_VERIFY = false; /* 裁判模式：不走近路，整列比一遍，并核对登记有没有漏 */
+let histForceAll = 0;    /* 下一拍强制整列比一遍：「当前值」可能被外部写动过（restore / unSnapshot 之后） */
+/* 这一组「登记」过写入没有。现在只有 edge 这一组（见 histEdgeDirty）；
+   没分组的列一律返回真 = 照旧每拍整列比一遍（神经元那几列本来就小，不值得为它们到处插钩子）。 */
+function histGrpDirty(grp) {
+  if (grp === 'edge') return !!histEdgeDirty;
+  if (grp === 'sel') return !!histSelDirty;
+  if (grp === 'w') return !!histWDirty;
+  return true;   /* 没分组的列（神经元那几列）照旧每拍整列比：本来就小，不值得为它们到处插钩子 */
+}
+/* checks = 裁判比过的列数；miss = 真漏报（近路本来会走、一走就吞改动的那种）；
+   soft = 登记干净、但块边界对不上只能全比（结果照样对，只是没搭上近路）——用来区分
+   「钩子漏了」和「长了一条边把最后一块撑长了」，不然裁判会天天误报。 */
+const HISTV = { checks: 0, miss: 0, missAt: [], fast: 0, soft: 0 };
+function histReg(arr, stride, count, getArr, grp, tag) {
   HIST.cols.push({ arr, getArr: getArr, stride, count, size: histChunkSize(arr.length), prev: null,
-                   copied: 0, live: 0, chunks: 0 });
+                   copied: 0, live: 0, chunks: 0, grp: grp || '', tag: tag || '' });
 }
 /* 容量增长会把整块数组换掉（见 growCpuTables）。撤销快照的每一列都抓着
    "当初那个数组"的引用，不跟着换的话，撤销会一头写进已经没人看的老数组里——
@@ -1237,6 +1269,22 @@ function histRebind() {
     const c = HIST.cols[k];
     const a = c.getArr ? c.getArr() : c.arr;
     if (a && a !== c.arr) c.arr = a;
+    /* 顺手把分块宽度重算一遍 —— **只在还没拍过任何一格的时候**（c.prev === null 就表示这一列
+       的分块边界还没被任何快照引用过，此时挪边界谁也影响不到）。
+       为什么必须重算：分块宽度是在注册那一刻按「当时那个小数组」算死的，而数组是后面加
+       神经元 / 载入工程时长上去的，于是 1681 万条的边列一直按最小块 1024 切 —— 一列 16423 块，
+       六个边列加起来十万个小对象。逐块比较要在堆里跳十万次（缓存 / TLB 全打散），
+       而且还白喂垃圾回收：实测一次快照要扫 324 MB、跑 225 ms。
+       按设计目标（每列 ~1024 块）重算之后，一列只剩 513 块，块本身也大得多、贴在一起。 */
+    /* 数组一变长就重算分块宽度（只在「变宽」的时候算，单调收敛不会来回抖）。
+       这里**不再要求 c.prev === null**：每一格快照自己记着当时的宽度（见 captureState 的 sizes /
+       restore），所以挪边界影响不到已经在栈里的那些格。丢掉 prev 只是因为老块边界跟新宽度对不上，
+       留着也只会让下一拍整列重拷一遍 —— 不如干脆丢掉，语义清楚。
+       效果：1681 万条的边列从「按最小块 1024 切成 16423 块」变成 513 块。 */
+    if (a) {
+      const want = histChunkSize(a.length);
+      if (want > c.size) { c.size = want; c.prev = null; }
+    }
   }
 }
 /* 逐元素比。类型化数组的紧凑循环，V8 会编成接近内存带宽的代码 */
@@ -1250,23 +1298,52 @@ function histCaptureCol(c) {
   const liveLen = Math.min(arr.length, c.count() * c.stride);
   const nch = Math.ceil(liveLen / size);
   const prev = c.prev;
+  const grp = c.grp;
+  const clean = !!grp && !histGrpDirty(grp);
+  /* 近路能不能走，判据必须**逐条等于**慢路的结果：块数一样、界内长度一样、
+     最后一块的长度也一样。少一条就会在「末尾那块被撑长 / 缩短」的时候整张沿用，
+     把改动吞掉。 */
+  const lastLen = nch ? liveLen - (nch - 1) * size : 0;
+  const wouldFast = clean && prev && prev.length === nch && liveLen === c.live &&
+                    (!nch || (prev[nch - 1] && prev[nch - 1].length === lastLen));
+  /* 登记说没动过 + 块边界跟上一拍一模一样 + 没有「被外部写动过」的怀疑：
+     整张沿用上一拍 —— **共享同一份内存，一个字节都不拷**。这才是结构共享本来该有的样子。
+     注意这个近路是"可能错、但错了会被抓住"的那种：登记漏一处就会错，所以下面还有裁判。 */
+  if (wouldFast && !HIST_VERIFY && !histForceAll) {
+    HISTV.fast++;   /* 走了近路的列数：自测靠它断言「这条近路真的在跑」，不是写了没人走 */
+    c.copied = 0; c.chunks = nch;
+    return prev;
+  }
   const out = new Array(nch);
   let copied = 0;
   for (let k = 0; k < nch; k++) {
     const off = k * size;
     const len = Math.min(size, liveLen - off);
     const old = prev && k < prev.length ? prev[k] : null;
-    if (old !== null && old.length === len && histSame(arr, off, len, old)) { out[k] = old; continue; }
+    if (old && old.length === len && histSame(arr, off, len, old)) { out[k] = old; continue; }
     out[k] = arr.slice(off, off + len);
     copied++;
   }
   c.prev = out; c.copied = copied; c.live = liveLen; c.chunks = nch;
+  /* 裁判：近路本来会走、真比一遍却发现有块不一致 = 登记漏了一处（这一走就吞改动，是真错）。
+     当场记下来，别等几个月之后某一次撤销莫名其妙回错一格。自测里常开（NF.histVerify(true)）。
+     另一种（登记干净但块边界对不上 → 只能全比）结果是对的，只记 soft 不报错。 */
+  if (HIST_VERIFY && grp) {
+    HISTV.checks++;
+    if (copied > 0) {
+      if (wouldFast) { HISTV.miss++; if (HISTV.missAt.length < 64) HISTV.missAt.push(c.tag + '#' + copied); }
+      else if (clean) HISTV.soft++;
+    }
+  }
   return out;
 }
 /* 把某一格的分块重新认作"当前值"（撤销 / 重做 / 中途撤掉一格时用） */
 function histAdopt(state) {
   if (!state) return;
   for (let ci = 0; ci < HIST.cols.length; ci++) HIST.cols[ci].prev = state.cols[ci];
+  /* prev 是「认」上去的，不是比出来的：万一这一格之后数组被写动过（操作没通过校验、
+     半路退出的那种），整张沿用就会把改动吞掉。所以下一拍强制整列比一遍。 */
+  histForceAll = 1;
 }
 histReg(nPos, 3, () => G.n, () => nPos);
 histReg(nIO, 1, () => G.n, () => nIO);
@@ -1278,14 +1355,14 @@ histReg(nColOn, 1, () => G.n, () => nColOn);
 histReg(nThr, 1, () => G.n, () => nThr);
 histReg(nGroup, 1, () => G.n, () => nGroup);
 histReg(nHid, 1, () => G.n, () => nHid);
-histReg(eSrc, 1, () => G.e, () => eSrc);
-histReg(eDst, 1, () => G.e, () => eDst);
-histReg(eW, 1, () => G.e, () => eW);
-histReg(eLock, 1, () => G.e, () => eLock);
-histReg(eId, 1, () => G.e, () => eId);
-histReg(eHid, 1, () => G.e, () => eHid);
+histReg(eSrc, 1, () => G.e, () => eSrc, 'edge', 'eSrc');
+histReg(eDst, 1, () => G.e, () => eDst, 'edge', 'eDst');
+histReg(eW, 1, () => G.e, () => eW, 'w', 'eW');
+histReg(eLock, 1, () => G.e, () => eLock, 'edge', 'eLock');
+histReg(eId, 1, () => G.e, () => eId, 'edge', 'eId');
+histReg(eHid, 1, () => G.e, () => eHid, 'edge', 'eHid');
 histReg(selN, 1, () => G.n, () => selN);
-histReg(selE, 1, () => G.e, () => selE);
+histReg(selE, 1, () => G.e, () => selE, 'sel', 'selE');
 /* 历史占了多少：分块按对象身份去重，所以这个数字就是真实驻留内存 */
 function histStats() {
   const seen = new Set();
@@ -1640,8 +1717,14 @@ function opInfo(id) {
 const history = { stack: [], head: -1, limit: 60 };
 /* 当前状态的快照。撤销 / 重做都靠它。存法见上面 2.0 节。 */
 function captureState() {
-  const cols = new Array(HIST.cols.length);
-  for (let ci = 0; ci < HIST.cols.length; ci++) cols[ci] = histCaptureCol(HIST.cols[ci]);
+  const cols = new Array(HIST.cols.length), sizes = new Array(HIST.cols.length);
+  /* 每一格记下当时的**分块宽度**：分块宽度会随容量增长重算（见 histRebind），
+     快照自己不带宽度的话，撤销时按「现在的宽度」去索引老块就会错位。 */
+  for (let ci = 0; ci < HIST.cols.length; ci++) { sizes[ci] = HIST.cols[ci].size; cols[ci] = histCaptureCol(HIST.cols[ci]); }
+  /* 拍完才清登记（不是拍前）：扫描期间万一还有写入，那一笔必须留给下一拍，不能被吞掉。
+     也不能写在 histCaptureCol 里面：一个组有好几列，第一列扫完就清的话，同组后面的列
+     会误以为「没动过」而整张沿用。 */
+  histEdgeDirty = 0; histSelDirty = 0; histWDirty = 0; histForceAll = 0;
   return {
     n: G.n, e: G.e, name: G.name,
     nmc: nameCapture(),
@@ -1663,6 +1746,7 @@ function captureState() {
     opLand: opList.map((o) => o.land),
     selOps: new Set(selOps),
     cols,
+    sizes,
   };
 }
 /* 约定：每次改动**之前**调一次。推上去的是"改动前"的状态，
@@ -1684,16 +1768,21 @@ function restore(s) {
   for (let ci = 0; ci < HIST.cols.length; ci++) {
     const c = HIST.cols[ci], list = s.cols[ci];
     const liveLen = Math.min(c.arr.length, c.count() * c.stride);
-    const nch = Math.ceil(liveLen / c.size);
+    /* 宽度按**这一格自己的**来数：分块宽度会随容量增长重算（见 histRebind），
+       c.size 只代表「现在」，拿它去索引老快照的块会错位（错位就是静默的数据错乱，
+       所以 captureState 把每格的宽度一起存下来了）。老快照没记宽度就退回 c.size。 */
+    const size = (s.sizes && s.sizes[ci]) || c.size;
+    const nch = Math.ceil(liveLen / size);
     for (let k = 0; k < nch; k++) {
       const ch = list[k];
       if (!ch) continue;
-      const off = k * c.size;
-      const len = Math.min(c.size, liveLen - off);
+      const off = k * size;
+      const len = Math.min(size, liveLen - off);
       if (ch.length === len) c.arr.set(ch, off);
       else c.arr.set(ch.subarray(0, len), off);
     }
     c.prev = list;   /* 这一格现在就是"当前值" */
+    c.live = liveLen;  /* 还原之后 prev 覆盖的就是 live 区间：下一拍能直接整张沿用 */
   }
   nameRestore(s.nmc);
   /* 分组：成员表跟着快照走（这一行就把归属关系整个换回去了），主分组缓存由上面的分块列还原。
@@ -1757,6 +1846,7 @@ function redo() {
 }
 function resetHistory() {
   history.stack.length = 0; history.head = -1;
+  histEdgeDirty = 1; histSelDirty = 1; histWDirty = 1; histForceAll = 0;   /* 换了个世界（新建 / 载入）：别信上一份世界的登记 */
   snapshot(); updateUndoButtons();
 }
 function updateUndoButtons() {
@@ -4885,6 +4975,7 @@ function addEdge(s, d, w) {
     toast('已达连线数量绝对上限 ' + fmt(CAP_HARD_E) + '，装不下了（受内存物理限制）', 'err');
     return -1;
   }
+  histEdgeDirty = 1; histWDirty = 1;
   const e = G.e++;
   eSrc[e] = s; eDst[e] = d;
   eW[e] = w === undefined ? rngSym(0.7) : w;
@@ -4900,6 +4991,7 @@ function deleteNeurons(list) {
   if (!list.length) return;
   const del = new Uint8Array(G.n);
   for (const i of list) if (i >= 0 && i < G.n) del[i] = 1;
+  histEdgeDirty = 1; histWDirty = 1;
   let w = 0;
   for (let e = 0; e < G.e; e++) {
     if (del[eSrc[e]] || del[eDst[e]]) continue;
@@ -4933,6 +5025,7 @@ function deleteNeurons(list) {
   G.n = k;
   gremap(remap, k); gsyncPrimary();
   nName.clear(); newNames.forEach((v, kk) => nName.set(kk, v));
+  histEdgeDirty = 1;
   for (let e = 0; e < G.e; e++) { eSrc[e] = remap[eSrc[e]]; eDst[e] = remap[eDst[e]]; }
   /* 块里的神经元 id 也要跟着重编号，引用到被删神经元的行列直接摘掉 */
   if (blocks.length) { const r = blockRemapDrop(del, remap); if (r.dropped || r.retagged) selBlocks.clear(); }
@@ -4943,6 +5036,7 @@ function deleteEdges(list) {
   if (!list.length) return;
   const del = new Uint8Array(G.e);
   for (const e of list) if (e >= 0 && e < G.e) del[e] = 1;
+  histEdgeDirty = 1; histWDirty = 1;
   let w = 0;
   for (let e = 0; e < G.e; e++) {
     if (del[e]) continue;
@@ -5004,11 +5098,11 @@ function applyEdgeSelection(edges) {
   for (let k = 0; k < next.length; k++) seenMark(next[k]);
   for (let k = 0; k < selEList.length; k++) {
     const e = selEList[k];
-    if (!seenHas(e)) { selE[e] = 0; writeEdge(e, true); }
+    if (!seenHas(e)) { histSelDirty = 1; selE[e] = 0; writeEdge(e, true); }
   }
   for (let k = 0; k < next.length; k++) {
     const e = next[k];
-    if (!selE[e]) { selE[e] = 1; writeEdge(e, true); }
+    if (!selE[e]) { histSelDirty = 1; selE[e] = 1; writeEdge(e, true); }
   }
   selEList = next.slice();
 }
@@ -6007,8 +6101,8 @@ inspector.addEventListener('change', async (ev) => {
   else if (act === 'px') { snapshot(); moveNodes(nodes, parseFloat(t.value) - nPos[nodes[0] * 3], 0, 0); }
   else if (act === 'py') { snapshot(); moveNodes(nodes, 0, parseFloat(t.value) - nPos[nodes[0] * 3 + 1], 0); }
   else if (act === 'pz') { snapshot(); moveNodes(nodes, 0, 0, parseFloat(t.value) - nPos[nodes[0] * 3 + 2]); }
-  else if (act === 'w') { snapshot(); for (const e of edges) eW[e] = parseFloat(t.value) || 0; afterEdgeParamChange(edges); }
-  else if (act === 'elock') { snapshot(); for (const e of edges) eLock[e] = t.checked ? 1 : 0; plastBump(); afterEdgeParamChange(edges); }
+  else if (act === 'w') { snapshot(); histWDirty = 1; for (const e of edges) eW[e] = parseFloat(t.value) || 0; afterEdgeParamChange(edges); }
+  else if (act === 'elock') { snapshot(); histEdgeDirty = 1; for (const e of edges) eLock[e] = t.checked ? 1 : 0; plastBump(); afterEdgeParamChange(edges); }
   else if (act === 'sim-src') { SIM.sourceIO = t.checked; }
   else if (act === 'sim-learn') {
     SIM.learn = !!t.checked; updateSimInfo();
@@ -6238,8 +6332,8 @@ inspector.addEventListener('click', async (ev) => {
       toast('已选中该算子的 ' + fmt(o.land.length) + ' 个落点神经元');
       break;
     }
-    case 'wneg': snapshot(); for (const e of edges) eW[e] = -eW[e]; afterEdgeParamChange(edges); break;
-    case 'wzero': snapshot(); for (const e of edges) eW[e] = 0; afterEdgeParamChange(edges); break;
+    case 'wneg': snapshot(); histWDirty = 1; for (const e of edges) eW[e] = -eW[e]; afterEdgeParamChange(edges); break;
+    case 'wzero': snapshot(); histWDirty = 1; for (const e of edges) eW[e] = 0; afterEdgeParamChange(edges); break;
     case 'selin': selectEdgesOf(nodes, true); break;
     case 'selout': selectEdgesOf(nodes, false); break;
     case 'b-apply-io': snapshot(); setIOBatch(nodes, K); break;
@@ -6291,15 +6385,15 @@ inspector.addEventListener('click', async (ev) => {
     case 'b-unlock': snapshot(); for (const i of nodes) nLock[i] = 0; afterNodeParamChange(nodes); toast('已解冻 ' + nodes.length + ' 个神经元'); break;
     case 'b-move': snapshot(); moveNodes(nodes, fval('#b-dx'), fval('#b-dy'), fval('#b-dz')); toast('已平移选中神经元'); break;
     case 'b-scatter': snapshot(); { const r = fval('#b-scatter'); for (const i of nodes) { nPos[i * 3] += rngSym(r); nPos[i * 3 + 1] += rngSym(r * 0.5); nPos[i * 3 + 2] += rngSym(r); } afterNodePosChange(nodes); toast('已随机散布'); } break;
-    case 'b-w-set': snapshot(); { const v = fval('#b-w-v'); for (const e of edges) eW[e] = v; afterEdgeParamChange(edges); toast('权重已设为 ' + v); } break;
-    case 'b-w-add': snapshot(); { const v = fval('#b-w-v'); for (const e of edges) eW[e] += v; afterEdgeParamChange(edges); toast('权重已加 ' + v); } break;
-    case 'b-w-mul': snapshot(); { const v = fval('#b-w-v'); for (const e of edges) eW[e] *= v; afterEdgeParamChange(edges); toast('权重已乘 ' + v); } break;
-    case 'b-w-rand': snapshot(); for (const e of edges) eW[e] = rngSym(0.8); afterEdgeParamChange(edges); toast('已随机初始化'); break;
+    case 'b-w-set': snapshot(); histWDirty = 1; { const v = fval('#b-w-v'); for (const e of edges) eW[e] = v; afterEdgeParamChange(edges); toast('权重已设为 ' + v); } break;
+    case 'b-w-add': snapshot(); histWDirty = 1; { const v = fval('#b-w-v'); for (const e of edges) eW[e] += v; afterEdgeParamChange(edges); toast('权重已加 ' + v); } break;
+    case 'b-w-mul': snapshot(); histWDirty = 1; { const v = fval('#b-w-v'); for (const e of edges) eW[e] *= v; afterEdgeParamChange(edges); toast('权重已乘 ' + v); } break;
+    case 'b-w-rand': snapshot(); histWDirty = 1; for (const e of edges) eW[e] = rngSym(0.8); afterEdgeParamChange(edges); toast('已随机初始化'); break;
     case 'b-w-xavier': snapshot(); xavierInit(edges); toast('已 Xavier 初始化'); break;
-    case 'b-w-neg': snapshot(); for (const e of edges) eW[e] = -eW[e]; afterEdgeParamChange(edges); break;
-    case 'b-w-zero': snapshot(); for (const e of edges) eW[e] = 0; afterEdgeParamChange(edges); break;
-    case 'b-elock': snapshot(); for (const e of edges) eLock[e] = 1; afterEdgeParamChange(edges); break;
-    case 'b-eunlock': snapshot(); for (const e of edges) eLock[e] = 0; afterEdgeParamChange(edges); break;
+    case 'b-w-neg': snapshot(); histWDirty = 1; for (const e of edges) eW[e] = -eW[e]; afterEdgeParamChange(edges); break;
+    case 'b-w-zero': snapshot(); histWDirty = 1; for (const e of edges) eW[e] = 0; afterEdgeParamChange(edges); break;
+    case 'b-elock': snapshot(); histEdgeDirty = 1; for (const e of edges) eLock[e] = 1; afterEdgeParamChange(edges); break;
+    case 'b-eunlock': snapshot(); histEdgeDirty = 1; for (const e of edges) eLock[e] = 0; afterEdgeParamChange(edges); break;
   }
 });
 
@@ -6405,6 +6499,7 @@ inspector.addEventListener('input', (ev) => {
     const v = parseFloat(t.value);
     if (!isFinite(v)) return;
     if (!liveEdit) { liveEdit = true; snapshot(); }
+    histWDirty = 1;
     for (const e of edges) eW[e] = v;
     afterEdgeParamChange(edges);
     return;
@@ -6630,6 +6725,7 @@ function tuneWeights(o) {
   const st = tuneWeightStatsInit();
   let touched = 0, skipped = 0;
   const pre = op === 'xavier' ? xavierLimitsOfAll() : null;
+  histWDirty = 1;
   beginBatch();
   try {
     const one = (e) => {
@@ -6875,6 +6971,7 @@ function batchConnect(kind, opts) {
 function xavierInit(edges) {
   const fanIn = new Uint32Array(G.n), fanOut = new Uint32Array(G.n);
   for (let e = 0; e < G.e; e++) { fanOut[eSrc[e]]++; fanIn[eDst[e]]++; }
+  histWDirty = 1;
   for (const e of edges) {
     const lim = Math.sqrt(6 / Math.max(1, fanIn[eDst[e]] + fanOut[eSrc[e]]));
     eW[e] = rngSym(lim);
@@ -10702,6 +10799,7 @@ function deserialize(o) {
     for (let k = 0; k < o.hidden.n.length; k++) { const i = o.hidden.n[k] | 0; if (i >= 0 && i < count) nHid[i] = 1; }
   }
   rebuildAdjacency();
+  histEdgeDirty = 1; histWDirty = 1;
   for (const e of o.edges) {
     const k = G.e++;
     eSrc[k] = e[0]; eDst[k] = e[1]; eW[k] = e[2]; eLock[k] = e[3]; eHid[k] = 0; eId[k] = edgeSeq++;
@@ -11255,6 +11353,7 @@ function extApplyDoc(ext, all, nMap, nn, eMap) {
     const j = mapN(ext.hn[k] | 0);
     if (j >= 0 && j < nn) { nHid[j] = 1; c++; }
   }
+  histEdgeDirty = 1;
   if (ext.he.length) {
     if (all) {
       for (let k = 0; k < ext.he.length; k++) { const e = ext.he[k] | 0; if (e >= 0 && e < G.e) { eHid[e] = 1; c++; } }
@@ -11910,6 +12009,7 @@ async function nforge3Apply(ctx, ids) {
       nLock.set(raw.subarray(L.lock, L.lock + n), c.n0);
       nColOn.set(raw.subarray(L.colOn, L.colOn + n), c.n0);
       nCol.set(new Float32Array(raw.buffer, at4(L.col), n * 3), c.n0 * 3);
+      histEdgeDirty = 1; histWDirty = 1;
       eSrc.set(new Uint32Array(raw.buffer, at4(L.src), e), c.e0);
       eDst.set(new Uint32Array(raw.buffer, at4(L.dst), e), c.e0);
       eW.set(new Float32Array(raw.buffer, at4(L.w), e), c.e0);
@@ -11933,6 +12033,7 @@ async function nforge3Apply(ctx, ids) {
       const src = new Uint32Array(raw.buffer, at4(L.src), e);
       const dst = new Uint32Array(raw.buffer, at4(L.dst), e);
       const w = new Float32Array(raw.buffer, at4(L.w), e);
+      histEdgeDirty = 1; histWDirty = 1;
       for (let k = 0; k < e; k++) {
         const s2 = nMap[src[k]], d2 = nMap[dst[k]];
         if (s2 < 0 || d2 < 0) { dropped++; continue; }   /* 另一头没载入：丢掉并如实计数 */
@@ -12493,6 +12594,7 @@ async function streamMaterialize(k) {
   const dst = new Uint32Array(raw.buffer, at4(L2.dst), e);
   const w = new Float32Array(raw.buffer, at4(L2.w), e);
   let ee = G.e;
+  histEdgeDirty = 1; histWDirty = 1;
   for (let j = 0; j < e; j++) {
     const s2 = nBase + (src[j] - c.n0);
     const di = streamLiveN(dst[j]);
@@ -12508,6 +12610,7 @@ async function streamMaterialize(k) {
     ee++;
   }
   /* 之前挂在这块上的边：它们的 dst 就在这块里，现在补上 */
+  histEdgeDirty = 1; histWDirty = 1;
   const bucket = STREAM.parked[k];
   if (bucket.length) {
     STREAM.parked[k] = [];
@@ -12790,6 +12893,7 @@ function streamEvict(keepIds) {
     }
     keepE[e] = 1;
   }
+  histEdgeDirty = 1; histWDirty = 1; histSelDirty = 1;
   let ne = 0;
   for (let e = 0; e < oldE; e++) {
     if (!keepE[e]) continue;
@@ -13628,6 +13732,7 @@ function generateNetwork(count, nLayers, fanout) {
 }
 function addEdgeRaw(s, d, w) {
   if (!ensureEdgeCapacity(G.e + 1)) return;
+  histEdgeDirty = 1; histWDirty = 1;
   const e = G.e++;
   eSrc[e] = s; eDst[e] = d; eW[e] = w; eLock[e] = 0; eHid[e] = 0; eId[e] = edgeSeq++;
 }
@@ -13999,6 +14104,7 @@ function applyPlasticity(waveOf) {
   const list = plastEdgesOf();
   if (!list.length) return 0;
   let touched = 0;
+  histWDirty = 1;
   for (let k = 0; k < list.length; k++) {
     const e = list[k], s = eSrc[e], d = eDst[e];
     const ws = waveOf[s], wd = waveOf[d];
@@ -16220,6 +16326,7 @@ function pruneByWeight(th, mode, includeBlocks) {
   snapshot();
   let edges = 0;
   if (mode === 'drop') {
+    histEdgeDirty = 1; histWDirty = 1;
     let w = 0;
     for (let e = 0; e < G.e; e++) {
       if (Math.abs(eW[e]) < th) continue;
@@ -16230,6 +16337,7 @@ function pruneByWeight(th, mode, includeBlocks) {
     G.e = w;
     applyEdgeSelection([]);
   } else {
+    histWDirty = 1;
     for (let e = 0; e < G.e; e++) if (Math.abs(eW[e]) < th) { eW[e] = 0; edges++; }
   }
   let blkW = 0;
@@ -16254,6 +16362,7 @@ function pruneRandom(keep, includeBlocks) {
   keep = Math.max(0, Math.min(1, keep));
   snapshot();
   let dropped = 0, w = 0;
+  histEdgeDirty = 1; histWDirty = 1;
   for (let e = 0; e < G.e; e++) {
     if (rng() >= keep) { dropped++; continue; }
     eSrc[w] = eSrc[e]; eDst[w] = eDst[e]; eW[w] = eW[e]; eLock[w] = eLock[e]; eHid[w] = eHid[e]; eId[w] = eId[e];
@@ -16616,6 +16725,7 @@ function distPrune(o, b0, b1, mode) {
   if (mode === 'drop') {
     const hit = new Uint8Array(G.e);
     for (const e of ids) hit[e] = 1;
+    histEdgeDirty = 1; histWDirty = 1;
     let w = 0;
     for (let e = 0; e < G.e; e++) {
       if (hit[e]) continue;
@@ -16628,6 +16738,7 @@ function distPrune(o, b0, b1, mode) {
     rebuildAdjacency(); rebuildScene(); refreshAll(); markDirty();
     return { changed: dropped, dropped: dropped, mode: mode };
   }
+  histWDirty = 1;
   for (const e of ids) eW[e] = 0;
   afterEdgeParamChange(ids);
   return { changed: ids.length, mode: mode };
@@ -17645,6 +17756,7 @@ function instantiateModule(mi, opts) {
     if (s === undefined || d === undefined || s === d) continue;
     if (!ensureEdgeCapacity(G.e + 1)) break;
     const e = G.e++;
+    histEdgeDirty = 1; histWDirty = 1;
     eSrc[e] = s; eDst[e] = d; eW[e] = ed.w; eLock[e] = ed.lock ? 1 : 0; eHid[e] = 0; eId[e] = edgeSeq++;
     writeEdge(e, true);
     made++;
@@ -19073,6 +19185,13 @@ window.NF = {
   seed: (v) => (v === undefined ? G.seed : seedRand(v)),
   /* 历史统计：分块与内存的真实数字（测试用来验“结构共享真的省了”） */
   histStats: () => histStats(),
+  /* 撤销登记的裁判开关：打开之后每一拍检查点照旧整列比一遍，并核对「登记说没动、实际动了」。
+     自测 / 排障用；平时关着——关着才有那条「不扫没变过的列」的快速路。 */
+  histVerify: (v) => { HIST_VERIFY = v !== false; return HIST_VERIFY; },
+  /* 登记的状态：dirty = 边列被登记过写入（下一拍要扫），miss = 裁判抓住的漏报次数 */
+  histMarks: () => ({ dirty: !!histEdgeDirty, wdirty: !!histWDirty, sdirty: !!histSelDirty,
+    force: !!histForceAll, fast: HISTV.fast, checks: HISTV.checks, miss: HISTV.miss, soft: HISTV.soft,
+    missAt: HISTV.missAt.slice(0, 20) }),
   nameStats: () => {
     let segs = 0, entries = 0, bytes = 0;
     for (let k = 0; k < nNameSegs.length; k++) { const sg = nNameSegs[k]; if (!sg) continue; segs++; entries += sg.m.size; bytes += nameSegBytes(sg.m); }
@@ -19895,7 +20014,7 @@ window.NF = {
   clear: () => newProject(),
   addNode: (x, y, z) => addNeuron(x || 0, y || 0, z || 0),
   addEdge: (s, d, w) => addEdge(s, d, w),
-  setW: (e, v) => { eW[e] = v; afterEdgeParamChange([e]); },
+  setW: (e, v) => { eW[e] = v; histWDirty = 1; afterEdgeParamChange([e]); },
   /* ---- 按神经元挑连接 / 批量调参（14.x）---- */
   edgesOf: (nodes, dir, opt) => {
     const raw = (nodes && nodes.length) ? nodes : selectedNodes();
@@ -19994,7 +20113,7 @@ window.NF = {
   gotoView: (n) => { const v = VIEWS.list.filter((x) => x.name === n)[0]; if (!v) return false; viewGoto(v); return true; },
   setBias: (nodes, v) => { for (const i of nodes || []) nBias[i] = v; },
   setLock: (nodes, v) => { for (const i of nodes || []) nLock[i] = v ? 1 : 0; plastBump(); },
-  setEdgeLock: (edges, v) => { for (const e of edges || []) eLock[e] = v ? 1 : 0; plastBump(); },
+  setEdgeLock: (edges, v) => { histEdgeDirty = 1; for (const e of edges || []) eLock[e] = v ? 1 : 0; plastBump(); },
   nameOf: (i) => nName.get(i) || '',
   setAct: (i, a) => {
     nAct[i] = a;
@@ -21290,6 +21409,7 @@ const AI_TOOLS = [
       if (!es.length) throw new Error('没有要改的连接');
       const op = a.op || 'set', v = a.value || 0;
       if (op === 'xavier') { xavierInit(es); return { edges: es.length, op: op }; }
+      histWDirty = 1;
       for (const e of es) {
         const w = eW[e];
         eW[e] = op === 'add' ? w + v : op === 'mul' ? w * v : op === 'random' ? rngSym(0.8)
@@ -21327,10 +21447,16 @@ const AI_TOOLS = [
     args: { edges: ['int[]?', '默认用当前选中'], lock: ['bool?', 'true=冻结，默认 true'] }, api: 'setEdgeLock', mut: true,
     run: (a) => {
       const es = (a.edges && a.edges.length) ? a.edges : selectedEdges();
+      histEdgeDirty = 1;
       for (const e of es) eLock[e] = a.lock === false ? 0 : 1;
       afterEdgeParamChange(es);
       return { edges: es.length };
     } },
+  { name: 'hist_verify', desc: '开 / 关撤销检查点的「裁判模式」。开着时每一拍检查点都会把连接数组整列再比一遍，并统计「登记说没动、实际却动了」的漏报——排「撤销回错了格」这种毛病时用。平时关着：关着才有那条「不扫没变过的列」的快速路。',
+    args: { on: ['bool?', 'true = 打开（默认），false = 关闭'] }, api: 'histVerify',
+    run: (a) => ({ on: window.NF.histVerify(a.on === undefined ? true : a.on) }) },
+  { name: 'hist_marks', desc: '看撤销检查点的「登记」状态：dirty = 连接列被登记过写入（下一拍要扫），force = 下一拍强制整列比，fast = 从上次重置以来「整张沿用、一个字节没比」的列数，checks = 裁判比过的列数，miss = 漏报次数，missAt = 漏报的是哪几列。miss 不为 0 就说明有写入点漏打了钩子（这是软件自己的 bug，把结果告诉开发者）。',
+    args: {}, api: 'histMarks', run: () => window.NF.histMarks() },
   { name: 'pack_blocks', desc: '把当前选中的连接打包成一个权重块（编译时变成一次矩阵乘）。allowSparse=false 时中间的缺口补 0。',
     args: { allowSparse: ['bool?', '默认 true'] }, api: 'packSelected', mut: true,
     run: (a) => { const r = window.NF.packSelected({ allowSparse: a.allowSparse !== false }); if (r && r.ok === false) throw new Error(r.msg || '打包失败'); return r; } },

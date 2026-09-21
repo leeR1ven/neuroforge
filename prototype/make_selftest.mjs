@@ -78,6 +78,11 @@ const TEST = `
     try { const j0 = JSON.parse(localStorage.getItem('nf.ai') || '{}'); KEEP19 = { key: String(j0.key || ""), visKey: String(j0.visKey || "") }; } catch (e) {}
     if (KEEP19.key) log(true, '开场快照：本机已经存着 ' + KEEP19.key.length + ' 位的 Key，跑完会原样放回去', '不打印内容');
     log(NF.aiState().bakKey === KEEP19.key.length, '开场快照：备份那一格里的 Key 位数跟现役那份一致（两份不会各走各的）', '备份 ' + NF.aiState().bakKey + ' 位');
+    /* 撤销检查点的「裁判模式」：不信「登记」，每一拍照旧整列比一遍，并统计「登记说没动、实际却动了」
+       的漏报。整场自测都开着跑，等于把「有没有写入点漏打了 histEdgeDirty 钩子」从头到尾验一遍
+       （收尾那条断言 miss === 0）。慢一点，但这是唯一能当场抓住「撤销静默回错格」的办法。 */
+    try { log(NF.histVerify(true) === true, '撤销裁判模式已打开（整场自测每一拍都整列复比）'); }
+    catch (e) { log(false, '打开撤销裁判模式', (e && e.message) || String(e)); }
 
     /* ---- 1. 入边 / 出边高亮 ---- */
     const inCnt = [], outCnt = [];
@@ -1602,6 +1607,28 @@ const TEST = `
         '多占 ' + (s3.bytes - s2.bytes) + ' B / ' + (s3.uniqueChunks - s2.uniqueChunks) + ' 块');
     const ratio = (s0.naive * s3.steps) / Math.max(1, s3.bytes);
     log(ratio > 1.5, '总体压缩比 > 1.5 倍（' + (s1.steps - s0.steps) + ' 格真改动共 ' + s1.bytes + ' B）', ratio.toFixed(2) + ' x');
+    /* ---- 登记快速路：拍完一拍就把三个「要扫」都清掉，只有真写了那一类列才会再变脏 ----
+       这条近路靠「每个写入点打一下标记」跑起来：标记漏了 = 撤销静默回错格。
+       所以既验标记本身（下面几条），也让上面打开的裁判把整场自测的每个操作都比一遍。 */
+    NF.setW(0, 0.25);
+    const mk1 = NF.histMarks();
+    log(mk1.wdirty === true && mk1.dirty === false && mk1.sdirty === false, '改权重只脏「权重列」，不脏「拓扑列」「选中列」（大模型上这两类差 200 ms）', JSON.stringify(mk1));
+    NF.snapshot();
+    const mk2 = NF.histMarks();
+    log(mk2.dirty === false && mk2.wdirty === false && mk2.sdirty === false, '拍完一拍三个登记都清干净（要等下一次真写了才再变脏）', JSON.stringify(mk2));
+    /* 再拍两拍、中间一列连接都不写：必须走「整张沿用、一个字节都不比」的近路。
+       裁判模式会挡近路，所以这一小段先把它关掉，数一数近路真的走了几列。 */
+    NF.histVerify(false);
+    const f1 = NF.histMarks().fast;
+    NF.snapshot();
+    NF.snapshot();
+    const f2 = NF.histMarks().fast;
+    log(f2 >= f1 + 12, '没写过的连接列走的是「整张沿用」的近路（两拍 = 那几列各不扫两次）', '近路列数 ' + f1 + ' -> ' + f2);
+    const pc0 = NF.histStats().perCol;
+    let edgeCopied = 0;
+    for (let k = 10; k < 18 && k < pc0.length; k++) edgeCopied += pc0[k].copied;   /* 10..15 连接列 + selN + selE */
+    log(edgeCopied === 0, '最近一拍里连接那几列一共重拷 0 块（真没动它们）', '重拷 ' + edgeCopied + ' 块');
+    NF.histVerify(true);
     /* 撤销必须逐位还原（位置 / 权重 / 颜色 / 接口都要对得上） */
     const grab = () => {
       const g = NF.graph(), a = [];
@@ -4547,6 +4574,13 @@ const TEST = `
       out.push((bk.keyLen === KEEP19.key.length ? 'PASS' : 'FAIL') + ' | 收尾：用户原来的 Key 原样放回去了 | ' + bk.keyLen + '/' + KEEP19.key.length + ' 位');
     }
   } catch (e) { out.push('ERROR | 收尾放回 Key：' + ((e && e.message) || e)); }
+  /* 裁判的账：整场自测（连线 / 删点 / 剪枝 / 调参 / 隐藏 / 撤销 / 重做 / 载入都在里面）跑下来
+     一次漏报都不许有。miss > 0 = 有写入点漏打了 histEdgeDirty 钩子，那条改动撤销时会静默回错格。 */
+  try {
+    const hm = window.NF.histMarks();
+    out.push((hm.miss === 0 ? 'PASS' : 'FAIL') + ' | 裁判：整场自测的连接列写入登记没有漏报 | checks=' + hm.checks + ' miss=' + hm.miss + ' fast=' + hm.fast + ' soft=' + hm.soft + ' ' + JSON.stringify(hm.missAt));
+    window.NF.histVerify(false);
+  } catch (e) { out.push('ERROR | 读撤销登记状态：' + ((e && e.message) || e)); }
   const pass = out.filter(l => l.indexOf('PASS') === 0).length;
   const fail = out.filter(l => l.indexOf('FAIL') === 0 || l.indexOf('ERROR') === 0).length;
   const pre = document.createElement('pre');

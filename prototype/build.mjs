@@ -23,3 +23,12 @@ for (const f of mk) {
   if (r.status !== 0) { console.error('生成失败：' + f); process.exit(r.status || 1); }
 }
 console.log('衍生的校验页已全部刷新（' + mk.length + ' 个）');
+
+/* 静态复查：不是生成页面，而是「改错了会当场报」的守卫（见 check_histhook.mjs）。
+   放在最后跑：它查的是刚写进 bundle 的那份源码。 */
+const ck = fs.readdirSync('prototype').filter((f) => /^check_.*\.mjs$/.test(f)).sort();
+for (const f of ck) {
+  const r = spawnSync(process.execPath, ['prototype/' + f], { stdio: 'inherit' });
+  if (r.status !== 0) { console.error('静态复查没通过：' + f); process.exit(r.status || 1); }
+}
+console.log('静态复查已通过（' + ck.length + ' 个）');
