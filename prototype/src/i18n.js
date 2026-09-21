@@ -217,6 +217,17 @@ export const I18N = {
     "void-s3": "units away",
     "void-b1": "Frame the whole graph (F)",
     "void-b2": "Back to the start view",
+    /* ---- 起步卡片（空工程 / 第一次打开） ---- */
+    "starter-t": "Where to start: just pick one road",
+    "starter-s": "You do not have to set up an API key first, and you do not have to write code.",
+    "starter-b1": "Load the example network (5 layers, 22 neurons)",
+    "starter-b2": "Open an existing project…",
+    "starter-b3": "Let the AI build a 3-layer network",
+    "starter-b4": "Let the AI import an existing model",
+    "starter-b5": "No API key: use a local Ollama",
+    "starter-n": "Once the example is loaded, press <b>F7</b> to generate a runnable Python model file (.py + weights); every step can be undone with <b>Ctrl+Z</b>.",
+    "vb-layout": "Layer",
+    "分层": "Layers",
     "（身后）": " (behind you)",
     "h-cam": "Right-drag orbits, middle-drag or the arrow keys pan (hold an arrow key to glide continuously and release to ease out, instead of stepping), the wheel zooms. Orbiting always turns around the “view center”: by default that is the world origin, which is why turning without panning keeps staring at the origin. Select neurons / connections and hit “Center on selection” to orbit around them instead (distance and direction stay put), or “Focus selection” to fit the distance too. With nothing selected, focus frames the whole graph.",
 

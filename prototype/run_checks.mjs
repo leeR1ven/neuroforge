@@ -109,7 +109,10 @@ try {
   if (srv.spawned) say("已自动启动本地服务 :" + PORT);
 
   br = await pw.chromium.launch({ headless: true, executablePath: exe, args: ["--no-sandbox", "--disable-gpu-sandbox"] });
-  const pg = await br.newPage({ viewport: { width: 1280, height: 800 } });
+  /* locale 必须显式给成中文：界面语言现在会跟着系统语言走（r60 起），
+   不给的话无头 Chrome 默认报 en-US，整个自测页会切成英文、几百条中文文案断言全崩。
+   给 zh-CN 才是这个软件真正的主场环境。 */
+const pg = await br.newPage({ viewport: { width: 1280, height: 800 }, locale: "zh-CN" });
   const errs = [];
   /* 「探测本机」那一步会**故意**去连本机上没开的端口（11434 / 1234 / 8080 …），
      Chromium 会为每一次失败记一条 "Failed to load resource: net::ERR_CONNECTION_REFUSED"。

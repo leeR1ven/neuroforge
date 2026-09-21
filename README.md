@@ -51,19 +51,23 @@ everything inlined, no network access needed). Download it from Releases and dou
 
 | Action | How |
 | --- | --- |
+| **First launch / an empty project** | A "where to start" card floats over the canvas: load the example network, open a project, have the AI build a 3-layer net, have the AI import a model you already have, or hook up a local Ollama with no API key. Close it with × — or just click anywhere in the canvas |
 | Orbit / pan / zoom | right-drag / middle-drag / wheel |
 | Switch tool | `S` select · `W` wire · `A` place · `D` delete |
 | Place by coordinates | `A`, then type XYZ and press `Enter` |
 | Select | click; `Shift` adds; drag a box; `Ctrl+A` selects all |
 | Mark an external interface | select, then `1` in · `2` out · `3` both · `4` clear |
 | Simulate activation | select neurons, then "Simulate" in the right panel |
+| Re-arrange into layers | the **Layer** button in the top-right of the viewport (same as View → re-arrange by topology): lays the graph out wave by wave. Coordinates only — `Ctrl+Z` undoes it |
 | **Compile** | `F7` |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Y` |
 | Save / open | `Ctrl+S` / `Ctrl+O` |
 
 > **Set up the AI assistant before anything else.** It is how you actually drive the editor: you say
 > what you want and it places, wires, edits, simulates and compiles for you. It needs one API key,
-> or a local model (free, and nothing leaves your machine). Step-by-step with screenshots:
+> or a local model (free, and nothing leaves your machine). No key yet? The card's
+> **No API key: use a local Ollama** button scans your machine and wires up whatever local server is
+> running. Step-by-step with screenshots:
 > [`docs/ai-setup.md`](docs/ai-setup.md) · [`docs/ai-setup.zh-CN.md`](docs/ai-setup.zh-CN.md)
 
 ---
@@ -154,11 +158,12 @@ rewiring, editing weights, pruning, compiling, opening channels, running the sim
 - **Interface channels are stored in the project file**, but whether a channel is *open* is not —
   you reopen it once per session.
 - The interface and manual are primarily written in Chinese; English coverage is broad but not
-  complete.
+  complete. The UI picks its language from your system locale on first launch, and remembers your
+  choice afterwards.
 
 ## Verified, not asserted
 
-The build is exercised by 777 interaction assertions plus cross-language checks (JS against Python
+The build is exercised by 875 interaction assertions plus cross-language checks (JS against Python
 on the project container, the compiled PyTorch against the compiled C target, and the importer
 against reference ONNX models). The Go2 numbers above come from a real MuJoCo run, not a mock.
 

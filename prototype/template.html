@@ -507,6 +507,25 @@ input[type=color]{padding:1px;height:24px;cursor:pointer}
 #voidhint .vh-s b{color:var(--tc-9fd3ff);font-family:var(--mono);font-size:15px;margin:0 3px}
 #voidhint .vh-b{display:flex;gap:6px;pointer-events:auto}
 #voidhint button{padding:5px 11px;font-size:12px}
+
+/* 起步卡片：空工程 / 第一次打开软件时浮出来。以前这种时候就是一片黑，人会以为软件坏了。
+   跟「镜头对着空白」那个提示一个规矩：整块不吃鼠标，只有按钮能点。 */
+/* 位置往上挪一点、层级压过 AI 对话框（#aiwrap 是 30）：默认布局下 AI 框占着下半屏，
+   卡片停在正中间会被它盖住一大半 —— 实测过，正中间时整张卡片都看不见。 */
+#starter{position:absolute;left:50%;top:30%;transform:translate(-50%,-50%);display:none;pointer-events:none;
+  flex-direction:column;gap:7px;padding:15px 18px 13px;max-width:min(680px,82%);
+  background:rgba(var(--ovl-0d131c),.94);border:1px solid var(--border2);box-shadow:0 14px 34px rgba(0,0,0,.62);z-index:60}
+#starter.show{display:flex}
+#starter .st-x{position:absolute;right:5px;top:3px;pointer-events:auto;cursor:pointer;color:var(--dim);
+  font-size:15px;line-height:1;padding:2px 6px;user-select:none}
+#starter .st-x:hover{color:var(--text)}
+#starter .st-t{color:var(--tc-dbe6f5);font-size:14px;font-weight:600;padding-right:16px}
+#starter .st-s{color:var(--tc-7f95ad);font-size:12px}
+#starter .st-b{display:flex;flex-wrap:wrap;gap:6px;pointer-events:auto;margin-top:2px}
+#starter .st-b button{padding:6px 11px;font-size:12px}
+#starter .st-n{color:var(--tc-7f95ad);font-size:11.5px;line-height:1.7;border-top:1px solid var(--border2);padding-top:7px}
+#starter .st-n:empty{display:none}
+#starter .st-n b{color:var(--tc-9fd3ff)}
 #viewbar{position:absolute;right:10px;top:10px;display:flex;gap:5px;background:rgba(var(--ovl-0d131c),.82);
   border:1px solid var(--border2);padding:5px;z-index:30}
 /* 结构视图：盖住画布但让开右上角那排按钮（#viewbar 的 z-index 更高），
@@ -957,6 +976,23 @@ input[type=color]{padding:1px;height:24px;cursor:pointer}
         <button id="vh-home" data-i18n="void-b2">回到初始视角</button>
       </div>
     </div>
+    <!-- 起步卡片：空工程、或者第一次打开软件时浮出来。以前这种时候就是一片黑，
+         人会以为软件坏了 —— 这里直接把几条能走通的路摆出来（按钮都走 data-starter，
+         不进菜单命令表：它是引导，不是菜单功能）。 -->
+    <div id="starter">
+      <div class="st-x" id="starter-x" title="先收起这张卡片（点过一次就不再自己冒出来；新建工程时还会回来）">×</div>
+      <div class="st-t" data-i18n="starter-t">从哪儿开始：挑一条路就行</div>
+      <div class="st-s" data-i18n="starter-s">不用先配 API Key，也不用会写代码。</div>
+      <div class="st-b">
+        <button class="primary" data-starter="demo" data-i18n="starter-b1">载入示例网络（5 层 22 个神经元）</button>
+        <button data-starter="open" data-i18n="starter-b2">打开已有工程…</button>
+        <button data-starter="ai-net" data-i18n="starter-b3">让 AI 搭一个三层网络</button>
+        <button data-starter="ai-import" data-i18n="starter-b4">让 AI 帮我导入已有模型</button>
+        <button data-starter="ollama" data-i18n="starter-b5">不配 Key：用本机 Ollama</button>
+      </div>
+      <div class="st-n" data-i18n="starter-n">示例网络载进来之后，按 <b>F7</b> 就生成能直接跑的 Python 模型文件（.py + 权重）；做的每一步都能 <b>Ctrl+Z</b> 撤回。</div>
+      <div class="st-n" id="starter-note"></div>
+    </div>
     <div id="posbadge"></div>
     <div id="structpanel">
       <div id="structhead">
@@ -977,6 +1013,7 @@ input[type=color]{padding:1px;height:24px;cursor:pointer}
       <button data-cmd="reset">重置</button>
       <button data-cmd="focus">聚焦</button>
       <button data-cmd="top">顶视</button>
+      <button data-cmd="layout" data-i18n="vb-layout" title="按拓扑把神经元重排成一层一层（大网络这样看更好懂；原始坐标会被覆盖，Ctrl+Z 能撤回）">分层</button>
       <button data-cmd="nodelist" title="神经元列表：一屏看全每个神经元的状态（编号 / 名称 / 分组 / 接口 / 激活 / 是否被隐藏），可以手动隐藏或显示，也能按分组挑人（Ctrl+L）">神经元列表</button>
       <button id="vb-struct" data-cmd="struct" title="翻页：算子级结构视图 ⇄ 3D 建模（F9）">结构视图 ⇄</button>
     </div>

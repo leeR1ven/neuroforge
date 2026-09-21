@@ -6,6 +6,13 @@ if (!AI_MANUAL_VERSION) throw new Error('读不到 AI_MANUAL_VERSION');
 
 const SRC = 'prototype/神经元编辑器原型.html';
 const html = fs.readFileSync(SRC, 'utf8');
+/* 防呆：这一页是从 build.mjs 生成的单文件原型里切出来的。bundle 比它新，说明有人改了
+   src 却没重新构建 —— 切出来的自测页跑的还是旧代码，会得出「改了也没用」的假结论，
+   而且报的 FAIL 全是旧代码的（这一轮真踩过）。宁可当场失败，也别让人对着假结果查半天。 */
+const _bundle = 'prototype/dist/bundle.js';
+if (fs.existsSync(_bundle) && fs.statSync(_bundle).mtimeMs > fs.statSync(SRC).mtimeMs) {
+  throw new Error('prototype/dist/bundle.js 比 ' + SRC + ' 新：先跑 node prototype/build.mjs（重新打包 + 刷新全部校验页）');
+}
 if (!html.includes('</body>')) throw new Error('no </body>');
 
 /* ---------- 1) 逻辑自测页 ---------- */
@@ -4311,6 +4318,189 @@ const TEST = `
   } catch (e) {
     out.push('ERROR | 第 40 组（本地大模型）：' + ((e && e.stack) || e));
   }
+  /* ==================== 41. 起步卡片 / 语言自动判定 ==================== */
+  try {
+    /* a) 语言自动判定：纯函数，跟跑这一页的机器是什么语言无关 */
+    log(NF.langDetect(['en-US']) === 'en' && NF.langDetect(['zh-CN']) === 'zh',
+      '41 界面语言跟着系统走：英文系统给 en、中文系统给 zh',
+      NF.langDetect(['en-US']) + ' / ' + NF.langDetect(['zh-CN']));
+    log(NF.langDetect(['fr-FR', 'en-GB']) === 'en' && NF.langDetect(['de-DE']) === 'zh' && NF.langDetect([]) === 'zh',
+      '41 系统语言认不出来就按中文（主场在国内），列表里先碰上哪个算哪个',
+      [NF.langDetect(['fr-FR', 'en-GB']), NF.langDetect(['de-DE']), NF.langDetect([])].join(' / '));
+    log(NF.lang() === 'zh' && document.documentElement.lang === 'zh-CN',
+      '41 这一页是中文界面（本机没存过语言，这是按系统语言判出来的）', NF.lang());
+
+    /* b) 空工程：卡片自己浮出来，几条路真的都摆着 */
+    NF.clear();
+    await raf();
+    const st41 = document.getElementById('starter');
+    log(!!st41 && st41.classList.contains('show') && NF.starter().shown === true,
+      '41 空工程时起步卡片自己浮出来（不再是一片黑等人猜下一步）', JSON.stringify(NF.starter()));
+    const bs41 = st41 ? st41.querySelectorAll('[data-starter]') : [];
+    log(bs41.length === 5, '41 卡片上摆了 5 条路（示例 / 打开 / AI 搭 / AI 导入 / 本机模型）', bs41.length + ' 个按钮');
+    const oll41 = st41 ? st41.querySelector('[data-starter=ollama]') : null;
+    log(!!oll41, '41 「不配 API Key 也能用」这条路就在卡片上（新手最容易卡在这一步）',
+      oll41 ? oll41.textContent.trim() : '没有');
+    log(!!(st41 && st41.querySelector('[data-starter=ai-import]')) && !!document.getElementById('starter-note'),
+      '41 「让 AI 干」那两条 + 结果回话的位置都在（点本机模型那条要靠它说话）', 'ok');
+
+    /* c) 从卡片上载入示例：图进来了，卡片自己收起来 */
+    st41.querySelector('[data-starter=demo]').click();
+    await sleep(250);
+    log(NF.stats().n >= 20 && NF.starter().shown === false,
+      '41 点卡片上的「载入示例网络」：图进来了、卡片自己收起来',
+      NF.stats().n + ' 个神经元 / shown=' + NF.starter().shown);
+
+    /* d) 第一次打开（图上已经有东西）也露一次头，人一动手就自己收回去 */
+    const f41 = NF.starterForce();
+    log(f41.shown === true && f41.force === true,
+      '41 第一次打开时卡片也露一次头（这次示例网络已经在画布上）', JSON.stringify(f41));
+    NF.select([0], []);
+    await raf();
+    log(NF.starter().shown === false && NF.starter().force === false,
+      '41 一动手（选中一个神经元）卡片就自己收回去，不挡路', JSON.stringify(NF.starter()));
+    NF.select([], []);
+    await raf();
+
+    /* e) × 点一次就记住：写进 nf.seen，以后不再自己冒出来 */
+    NF.clear();
+    await raf();
+    try { localStorage.removeItem('nf.seen'); } catch (e) {}
+    log(NF.starter().shown === true, '41 清空成空工程，卡片又回来（新建工程时正需要它）', JSON.stringify(NF.starter()));
+    document.getElementById('starter-x').click();
+    await raf();
+    let seen41 = '';
+    try { seen41 = String(localStorage.getItem('nf.seen') || ''); } catch (e) {}
+    log(NF.starter().shown === false && seen41 === '1',
+      '41 点一次 × 就收起并写进 nf.seen（以后不再自己冒出来）', 'shown=' + NF.starter().shown + ' / nf.seen=' + seen41);
+
+    /* f) 视图栏那个「分层」按钮：大网络一眼看不懂时的低头路，真能重排 */
+    const lb41 = document.querySelector('#viewbar [data-cmd=layout]');
+    log(!!lb41, '41 视图栏多了「分层」按钮（不用翻菜单就能把网络排成一层一层）',
+      lb41 ? lb41.textContent.trim() : '没有');
+    document.querySelector('[data-cmd=demo]').click();
+    await sleep(250);
+    const n41 = NF.stats().n;
+    const xy41 = [NF.node(0).x, NF.node(0).y, NF.node(0).z];
+    const r41 = NF.relayout('layer');
+    await raf();
+    const moved41 = Math.abs(NF.node(0).x - xy41[0]) + Math.abs(NF.node(0).y - xy41[1]) + Math.abs(NF.node(0).z - xy41[2]);
+    log(!!r41 && r41.mode === 'layer' && NF.stats().n === n41 && moved41 > 0,
+      '41 「分层」重排真的动了坐标，但神经元和连接一个没多一个没少',
+      JSON.stringify({ mode: r41 && r41.mode, n: NF.stats().n, moved: Math.round(moved41) }));
+  } catch (e) {
+    out.push('ERROR | 第 41 组（起步卡片）：' + ((e && e.stack) || e));
+  }
+  /* ---- 42 组：按区摆位置的那套（区重心 / 包围盒 + set_pos 认区名 + 按轴缩放） ----
+     为什么单独测：AI 按区摆大脑布局时，四个约束缺一不可 ——
+       ① 要能"看见"每个区在哪、多大（region_map 的 c / b），
+       ② 要能不写编号就动一整个区（set_pos 的 region），
+       ③ 要能改形状（set_pos 的 sx/sy/sz），
+       ④ 这些参数得真出现在工具表里，AI 才看得见。 */
+  try {
+    NF.clear();
+    await raf();
+    for (let k = 0; k < 9; k++) NF.addNode((k % 3) * 10, 0, Math.floor(k / 3) * 10);
+    await raf();
+    const col = NF.node(0).color;
+    const rm = NF.regionMap();
+    const hit = rm.filter((e) => e.hexes && e.hexes.indexOf(col) >= 0)[0];
+    log(!!hit && Array.isArray(hit.c) && hit.c.length === 3 && Array.isArray(hit.b) && hit.b.length === 6,
+      '42 region_map 每项都带重心 c[3] 和包围盒 b[6]（按区摆位置只要这两个数，不用取几万个编号）',
+      JSON.stringify(hit && { name: hit.name, n: hit.n, c: hit.c, b: hit.b }));
+
+    const bx0 = NF.node(4).x;
+    const rMove = await NF.aiTool('set_pos', { region: col, dx: 100 });
+    await raf();
+    const xsA = [0, 1, 2, 3, 4, 5, 6, 7, 8].map((i) => NF.node(i).x);
+    log(Math.round(NF.node(4).x - bx0) === 100 && xsA.every((x) => x >= 100),
+      '42 set_pos 给一个色号就把整个区一起挪了：不用把编号写出来，这是 AI 摆大布局的关键',
+      JSON.stringify({ moved: Math.round(NF.node(4).x - bx0), ret: rMove, col: col, ids: NF.regionCells(col) ? NF.regionCells(col).ids.length : null }));
+
+    const rScale = await NF.aiTool('set_pos', { region: col, sx: 2 });
+    await raf();
+    const xsB = [0, 1, 2, 3, 4, 5, 6, 7, 8].map((i) => NF.node(i).x);
+    const w = Math.max.apply(null, xsB) - Math.min.apply(null, xsB);
+    log(Math.round(w) === 40,
+      '42 set_pos 的 sx 是以这一批包围盒的中心按轴缩放（3x3 本来 20 宽，2 倍后 40）',
+      JSON.stringify({ width: Math.round(w), ret: rScale }));
+
+    const t42 = NF.aiTools().filter((x) => x.name === 'set_pos')[0];
+    log(!!(t42 && t42.args && t42.args.indexOf('region') >= 0 && t42.args.indexOf('sx') >= 0),
+      '42 set_pos 的工具表里真的多了 region / sx / sy / sz（AI 看得见才用得上）',
+      JSON.stringify(t42 && Object.keys(t42.args)));
+
+    const st42 = NF.aiState();
+    out.push('INFO 42 当前 AI | 模型=' + (st42 && st42.model) + ' 最大输出=' + (st42 && st42.maxTok) + ' 思考=' + (st42 && st42.think));
+  } catch (e) {
+    out.push('ERROR | 第 42 组（按区摆位置）：' + ((e && e.stack) || e));
+  }
+
+  /* ---- 43 组：改坐标不再每次全量刷新（大工程上"未响应"的根因之一） ----
+     实测（born-wired-cortex，14.4 万神经元）：单个 NF.setPos 以前要 ~18ms，几乎全花在一次
+     全量刷新上；脚本 / AI 按个循环改坐标就是几分钟的假死。现在刷新攒到一帧做一次。 */
+  try {
+    NF.clear();
+    await raf();
+    for (let k = 0; k < 2000; k++) NF.addNode((k % 50) * 2, Math.floor(k / 50) * 2, 0);
+    await raf();
+    const y0 = NF.node(1500).y, bx = NF.node(1500).x;
+    NF.setPos(1500, bx + 7, y0, NF.node(1500).z);
+    log(Math.abs(NF.node(1500).x - (bx + 7)) < 1e-6,
+      '43 坐标改完立刻读回来就是新值（刷新可以攒，坐标不许攒）',
+      JSON.stringify({ x: NF.node(1500).x }));
+    NF.setPos(1500, bx, y0, NF.node(1500).z);
+    log(typeof NF.flushPos === "function" && NF.flushPos() === true,
+      '43 有 flushPos：截图 / 存盘前能把攒着的刷新立刻做掉（否则存到的是上一帧的场面）', 'ok');
+    const t0 = performance.now();
+    for (let k = 0; k < 1500; k++) NF.setPos(k, NF.node(k).x + 0.001, NF.node(k).y, NF.node(k).z);
+    const ms = performance.now() - t0;
+    await raf();
+    log(ms < 1500,
+      '43 连续 1500 次单点改坐标不再每次全量刷新（以前一次约 18ms，1500 次要二十多秒）',
+      JSON.stringify({ ms: Math.round(ms) }));
+  } catch (e) {
+    out.push('ERROR | 第 43 组（改坐标不再全量刷新）：' + ((e && e.stack) || e));
+  }
+
+  /* ---- 44 组：区色被换过也能按区寻址（按几何认区的兜底） ----
+     来历：born-wired-cortex 那份工程的颜色被换成了渐变色阶，调色板一个区都对不上，
+     于是 region_cells 按区名一律返回 null，按区寻址 / 按区摆位置整套失效。 */
+  try {
+    NF.clear();
+    await raf();
+    for (let k = 0; k < 8; k++) NF.addNode((k % 4) * 5, Math.floor(k / 4) * 5, 0);
+    for (let k = 0; k < 4; k++) NF.addNode(300 + (k % 2) * 5, Math.floor(k / 2) * 5, 0);
+    await raf();
+    const rm = NF.regionMap();
+    const named = rm.filter((e) => /^区[0-9]+$/.test(e.name));
+    log(rm.length >= 2 && named.length === rm.length && !!rm[0].c && !!rm[0].b,
+      '44 调色板对不上时按几何认区：给 区N 编号 + 规模 + 重心 + 包围盒（不再是一片空名字）',
+      JSON.stringify(rm.map((e) => e.name + ":" + e.n)));
+    const big = rm[0], small = rm[rm.length - 1];
+    const g1 = NF.regionCells(big.name);
+    log(!!g1 && g1.geo === true && g1.total === big.n && g1.ids.length === big.n,
+      '44 regionCells 能按 区N 取到细胞（以前按区名一律 null）',
+      JSON.stringify({ name: g1 && g1.name, total: g1 && g1.total }));
+    const idsA = g1.ids.slice();
+    const before = [];
+    for (let i = 0; i < NF.graph().n; i++) before.push(NF.node(i).x);
+    await NF.aiTool('set_pos', { region: big.name, dx: 40 });
+    await raf();
+    let okMove = true, moved = 0;
+    for (let i = 0; i < NF.graph().n; i++) {
+      const want = (idsA.indexOf(i) >= 0) ? 40 : 0;
+      const d = NF.node(i).x - before[i];
+      if (Math.abs(d - want) > 1e-4) okMove = false;
+      if (Math.abs(d) > 1e-4) moved++;
+    }
+    log(okMove && moved === big.n,
+      '44 set_pos 认 区N：整块搬走，别的区块一动没动（AI 因此不用把几万个编号写进对话）',
+      JSON.stringify({ moved: moved, want: big.n, small: small.name }));
+  } catch (e) {
+    out.push('ERROR | 第 44 组（按几何认区）：' + ((e && e.stack) || e));
+  }
+
   /* 收尾：把用户原来的 Key 放回原处（自测绝不给用户留副作用）。
      走的是「用户明确保存」那条路，本机存储、设置文件、备份三份会一起写正确。 */
   try {
@@ -4339,7 +4529,8 @@ const TEST = `
 /* 自测必须从“全新安装”状态开始：上次手工切过的语言会留在 localStorage，
    不清掉的话界面语言断言就取决于本机状态，结果不可复现。 */
 if (!html.includes('<head>')) throw new Error('no <head>');
-const FRESH = '<' + 'script>try{["nf.lang","nf.ui","nf.ai","nf.ai.bak","nf.aiui","nf.autosave","nf.modules","nf.views"].forEach(function(k){localStorage.removeItem(k);});}catch(e){}<' + '/script>';
+const FRESH = '<' + 'script>try{["nf.lang","nf.ui","nf.ai","nf.ai.bak","nf.aiui","nf.autosave","nf.modules","nf.views","nf.seen"].forEach(function(k){localStorage.removeItem(k);});}catch(e){}<' + '/script>';
 const freshLog = html.replace('<head>', '<head>' + FRESH).replace('</body>', TEST.split('{{MV}}').join(AI_MANUAL_VERSION) + '</body>');
 fs.writeFileSync('prototype/_selftest.html', freshLog);
 console.log('已生成自测页 prototype/_selftest.html');
+

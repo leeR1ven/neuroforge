@@ -15,7 +15,28 @@ import { AI_MANUAL, AI_MANUAL_VERSION, AI_MENU_COMMANDS, AI_MANUAL_CMD_IDS } fro
    ========================================================================== */
 const EN = I18N.en;
 let LANG = 'zh';
-try { const saved = localStorage.getItem('nf.lang'); if (saved === 'en' || saved === 'zh') LANG = saved; } catch (e) {}
+/* 没手动选过语言时跟着系统语言走：系统是英文的用户第一次打开，不该满屏中文。
+   列表里先碰到的那个算数（zh-CN → zh，en-US → en）；都认不出来就按中文——这个软件的主场在国内。 */
+function detectLangFrom(list) {
+  const arr = list || [];
+  for (let i = 0; i < arr.length; i++) {
+    const s = String(arr[i] || '').toLowerCase();
+    if (s.indexOf('zh') === 0) return 'zh';
+    if (s.indexOf('en') === 0) return 'en';
+  }
+  return 'zh';
+}
+function detectLang() {
+  try {
+    const list = (navigator.languages && navigator.languages.length) ? navigator.languages : [navigator.language || ''];
+    return detectLangFrom(list);
+  } catch (e) { return 'zh'; }
+}
+/* 用户自己在「语言」菜单里选过（本地存着 nf.lang）就听用户的，没选过才自己认 */
+try {
+  const saved = localStorage.getItem('nf.lang');
+  LANG = (saved === 'en' || saved === 'zh') ? saved : detectLang();
+} catch (e) { LANG = detectLang(); }
 function T(s) { return LANG === 'zh' ? s : (EN[s] !== undefined ? EN[s] : s); }
 /* 带数字的整句没法按词条查表（每次生成的文本节点都不一样），中英各写一遍最直接 */
 function TL(zh, en) { return LANG === 'zh' ? zh : en; }
@@ -3358,7 +3379,9 @@ function updateVoidHint(fill) {
   if (!el) return;
   const f = fill || viewFill();
   let away = '', dist = 0;
-  if (G.n >= 40 && f.nodes + f.edges < 3) {
+  /* 以前这里要求至少 40 个神经元才提示，结果示例网络（22 个）被镜头甩到屏幕外时反倒一声不吭，
+     看起来就跟空的一样。判据已经有「相机确实在图外面」兜着，门槛就没必要那么高。 */
+  if (G.n > 0 && f.nodes + f.edges < 3) {
     const b = graphBounds(false);
     if (b) {
       const pad = Math.max(1, b.span * 0.02);
@@ -3381,6 +3404,109 @@ function updateVoidHint(fill) {
   if (ea) ea.textContent = away;
   if (ed) ed.textContent = fmt(Math.round(dist));
   el.classList.add('show');
+}
+/* ==========================================================================
+   起步卡片：空工程别再给人一片黑
+   --------------------------------------------------------------------------
+   以前「新建工程」之后画布就是一片黑，人不知道下一步该点哪儿；第一次打开也容易这样。
+   这张卡片只干一件事：把几条真能走通的路摆在眼前——载入示例、打开工程、让 AI 代劳；
+   另外把「不配 API Key 也能用」（本机 Ollama）放在同一层，那是新手最容易卡住的一步。
+   显示规则：
+     · G.n === 0（空工程）：一直显示，人一动手就不显示了；
+     · 第一次打开软件那一次（本机没记过 nf.seen）：示例网络已经在画布上了，卡片也露一次头，
+       人一动手（选中东西 / 图变了）就自己收回去，不挡路；
+     · 右上角那个 × 点过一次，就写进 nf.seen，以后不再自己冒出来。
+   ========================================================================== */
+const STARTER = { hidden: false, force: false, n0: 0, key: '' };
+function updateStarter() {
+  const el = document.getElementById('starter');
+  if (!el) return;
+  if (STARTER.force) {
+    const sc = selectionCount();
+    if (G.n !== STARTER.n0 || sc.n + sc.e > 0) STARTER.force = false;   /* 人一动就收起来 */
+  }
+  const show = !STARTER.hidden && (STARTER.force || G.n === 0);
+  const key = show ? '1' : '0';
+  if (key === STARTER.key) return;
+  STARTER.key = key;
+  el.classList.toggle('show', show);
+}
+function starterDismiss() {
+  STARTER.hidden = true;
+  STARTER.force = false;
+  try { localStorage.setItem('nf.seen', '1'); } catch (e) {}
+  updateStarter();
+}
+function starterReset() { STARTER.hidden = false; STARTER.force = false; STARTER.key = ''; }
+function starterState() {
+  const el = document.getElementById('starter');
+  return { shown: !!(el && el.classList.contains('show')), force: STARTER.force,
+           hidden: STARTER.hidden, neurons: G.n };
+}
+/* 「让 AI 干」的两个入口：第一次用的人不用自己想该说什么话。
+   没配接口时 aiAsk 自己会把设置面板打开、并把「云端要 Key / 本机不用」讲清楚，这里不重复判断。 */
+const STARTER_ASK = {
+  net: '请在这个工程里搭一个三层网络：每层 8 个神经元，沿 Y 轴分成三层、层间距 30，层与层之间全连接，权重随机取 -1~1，第一层标成「接收外界信号」、最后一层标成「输出到外界」。搭完告诉我怎么看它，以及怎么编译成 Python。',
+  imp: '我想把一个已有的模型导入这个软件。先问我模型文件在哪儿、是什么格式（ONNX / PyTorch 都行），拿到路径后用仓库里的 tools/import_model.py 转成 .nforge 工程，再告诉我怎么在界面里打开它。'
+};
+function starterAskAI(kind) {
+  starterDismiss();
+  aiSetUI({ folded: false });
+  aiAsk(STARTER_ASK[kind === 'imp' ? 'imp' : 'net']);
+}
+/* 「不配 API Key 也能用」：扫一圈本机常见端口，谁在开就把地址和模型填好。
+   跟设置面板里那个「探测本机」是同一套判断（aiLocalProbe / aiLocalUse），
+   只是把结果写在这张卡片上说给人听——新手十有八九卡在「没有 Key」。 */
+async function starterOllama() {
+  const el = document.getElementById('starter-note');
+  const say = (h) => { if (el) el.innerHTML = h; };
+  say(TL('正在扫本机常见端口……', 'Scanning the usual local ports…'));
+  let hits = [];
+  try { hits = await aiLocalProbe(); } catch (e) { hits = []; }
+  if (!hits.length) {
+    say('<b style="color:#e0a24a">' + TL('本机上没探到推理服务。', 'No local inference server found.') + '</b>' +
+      TL('常见端口都试过了。先把服务起起来：', ' Every common port was tried. Start one of these first:') +
+      '<br>' + AI_LOCAL_PRESETS.map((p) => aiEsc(p.name) + '（' + p.port + '）→ ' + aiEsc(p.how)).join('<br>') +
+      '<br>' + TL('服务起来之后回来再点一次这个按钮。端口不常见的话，去「AI 助手 → 设置」里手填地址再按「测试连接」。',
+        'Come back and press this button again once it is running. If your port is unusual, fill the address in under “AI assistant → Settings” and hit “Test connection”.'));
+    toast(TL('本机上没探到推理服务', 'No local inference server found'), 'warn');
+    return;
+  }
+  const h = hits[0];
+  aiLocalUse(h.id);                 /* 填地址：它自己会存配置、刷界面 */
+  aiLocalFillList(h.models);
+  if (h.models.length && h.models.indexOf(AI.model) < 0) { AI.model = h.models[0]; aiFillCfg(); aiSaveCfg(); aiInfo(); }
+  aiLocalFill();
+  say('<b style="color:#5ac8a0">' + TL('探到了 ', 'Found ') + aiEsc(h.name) + '（' + h.port + '）</b>' +
+    TL('，地址和模型已经填好，不用 API Key。', ' — the address and model are filled in; no API key needed.') +
+    (h.models.length
+      ? '<br>' + TL('它挂着的模型：', 'Models on it: ') + aiEsc(h.models.slice(0, 10).join('、'))
+      : '<br>' + TL('（它没报出模型清单，模型名在设置里手填一个）', '(it did not report a model list — type a model name in Settings)')) +
+    '<br>' + TL('现在直接去下面的 AI 对话框打字就能用。', 'Now just type in the AI panel below.'));
+  toast(TL('已接上本机 ', 'Connected to local ') + h.name, 'ok');
+}
+function starterBind() {
+  const el = document.getElementById('starter');
+  if (!el) return;
+  el.addEventListener('click', (ev) => {
+    if (ev.target.closest('#starter-x')) { starterDismiss(); return; }
+    const b = ev.target.closest('[data-starter]');
+    if (!b) return;
+    const k = b.getAttribute('data-starter');
+    if (k === 'demo') { starterDismiss(); doCommand('demo'); }
+    else if (k === 'open') { starterDismiss(); doCommand('open'); }
+    else if (k === 'ai-net') starterAskAI('net');
+    else if (k === 'ai-import') starterAskAI('imp');
+    else if (k === 'ollama') starterOllama();
+  });
+  /* 在画布上一动手（转视角、点一下、开始放神经元）这张卡片就该让路：
+     它挡在正中间，一直留着反而碍事。点在卡片自己身上不算。 */
+  const vp = document.getElementById('viewport');
+  if (vp) vp.addEventListener('pointerdown', (ev) => {
+    if (!STARTER.force && !(G.n === 0 && !STARTER.hidden)) return;
+    if (ev.target && ev.target.closest && ev.target.closest('#starter')) return;
+    starterDismiss();
+  }, true);
 }
 function applyLodTier(t, force) {
   t = normTier(t);
@@ -4403,6 +4529,25 @@ function regionHistogram() {
   for (let i = 0; i < G.n; i++) { const h = hexOf(i); hist.set(h, (hist.get(h) || 0) + 1); }
   return hist;
 }
+/* 同上，但顺带把每个色号（= 每个区）的重心和包围盒也算出来。
+   为什么需要：按区摆位置（"把视觉区挪到最后面"）只要重心和范围就够了，
+   不用把几万个神经元编号全取出来——那些编号一动就是几十万字的上下文，写不进对话。 */
+function regionBoxes() {
+  const m = new Map();
+  for (let i = 0; i < G.n; i++) {
+    const h = hexOf(i), p = i * 3;
+    const x = nPos[p], y = nPos[p + 1], z = nPos[p + 2];
+    let e = m.get(h);
+    if (!e) { e = { n: 0, sx: 0, sy: 0, sz: 0, x0: Infinity, x1: -Infinity, y0: Infinity, y1: -Infinity, z0: Infinity, z1: -Infinity }; m.set(h, e); }
+    e.n++; e.sx += x; e.sy += y; e.sz += z;
+    if (x < e.x0) e.x0 = x; if (x > e.x1) e.x1 = x;
+    if (y < e.y0) e.y0 = y; if (y > e.y1) e.y1 = y;
+    if (z < e.z0) e.z0 = z; if (z > e.z1) e.z1 = z;
+  }
+  return m;
+}
+const _r3 = (v) => Math.round(v * 100) / 100;
+
 /* 导入器的调色板：一个区一种颜色（tools/import_bwc.py 的 区色 表）。
    有名字的细胞会被导入器**提亮 0.25**（好一眼看出"这格有名字"），所以一个区在
    文件里可能落到两个色号上——匹配时两个都认。
@@ -4413,7 +4558,101 @@ const REGION_PALETTE = [
   ['本体感觉', 0.55, 1.00, 0.35], ['平衡感觉', 0.85, 0.95, 0.25], ['机身状态', 0.45, 0.85, 0.55],
   ['视觉运动', 0.25, 0.45, 0.95], ['多巴胺', 1.00, 0.88, 0.20], ['抑制', 0.55, 0.55, 0.62]];
 const _rcA = new THREE.Color();
+/* ---- 按几何认区（调色板对不上时的兜底）--------------------------------------
+   为什么需要：region_map / region_cells / wire_mujoco 这整套「按区」的功能，全靠
+   import_bwc.py 给每个区上的那一种专属颜色认区。可用户一旦在软件里换过颜色
+   （点过「彩虹」、按连接强度着色、或者自己刷过色），调色板一个都对不上 ——
+   于是 12 个区全部变成「没有名字」，region_cells 按区名直接返回 null，
+   按区寻址 / 按区接仿真 / 按区摆位置一起失效（实测：born-wired-cortex 那份工程就是这样）。
+
+   兜底不看颜色，看几何：导入器把每个区摆成一个立方体块，块与块之间留了缝，
+   所以「空间上连成一坨」的就是一个区。体素连通分量一跑就出来了。
+   名字默认叫 区1、区2……（按规模从大到小）—— 不猜真名：几何上认不出「这坨是视觉还是听觉」，
+   与其猜错，不如给个稳定的编号 + 规模 + 重心 + 包围盒，让用户 / AI 自己对照认。
+   已知局限（说实话）：两块要是贴在一起（没有缝），会被当成一坨。 */
+let geoCache = null;
+/* 体素边长不能写死：导入器的神经元间距是 1，别人自己搭的工程可能就是 10。
+   办法：包围盒体积 ÷ 神经元数 = 平均每个神经元占多大空间，开三次方就是平均间距，
+   乘 2.5 当体素边长（同一坨里挨着的神经元一定落进同一个或紧邻的体素）。
+   包围盒退化成薄片 / 一条线时体积是 0，改用最长边 ÷ 个数的三次方根。 */
+function geoVoxelSize() {
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+  for (let i = 0; i < G.n; i++) {
+    const p = i * 3, x = nPos[p], y = nPos[p + 1], z = nPos[p + 2];
+    if (x < x0) x0 = x; if (x > x1) x1 = x;
+    if (y < y0) y0 = y; if (y > y1) y1 = y;
+    if (z < z0) z0 = z; if (z > z1) z1 = z;
+  }
+  const n = Math.max(1, G.n);
+  const vol = Math.max(0, x1 - x0) * Math.max(0, y1 - y0) * Math.max(0, z1 - z0);
+  let sp = vol > 0 ? Math.cbrt(vol / n) : 0;
+  if (!(sp > 0)) sp = Math.max(x1 - x0, y1 - y0, z1 - z0) / Math.max(1, Math.cbrt(n));
+  if (!(sp > 0)) sp = 1;
+  return Math.max(2, Math.min(32, sp * 2.5));
+}
+
+function geoComponents(vs) {
+  const n = G.n, vb = new Map();
+  for (let i = 0; i < n; i++) {
+    const p = i * 3;
+    const k = Math.floor(nPos[p] / vs) + "," + Math.floor(nPos[p + 1] / vs) + "," + Math.floor(nPos[p + 2] / vs);
+    let a = vb.get(k);
+    if (!a) { a = []; vb.set(k, a); }
+    a.push(i);
+  }
+  const seen = new Set(), comps = [];
+  for (const start of vb.keys()) {
+    if (seen.has(start)) continue;
+    seen.add(start);
+    const stack = [start], ids = [];
+    const colN = new Map();   /* 这一坨里各色号各有几个：几何认区也要能按色号寻址 */
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    while (stack.length) {
+      const cur = stack.pop();
+      const arr = vb.get(cur);
+      for (let q = 0; q < arr.length; q++) {
+        const i = arr[q], p = i * 3, x = nPos[p], y = nPos[p + 1], z = nPos[p + 2];
+        ids.push(i);
+        const hx = hexOf(i); colN.set(hx, (colN.get(hx) || 0) + 1);
+        if (x < x0) x0 = x; if (x > x1) x1 = x;
+        if (y < y0) y0 = y; if (y > y1) y1 = y;
+        if (z < z0) z0 = z; if (z > z1) z1 = z;
+      }
+      const pr = cur.split(","), a = +pr[0], b = +pr[1], c = +pr[2];
+      for (let da = -1; da <= 1; da++) for (let db = -1; db <= 1; db++) for (let dc = -1; dc <= 1; dc++) {
+        const nk = (a + da) + "," + (b + db) + "," + (c + dc);
+        if (!seen.has(nk) && vb.has(nk)) { seen.add(nk); stack.push(nk); }
+      }
+    }
+    ids.sort((u, v) => (nPos[u * 3 + 1] - nPos[v * 3 + 1]) || (nPos[u * 3 + 2] - nPos[v * 3 + 2]) || (nPos[u * 3] - nPos[v * 3]));
+    const hexes = Array.from(colN.entries()).sort((a, b) => b[1] - a[1]).map((e) => e[0]);
+    comps.push({ ids: ids, n: ids.length, hexes: hexes, x0: x0, x1: x1, y0: y0, y1: y1, z0: z0, z1: z1 });
+  }
+  comps.sort((p, q) => q.n - p.n);
+  return comps;
+}
+function geoRegions() {
+  if (geoCache && geoCache.epoch === posEpoch) return geoCache;
+  const comps = geoComponents(geoVoxelSize());
+  geoCache = { epoch: posEpoch, comps: comps, list: comps.map((cp, k) => ({
+    name: "区" + (k + 1), hex: cp.hexes[0] || "", hexes: cp.hexes, n: cp.n, geo: true, gi: k,
+    c: [_r3((cp.x0 + cp.x1) / 2), _r3((cp.y0 + cp.y1) / 2), _r3((cp.z0 + cp.z1) / 2)],
+    b: [_r3(cp.x0), _r3(cp.y0), _r3(cp.z0), _r3(cp.x1), _r3(cp.y1), _r3(cp.z1)]
+  })) };
+  return geoCache;
+}
+
 function regionMapInfo() {
+  const _bx = regionBoxes();
+  /* 每项都挂上重心 c 和包围盒 b：AI / 脚本按区摆位置时，有这两个数就够了。 */
+  const _putBox = (e) => {
+    const o = _bx.get(e.hex);
+    if (o && o.n) {
+      e.c = [_r3(o.sx / o.n), _r3(o.sy / o.n), _r3(o.sz / o.n)];
+      e.b = [_r3(o.x0), _r3(o.y0), _r3(o.z0), _r3(o.x1), _r3(o.y1), _r3(o.z1)];
+    }
+    return e;
+  };
   const hist = regionHistogram();
   const found = new Map();
   const rest = [];
@@ -4443,7 +4682,21 @@ function regionMapInfo() {
   const out = [];
   found.forEach((e) => out.push(e));
   for (let k = 0; k < rest.length; k++) { rest[k].name = byN.get(rest[k].n) || ''; out.push(rest[k]); }
+  /* 调色板一个区都没认出来、也没有名字可用 -> 说明这份工程的区色被换过了，
+     退回按几何认区（见 geoRegions 上面那段说明）。 */
+  if (!found.size && !out.some((e) => e.name)) {
+    /* 调色板一个区都没认出来 -> 几何认区的结果**换掉**按色号分的那一堆，不是追加。
+       为什么必须换：颜色被改成渐变色阶的工程（born-wired-cortex 就是），按色号分
+       出来的就是十几万条"没有名字、只有一个神经元"的区，region_map 一出来就把
+       对话撑爆、人也读不懂（实测 44 组）。换掉不影响按色号寻址——几何区自己带着
+       自己那几坨里出现过的色号（hexes），regionCellsOf 找不到按颜色分的那项时会
+       退到几何项：返回的是"这个色号属于哪个区"，比"这个色号有几个神经元"有用。 */
+    out.length = 0;
+    const gl = geoRegions().list;
+    for (let k = 0; k < gl.length; k++) out.push(gl[k]);
+  }
   out.sort((a, b) => b.n - a.n);
+  for (let k = 0; k < out.length; k++) _putBox(out[k]);
   return out;
 }
 function cellsOfRegion(hexes) {
@@ -4461,13 +4714,14 @@ function regionCellsOf(nameOrHex, limit) {
   let hit = null;
   if (/^#?[0-9a-fA-F]{6}$/.test(q)) {
     const h = q[0] === '#' ? q.toLowerCase() : ('#' + q.toLowerCase());
-    hit = map.filter((x) => x.hexes.indexOf(h) >= 0)[0] || null;
+    hit = map.filter((x) => !x.geo && x.hexes.indexOf(h) >= 0)[0] || map.filter((x) => x.hexes.indexOf(h) >= 0)[0] || null;
   } else {
     hit = map.filter((x) => x.name === q)[0] || null;
   }
   if (!hit) return null;
-  const ids = cellsOfRegion(hit.hexes);
-  return { name: hit.name, hex: hit.hex, hexes: hit.hexes, total: ids.length,
+  /* 几何认出来的区：细胞就在那个连通分量里，不用再按颜色扫一遍。 */
+  const ids = hit.geo ? geoRegions().comps[hit.gi].ids.slice() : cellsOfRegion(hit.hexes);
+  return { name: hit.name, hex: hit.hex, hexes: hit.hexes, geo: !!hit.geo, total: ids.length,
            ids: (limit | 0) > 0 ? ids.slice(0, limit | 0) : ids };
 }
 /* 把两条通道一次性建好（观测进 / 控制出），跟 tools/bridge_mujoco.py 的约定对齐：
@@ -5193,6 +5447,7 @@ function refreshAll() {
   blockTintFill();
   wAbsCache = null;   /* 权重 / 拓扑可能刚变过：阈值统计那点缓存作废 */
   renderInspector();
+  updateStarter();   /* 空工程 / 第一次打开的起步卡片：有神经元了它自己收起来 */
   requestRender();
 }
 function updateStatsOnly() {
@@ -6149,16 +6404,114 @@ function moveNodes(nodes, dx, dy, dz) {
   for (const i of nodes) { nPos[i * 3] += dx; nPos[i * 3 + 1] += dy; nPos[i * 3 + 2] += dz; }
   afterNodePosChange(nodes);
 }
+/* 以这一批神经元**当前包围盒的中心**为原点，按轴缩放（做形状用）。
+   跟 moveNodes 是一对：一个挪、一个改形状，都是"一次动一大批"的入口。
+   为什么要它：AI 想给一个区改形状（让视觉区扁一点、听觉区拉长），
+   不该去把五万个神经元编号写进对话里——那是几十万字的上下文，写不下也不该写。 */
+function nodesCenter(nodes) {
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+  for (let k = 0; k < nodes.length; k++) {
+    const p = nodes[k] * 3, x = nPos[p], y = nPos[p + 1], z = nPos[p + 2];
+    if (x < x0) x0 = x; if (x > x1) x1 = x;
+    if (y < y0) y0 = y; if (y > y1) y1 = y;
+    if (z < z0) z0 = z; if (z > z1) z1 = z;
+  }
+  return { cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, cz: (z0 + z1) / 2 };
+}
+/* 以给定中心按轴缩放。中心单独算的必要性：分片搬的时候，每片只能按**整批**的中心缩放，
+   各片按自己的中心缩放会把一整个区越缩越散（那是错的）。 */
+function scaleNodesAbout(nodes, c, sx, sy, sz) {
+  for (let k = 0; k < nodes.length; k++) {
+    const p = nodes[k] * 3;
+    nPos[p] = c.cx + (nPos[p] - c.cx) * sx;
+    nPos[p + 1] = c.cy + (nPos[p + 1] - c.cy) * sy;
+    nPos[p + 2] = c.cz + (nPos[p + 2] - c.cz) * sz;
+  }
+  afterNodePosChange(nodes);
+  return nodes.length;
+}
+function scaleNodes(nodes, sx, sy, sz) {
+  if (!nodes.length) return 0;
+  return scaleNodesAbout(nodes, nodesCenter(nodes), sx, sy, sz);
+}
+/* 一批好几万个神经元时别把一帧占满：分片做，片与片之间把主线程让出来。
+   为什么必须让：AI 连着搬十几个区做整体布局时，同步做完是**一整段 8.5 秒的堵**
+   （实测：那 8.5 秒里 rAF 只跑了一帧，界面全程是死的，按钮点不动）。分片之后总耗时
+   差不多，但这段时间界面一直活着：看得见区在动，也点得动「停止」。
+   让出的写法是 rAF 和 60ms 超时赛跑 —— 窗口最小化时 rAF 会被节流，干等 rAF 会让 AI 等半天。 */
+const NODE_SLICE = 4000;
+async function sliceRun(nodes, fn) {
+  if (nodes.length <= NODE_SLICE) { fn(nodes); return 1; }
+  let slices = 0;
+  for (let k = 0; k < nodes.length; k += NODE_SLICE) {
+    const end = Math.min(nodes.length, k + NODE_SLICE);
+    const part = [];
+    for (let j = k; j < end; j++) part.push(nodes[j]);
+    fn(part);
+    slices++;
+    await new Promise((res) => {
+      let done = false;
+      const fin = () => { if (!done) { done = true; res(); } };
+      requestAnimationFrame(fin);
+      setTimeout(fin, 60);
+    });
+  }
+  return slices;
+}
+
 function afterNodeParamChange(nodes) {
   for (const i of nodes) writeNeuron(i, true);
   markDirty(); refreshAll();
 }
+
+/* 长循环里定时把主线程让出去：账本是 {t}，每超过 budget 毫秒就让一次（setTimeout(0) 是宏任务，
+   浏览器能趁机画一帧）。用在编码这种"总量很大但可以分段"的地方：字节一个不差，只是不再一口气堵住。 */
+async function longLoopYield(mark, budget) {
+  if (performance.now() - mark.t < budget) return false;
+  mark.t = performance.now();
+  await new Promise((r) => setTimeout(r, 0));
+  return true;
+}
+/* 坐标改动的收尾。分两段：
+   ① 必须同步做的：写坐标本身 + 把新坐标喂给大数据层的位置纹理
+      （连线的端点坐标就是从那张纹理里按神经元下标查的，见 bigPosTouch）；
+   ② 贵的收尾：边、选中网格、权重块 / 算子、markDirty + refreshAll。
+
+   ★ ② 里的 updateEdgesOf 在**大数据层上是纯无用功**：那一层的边缓冲只存
+     [源, 目标, 权重, 状态位]（见 bigWriteEdge），端点坐标是着色器自己按下标从位置纹理里查的
+     （见着色器里的 neuronPos）。所以坐标一动，纹理跟着动就够了，边一条都不用重写。
+     而 updateEdgesOf 是"这条边的每个端点都写一遍"——born-wired-cortex 这个工程平均
+     一个神经元 117 条相邻边，搬一个 5 万神经元的区就是 620 万次白干（实测 ~0.3ms/神经元，
+     一次要十几秒，界面就"未响应"了）。小工程不走大数据层，那一层是把坐标烘进实例矩阵的，
+     必须照旧重写，所以这里要判 BIG.on。
+
+   ★ ② 还要攒：脚本 / AI 一个区一个区地摆时，几十次调用并到一帧做一次。
+     不然每次调用那 18ms 的全量刷新会乘上调用次数（单个 NF.setPos 实测就是 18ms）。 */
 function afterNodePosChange(nodes) {
   for (const i of nodes) writeNeuron(i, false);
-  invalidatePick(); updateEdgesOf(nodes); rebuildSelMesh();
-  updateBlocksOf(nodes); updateOpsOf(nodes);
+  invalidatePick();
+  posDirtyAdd(nodes);
+}
+let posPend = null, posRAF = 0;
+let posEpoch = 0;   /* 坐标每动一批就 +1：给「按几何认区」的缓存做失效标记 */
+function posDirtyAdd(nodes) {
+  posEpoch++;
+  if (!posPend) posPend = new Set();
+  for (const i of nodes) posPend.add(i);
+  if (!posRAF) posRAF = requestAnimationFrame(posFlush);
+}
+function posFlush() {
+  posRAF = 0;
+  if (!posPend) return;
+  const nodes = Array.from(posPend);
+  posPend = null;
+  if (!BIG.on) updateEdgesOf(nodes);   /* 大数据层不用写边：端点坐标在纹理里 */
+  rebuildSelMesh(); updateBlocksOf(nodes); updateOpsOf(nodes);
   markDirty(); refreshAll();
 }
+/* 需要"立刻拿到最新场面"的地方（截图 / 存盘 / 编译 / 自测）先把它清掉，
+   否则拿到的是上一帧的场面。平时不用手动调：一帧之内自己会刷。 */
+function posFlushNow() { if (posRAF) { cancelAnimationFrame(posRAF); posRAF = 0; } posFlush(); }
 function afterEdgeParamChange(edges) {
   viewStatsTouch();
   for (const e of edges) writeEdge(e, true);
@@ -8188,7 +8541,8 @@ function generatePyTorch(m, opts) {
   const pl = m.plast || { list: [], ix: [], prof: [], dt: [], hardSrc: [], pairSrc: [], pairDst: [], hardExported: true };
   const pAny = pl.list.length > 1;
   const pHard = pl.pairSrc.length > 0 && !m.recurrent;
-  const L = [];  /* 「造一个随机输入」集中在这一处：循环网是 3 维 (B, T, K)，前馈网还是 2 维 (B, K)。
+  const L = [];
+  /* 「造一个随机输入」集中在这一处：循环网是 3 维 (B, T, K)，前馈网还是 2 维 (B, K)。
      散在好几个函数里各写一遍迟早会漏改一个，漏了就是运行时报错。 */
   const RANDX = (b) => (m.recurrent
     ? 'torch.randn(' + b + ', NUM_STEPS, NUM_INPUTS)'
@@ -10007,9 +10361,22 @@ function idbOp(mode, fn) {
   }));
 }
 async function autosaveRun(force) {
+  /* 攒着的坐标刷新先做掉：不然存下来的"已保存"状态和场面会对不上（见 posFlushNow） */
+  posFlushNow();
   if (!AUTOSAVE.on && !force) return { ok: false, msg: '自动保存是关的' };
   if (AUTOSAVE.busy) { AUTOSAVE.later = true; return { ok: false, msg: '上一轮还没写完' }; }
   if (!G.n) return { ok: false, msg: '空工程不存' };
+  /* 手上正忙的时候先别存：AI 正在搬神经元、或者用户手上正拖着东西，这时候插一次
+     一百多 MB 的编码 + 写库，等于在已经满载的主线程上再压一段（这台上实测：
+     104 MB 工程存一次 4.1 秒，其中最长一次卡顿 1.7 秒）。等这轮忙完再存：4 秒后重排队。
+     但也不能一直不存：AI 一跑几十分钟，中途崩了就白干。所以拖拽期间一律不存，
+     AI 跑着的时候最多一分钟存一次。 */
+  const saveBusy = S.drag || S.marquee || (AI.busy && (Date.now() - (AUTOSAVE.ts || 0)) < 60000);
+  if (!force && saveBusy) {
+    AUTOSAVE.later = true;
+    autosaveSchedule(4000);
+    return { ok: false, msg: '正在忙（AI 在跑 / 手上拖着东西），自动保存这轮先跳过' };
+  }
   /* 流式打开的工程还没全载进来：这时候存下来是一张残缺的图，会把本机那份好的
      自动保存盖掉。宁可跳过（「保存工程」那边同样拦着，说明白给用户看）。 */
   if (streamSaveBlocked()) return { ok: false, msg: '流式载入的工程还没全部载入（' + STREAM.done + ' / ' + STREAM.chunks.length + ' 块），本机自动保存先跳过' };
@@ -10359,7 +10726,15 @@ function deserialize(o) {
    ========================================================================== */
 const NF3_MAGIC = [0x4e, 0x46, 0x4f, 0x52, 0x47, 0x45, 0x33, 0x00];
 const NF3_HEAD_OFF = 16;
-const NF3_CHUNK_NEURONS = 65536;
+/* 一块多少神经元。**这个数直接决定"最卡的一次"有多长**：一圈神经元块是一口气编码 +
+   压缩出来的（中间没有让出主线程的机会），块越大那一下越久。这台上拿 14.4 万神经元 /
+   1680 万条边的工程实测（同一份数据，只改这个数）：
+     65536 -> 整段 3.85 秒，最长一次卡顿 2043 毫秒，文件 103.6 MB
+     16384 -> 整段 4.02 秒，最长一次卡顿  869 毫秒，文件 103.6 MB
+      4096 -> 整段 3.77 秒，最长一次卡顿  297 毫秒，文件 103.8 MB
+   总耗时和文件大小几乎不变（小块多切几段，压缩率差 0.2%），但最坏的那一下小 7 倍。
+   块小还有个好处：流式载入 / 分块剔除是一块一块挑的，块小 = 能挑得更准。 */
+const NF3_CHUNK_NEURONS = 4096;
 const NF3_MIN_ZIP = 2048;
 const NF3_ORDER_LINEAR = 'linear', NF3_ORDER_SPATIAL = 'spatial';
 const NF3_MORTON_LEVELS = 10;              /* 每轴 10 位 -> 30 位 Morton 码 */
@@ -10605,10 +10980,11 @@ function nf3BlockPartBBox(list) {
   return [r3(x0), r3(y0), r3(z0), r3(x1), r3(y1), r3(z1)];
 }
 /* 把块区所有块编成"一块一段"的原始字节（还没压）。off / len / codec 由调用方填。 */
-function nf3BlocksPartsRaw(rank) {
+async function nf3BlocksPartsRaw(rank) {
   const parts = [], blobs = [];
   let sumK = 0, sumN = 0, totalW = 0, totalAll = 0, hasLock = false;
   const done = new Set();
+  const _ytick = { t: performance.now() };
   for (let i = 0; i < blocks.length; i++) {
     if (done.has(i)) continue;
     /* 共享参数组整个进同一段：引用表只在段内有效，拆开就有一半读不回来 */
@@ -10629,6 +11005,7 @@ function nf3BlocksPartsRaw(rank) {
     parts.push({ i: parts.length, k: rows, n: cols, b: list.length, blocks: mem.slice(),
                  weights: reg.totalW, all: all, raw: reg.u8.length, bbox: nf3BlockPartBBox(list) });
     blobs.push(reg.u8);
+    await longLoopYield(_ytick, 120);
   }
   return { nb: blocks.length, sumK: sumK, sumN: sumN, totalW: totalW, totalAll: totalAll,
            hasLock: hasLock, parts: parts, blobs: blobs };
@@ -11223,7 +11600,7 @@ async function nforge3Encode(opt) {
   const blockBlobs = [];
   if (!(opt && opt.blockParts === false)) {
     /* 默认「一块一段」：每段独立压缩、独立定位，读的时候才挑得动。 */
-    const bp = nf3BlocksPartsRaw(rank);
+    const bp = await nf3BlocksPartsRaw(rank);
     if (bp.nb) {
       let boff = 0, brawTot = 0;
       for (let i = 0; i < bp.parts.length; i++) {
@@ -11263,6 +11640,7 @@ async function nforge3Encode(opt) {
   const opsBlobs = [];
   {
     const op = nf3OpsPartsRaw(rank);
+    const _ytick = { t: performance.now() };
     if (op) {
       let ooff = 0, orawTot = 0;
       for (let i = 0; i < op.parts.length; i++) {
@@ -11275,6 +11653,7 @@ async function nforge3Encode(opt) {
         op.parts[i].off = ooff; op.parts[i].len = body.length; op.parts[i].codec = codec;
         orawTot += op.parts[i].raw;
         opsBlobs.push(body);
+        await longLoopYield(_ytick, 120);
         ooff += body.length;
       }
       opsMeta = { count: op.dir.length,
@@ -12933,6 +13312,8 @@ function streamSaveBlocked() {
    这不改内存里这张图（编号、选中、撤销栈都不动），只是写出去的文件里下标换了一套。
    所以文件名加 .spatial 后缀，不覆盖原来那份。 */
 async function saveProject(opt) {
+  /* 攒着的坐标刷新先做掉：不然存下来的"已保存"状态和场面会对不上（见 posFlushNow） */
+  posFlushNow();
   if (streamSaveBlocked()) {
     toast('流式载入的工程还没全部载入（' + STREAM.done + ' / ' + STREAM.chunks.length +
       ' 块）。先点左栏的「全部载入」再保存，否则存下来的是一张残缺的图。', 'warn');
@@ -13128,6 +13509,8 @@ function newProject() {
   plastReset();    /* 档位表也是跟着工程走的，新建工程 = 回到「只有固定（不学习）」 */
   rebuildAdjacency(); rebuildScene(); resetHistory(); refreshAll(); updateProjName();
   aiResetSessions('新建工程');
+  starterReset();   /* 刚清空过，正是最需要这张卡片的时候 */
+  updateStarter();
   toast('已新建空白工程');
 }
 
@@ -19029,6 +19412,7 @@ window.NF = {
      就得先 base64 成 140 MB 的字符串，白吃内存还容易撞上限。这条是编码完直接一段段写盘。
      返回字节数和规模，方便 AI 汇报"存到哪、多大"。 */
   saveTo: (path, opt) => (async () => {
+    posFlushNow();
     const p = String(path == null ? "" : path).trim();
     if (!p) throw new Error("要存到哪个路径？path 不能空。");
     const b = await nforge3Encode(opt || {});
@@ -19036,6 +19420,8 @@ window.NF = {
     return { path: p, bytes: b.length, neurons: G.n, edges: G.e };
   })(),
   /* ---- 一键对接物理仿真 ---- */
+  /* 把攒着的坐标刷新立刻做掉（截图 / 存盘 / 自测用；平时一帧内自动刷） */
+  flushPos: () => { posFlushNow(); return true; },
   regionMap: () => regionMapInfo(),
   regionCells: (nameOrHex, limit) => regionCellsOf(nameOrHex, limit),
   wireMujoco: (o) => wireMujoco(o || {}),
@@ -19333,6 +19719,13 @@ window.NF = {
   graphBounds: () => { const b = graphBounds(true);
                        return b ? { cx: b.cx, cy: b.cy, cz: b.cz, r: b.r, span: b.span } : null; },
   viewFill: () => viewFill(),
+  /* 界面语言自动判定的纯函数（按系统语言列表给 zh / en），测试用它，不依赖跑它的机器 */
+  langDetect: (list) => detectLangFrom(list),
+  /* 起步卡片：空工程 / 第一次打开时的那张「挑一条路」 */
+  starter: () => starterState(),
+  /* 模拟「第一次打开」（图上已经有东西也强行露一次头）：只有自测会调它 */
+  starterForce: () => { STARTER.hidden = false; STARTER.force = true; STARTER.n0 = G.n; STARTER.key = '';
+                        updateStarter(); return starterState(); },
   voidHint: () => { const el = document.getElementById('voidhint');
                     return { shown: !!(el && el.classList.contains('show')), away: voidArrow }; },
   setCam: (px, py, pz, tx, ty, tz) => {
@@ -19414,6 +19807,8 @@ window.NF = {
   /* 渲染一帧并读回像素。同一视角下"开剔除 / 关剔除"必须逐像素一致——
      块级剔除唯一的验收标准就是"画面不能变"。 */
   grabFrame: () => {
+  /* 攒着的坐标刷新先做掉：不然存下来的"已保存"状态和场面会对不上（见 posFlushNow） */
+    posFlushNow();
     if (BUILD.active) scenePump(Infinity);
     updateChunkVisibility();
     /* 脚本 / 自测读到的必须是用户会看到的那一帧：视距自适应也得走一遍 */
@@ -19893,7 +20288,7 @@ window.NF = {
   aiLog: () => AI.log.slice(0),
   aiSend: (text) => aiAsk(text),
   /* 视口截图（dataURL）+ 「看画面」这条路的状态。没配视觉端点时 aiShot 只会截好留着、不发出去 */
-  shot: (maxW) => snapshotDataURL(maxW),
+  shot: (maxW) => { posFlushNow(); return snapshotDataURL(maxW); },
   aiShot: (text) => aiShotAsk(text),
   aiVis: () => { const v = aiVisInfo(); return { ready: !!v, mode: v ? v.mode : null, own: v ? v.own : false,
     base: v ? v.base : '', model: v ? v.model : '', cfgBase: AI.visBase, cfgModel: AI.visModel, shots: AI.shotN }; },
@@ -20045,6 +20440,7 @@ const AI = {
   /* 「外部操作」两道门，默认关，而且**故意不写进 localStorage**：每次打开软件都要用户重新勾一次。
      fs  = 按路径读写文件 / 从网上下东西；run = 在本机跑命令（等于把这台机器交给对面的模型）。
      只对桌面版有效：浏览器里没有这条通道，勾了也没用。 */
+  lastFinish: '',
   sysFs: false, sysRun: false,
   /* 当前 msgs[0] 里装的是哪一版系统提示词（true = 瘦身版）。null = 还不知道，发请求前对一次。 */
   sysSlim: null,
@@ -20822,11 +21218,16 @@ const AI_TOOLS = [
       afterNodeParamChange(nodes);
       return { nodes: nodes.length, changed: done, keepBumped: bumped };
     } },
-  { name: 'set_pos', desc: '改神经元坐标。给绝对坐标 px/py/pz（只作用于第一个），或给相对偏移 dx/dy/dz（作用于全部）。',
-    args: { nodes: ['int[]?', '默认用当前选中'], px: ['num?'], py: ['num?'], pz: ['num?'], dx: ['num?'], dy: ['num?'], dz: ['num?'] },
+  { name: 'set_pos', desc: '改神经元坐标。挑对象有三种：nodes 给一批编号；region 给区名或色号（region_map 的结果），一次作用整个区——几万个编号不用写出来；两个都不给就用当前选中。平移用 dx/dy/dz；px/py/pz 是绝对坐标（只作用于第一个）；sx/sy/sz 是以这一批当前包围盒的中心按轴缩放（1 = 不变，做形状用：把一区压扁 / 拉长就是这个）。',
+    args: { nodes: ['int[]?', '默认用当前选中'], region: ['str?', '区名或色号；给了它就作用整个区'], px: ['num?'], py: ['num?'], pz: ['num?'], dx: ['num?'], dy: ['num?'], dz: ['num?'], sx: ['num?'], sy: ['num?'], sz: ['num?'] },
     api: 'setPos', mut: true,
-    run: (a) => {
-      const nodes = (a.nodes && a.nodes.length) ? a.nodes : selectedNodes();
+    run: async (a) => {
+      let nodes;
+      if (a.region !== undefined && String(a.region).trim()) {
+        const rr = regionCellsOf(String(a.region).trim());
+        if (!rr) throw new Error('认不出这个区「' + a.region + '」：先用 region_map 看有哪些区，名字或色号都能填');
+        nodes = rr.ids;
+      } else nodes = (a.nodes && a.nodes.length) ? a.nodes : selectedNodes();
       if (!nodes.length) throw new Error('没有指定神经元，也没有选中');
       if (a.px !== undefined || a.py !== undefined || a.pz !== undefined) {
         const i = nodes[0];
@@ -20835,7 +21236,15 @@ const AI_TOOLS = [
         if (a.pz !== undefined) nPos[i * 3 + 2] = a.pz;
         afterNodePosChange([i]);
       }
-      if (a.dx || a.dy || a.dz) moveNodes(nodes, a.dx || 0, a.dy || 0, a.dz || 0);
+      /* 大区走分片：一次几万个神经元，同步做完会把主线程堵死（见 sliceRun）。
+         分片不影响结果，返回前所有片都做完了。 */
+      if (a.dx || a.dy || a.dz) await sliceRun(nodes, (part) => moveNodes(part, a.dx || 0, a.dy || 0, a.dz || 0));
+      if (a.sx || a.sy || a.sz) {
+        /* 中心只算一次：每片按整批的中心缩放，各自按自己的中心缩会越缩越散（见 scaleNodesAbout）。 */
+        const c = nodesCenter(nodes);
+        const sx = a.sx === undefined ? 1 : a.sx, sy = a.sy === undefined ? 1 : a.sy, sz = a.sz === undefined ? 1 : a.sz;
+        await sliceRun(nodes, (part) => scaleNodesAbout(part, c, sx, sy, sz));
+      }
       return { nodes: nodes.length };
     } },
   { name: 'set_weights', desc: '批量改权重。op=set|add|mul|random|xavier|neg|zero（value 用于 set/add/mul）。不给 edges 就用当前选中的连接。',
@@ -20865,9 +21274,11 @@ const AI_TOOLS = [
   { name: 'export_model', desc: '**把编译好的模型文件直接写到指定目录**（桌面版 + 「读写文件」开关）：主代码、model.bin、元数据一起写，不弹对话框、不用人点。等到要"生成能用的模型文件"、或者"把调完参的网络导出去"时用这个。',
     args: { dir: ['str', '输出目录（会直接写进去）'], target: ['str?', 'pytorch（默认）| onnx | c（独立可执行）'], train: ['bool?', '连训练脚手架一起给（默认按界面上的设置）'] },
     api: 'exportArtifacts', run: (a) => window.NF.exportArtifacts(a.dir, a.target, a.train === undefined ? {} : { train: DLG.train }) },
-  { name: 'region_map', desc: '列出这个工程里的"脑区"：每个区一个颜色、各有多少个神经元、区名是什么。导入工具（像 import_bwc.py）会给每个区上一种专属颜色，这里按"颜色 + 个数"把它们认出来。接仿真、按区标记接口、按区调参时先看它。', 
+  { name: 'region_map', desc: '列出这个工程里的「脑区」：每个区一个颜色、各有多少个神经元、区名是什么。导入工具（像 import_bwc.py）会给每个区上一种专属颜色，这里按「颜色 + 个数」认区。**每项带重心 c=[x,y,z] 和包围盒 b=[x0,y0,z0,x1,y1,z1]**——按区摆位置用这两个数就够。区色被人换过的工程（调色板一个都对不上）会**退回按几何认区**：名字是 区1、区2…（按规模从大到小），一样带 c / b，一样能喂给 region_cells 和 set_pos 的 region。接仿真、按区标记接口、按区调参、按区摆布局时先看它。', 
+  /* region_map 返回的每项还带重心 c=[x,y,z] 和包围盒 b=[x0,y0,z0,x1,y1,z1]：
+     按区摆位置时用这两个数就够了，不用把几万个编号取出来。 */
     args: {}, api: 'regionMap', run: () => window.NF.regionMap() },
-  { name: 'region_cells', desc: '按区名（如 本体感觉 / 运动 / 视觉）或色号取这一区的神经元编号，**顺序就是导入时这一区内部的细胞编号**（按立方体布局的层→行→列还原）。不填 limit 就全给（大区会很长，先用 region_map 看规模）。',
+  { name: 'region_cells', desc: '按区名（如 本体感觉 / 运动 / 视觉）或色号、或几何认出来的编号名（区1、区2…）取这一区的神经元编号。**大区别把 ids 拉进对话**（一区几万个编号＝几十万字）：要按区改坐标就用 set_pos 的 region，要按区连线就用 batch_connect 的 nodes 配合少量抽样。不填 limit 就全给，先用 region_map 看规模。',
     args: { region: ['str', '区名或 #rrggbb'], limit: ['int?', '最多给几个，默认 0 = 全给'] },
     api: 'regionCells', run: (a) => window.NF.regionCells(a.region, a.limit | 0) },
   { name: 'wire_mujoco', desc: '**一键把物理仿真接好**：认出观测区（默认本体感觉）和输出细胞，把它们标成输入/输出，再建好两条 UDP 通道（观测进 obsPort、控制出 actPort），并返回那边该跑的命令行。接 MuJoCo / PyBullet 这类仿真时用这个，比一条条 iface_chan_add 稳。要桌面版才有 UDP。输出细胞的挑法：outCells 给了就用它，没给就用**已经标成「输出」的细胞**，还没标就用整个输出区。返回里的 fold 是「每几个细胞压成一路执行器」。返回里三个数别搞混：dimsOnWire = 每帧真发出去几个浮点（= 输出细胞数，出通道一个信号位一个值、不折叠）；groups = 桥按 fold 压完之后的路数（= outCells/fold）；executors = 身体真正有几个执行器（只有传了 actCount 才知道，不知道就是 null，最终由桥按模型自己定）。born-wired-cortex 那种每块肌肉 10 个细胞排下来的工程，fold=10 正好是每块肌肉一路；它的运动区 160 = 腿 12×10 + 眼球 4×10，接 Go2（12 个执行器）要传 actCount=12，多出来的 4 组眼球肌桥会丢掉，那是身体没眼球、不是接线错。',
@@ -21953,6 +22364,18 @@ function aiThinkReject(status, text) {
 }
 /* 统一的发请求：第一次按用户选的思考强度发，端点不认就摘掉重试一次。
    返回 { res, think } —— think 记着这一次到底带没带思考参数（带没带决定思维链要不要回传）。 */
+/* 自动最大输出（设置里「最大输出」= 0 时走这里）。
+   ★ 开了思考就必须多给：思维链和正文/工具调用**共用同一份 max_tokens**。
+   实测 deepseek-flash + reasoning_effort:max（配 72k 字手册）：给 4000 的时候思维链把它
+   全吃光，正文和工具调用一个都没出来，界面上只留一句「（这条没有文字回复）」——
+   看着就像软件坏了。DeepSeek 默认档位也是开着思考的，所以只有明确关掉（off）才用老的那两个数。
+   本机端点（Ollama / LM Studio / llama.cpp）不动：那边显存紧张，max_tokens 给太大直接爆显存，
+   用户自己在设置里压多少就是多少。 */
+function aiAutoMaxTok(stream) {
+  if (aiLocalNow() || aiThinkNorm(AI.think) === 'off') return stream ? 4000 : 3000;
+  return stream ? 32000 : 24000;
+}
+
 async function aiChatFetch(stream, messages, useTools, V, signal, maxTokens) {
   for (let attempt = 0; ; attempt++) {
     const think = attempt === 0 ? (V ? null : aiThinkFields()) : null;
@@ -22018,7 +22441,7 @@ async function aiChatFetch(stream, messages, useTools, V, signal, maxTokens) {
 }
 async function aiFetchChat(messages, useTools, vis, signal) {
   const V = vis || null;
-  const res = (await aiChatFetch(false, messages, useTools, V, signal, 3000)).res;
+  const res = (await aiChatFetch(false, messages, useTools, V, signal, aiAutoMaxTok(false))).res;
   const text = await res.text();
   if (!res.ok) {
     const err = new Error('接口返回 HTTP ' + res.status + '：' + text.slice(0, 400));
@@ -22031,6 +22454,7 @@ async function aiFetchChat(messages, useTools, vis, signal) {
   const ch = data && data.choices && data.choices[0];
   if (!ch || !ch.message) throw new Error('返回里没有 choices[0].message');
   if (data.usage) AI.usage = data.usage;
+  AI.lastFinish = ch.finish_reason || '';
   return ch.message;
 }
 
@@ -22040,7 +22464,7 @@ async function aiFetchChat(messages, useTools, vis, signal) {
    tool_calls 在流里是一段一段挤出来的：按 index 攒，name 和 arguments 都是拼接。 */
 async function aiFetchChatStream(messages, useTools, vis, onDelta, signal) {
   const V = vis || null;
-  const res = (await aiChatFetch(true, messages, useTools, V, signal, 4000)).res;
+  const res = (await aiChatFetch(true, messages, useTools, V, signal, aiAutoMaxTok(true))).res;
   if (!res.ok) {
     let t = '';
     try { t = await res.text(); } catch (e) {}
@@ -22056,6 +22480,7 @@ async function aiFetchChatStream(messages, useTools, vis, onDelta, signal) {
     const ch = data && data.choices && data.choices[0];
     if (!ch || !ch.message) throw new Error('返回里没有 choices[0].message');
     if (data.usage) AI.usage = data.usage;
+    AI.lastFinish = ch.finish_reason || '';
     return ch.message;
   }
   const reader = res.body.getReader();
@@ -22102,6 +22527,7 @@ async function aiFetchChatStream(messages, useTools, vis, onDelta, signal) {
         }
         if (onDelta) onDelta(content, think);
       }
+      if (ch.finish_reason) AI.lastFinish = ch.finish_reason;
       if (ch.finish_reason && onDelta) onDelta(content, think);
     }
   }
@@ -22296,7 +22722,14 @@ async function aiAsk(text, image) {
       const calls = aiParseCalls(msg);
       const native = !!(msg.tool_calls && msg.tool_calls.length);
       if (!calls.length) {
-        const say = String(msg.content || '').trim() || '(这条没有文字回复)';
+        const raw = String(msg.content || '').trim();
+        /* 空回复：以前只写一句「(这条没有文字回复)」——用户根本不知道发生了什么。
+           真正的原因几乎总是「思维链把最大输出吃光了」（finish_reason = length），
+           所以直接把该动哪个开关写出来。 */
+        const ranOut = !raw && (AI.lastFinish === 'length' || !!String(msg.reasoning_content || '').trim());
+        const say = raw || (ranOut
+          ? '（模型思考完却没吐出正文：最大输出被思维链吃光了。设置 → 最大输出 填 32000，或把思考强度降一档，再发一次）'
+          : '(这条没有文字回复)');
         AI.live = ''; AI.liveThink = '';
         aiPush({ role: 'assistant', text: say, think: msg.reasoning_content || '' });
         AI.msgs.push({ role: 'assistant', content: say });
@@ -23331,6 +23764,7 @@ uiLoad();
 modLoad();
 aiLoadCfg();
 aiBind();
+starterBind();
 /* 设置目录 / 工具目录 / 自定义工具：异步的，不挡启动 */
 applyAppearance(false);
 aiCfgBoot().then(function () { applyAppearance(false); }).catch(function () {});
@@ -23345,6 +23779,9 @@ refreshIOPanel();
 setTool('select');
 resetHistory();
 loadDemo();
+/* 第一次打开这台机器上的软件（没记过 nf.seen）：起步卡片露一次头，人一动手就自己收回去 */
+try { if (!localStorage.getItem('nf.seen')) { STARTER.force = true; STARTER.n0 = G.n; } } catch (e) {}
+updateStarter();
 aiNewSession('启动');
 resize();
 refreshLangMenu();
@@ -23357,3 +23794,13 @@ setStatus('就绪 — 右键旋转 / 中键平移 / 滚轮缩放；按 F7 编译
 setTimeout(() => { autosaveProbe(); }, 1500);
 setTimeout(() => toast('原型已就绪：试试 S/W/A/D 切换工具，或按 F7 编译生成 PyTorch 模型', 'ok'), 500);
 console.log('%cNeuroForge v0.1', 'color:#2f81f7;font-weight:bold', '数据模型: SoA typed array / 渲染: InstancedMesh / 拾取: 网格+DDA');
+
+
+
+
+
+
+
+
+
+
