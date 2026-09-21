@@ -61,6 +61,11 @@ everything inlined, no network access needed). Download it from Releases and dou
 | Undo / redo | `Ctrl+Z` / `Ctrl+Y` |
 | Save / open | `Ctrl+S` / `Ctrl+O` |
 
+> **Set up the AI assistant before anything else.** It is how you actually drive the editor: you say
+> what you want and it places, wires, edits, simulates and compiles for you. It needs one API key,
+> or a local model (free, and nothing leaves your machine). Step-by-step with screenshots:
+> [`docs/ai-setup.zh-CN.md`](docs/ai-setup.zh-CN.md) — Chinese for now.
+
 ---
 
 ## What you can do with it

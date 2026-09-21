@@ -42,3 +42,6 @@ prototype/_*.html
 
 # MuJoCo 桥跑起来留下的日志（每次运行重写）
 MUJOCO_LOG.TXT
+
+# 教程截图的工作目录（成品已经拷进 docs/img/）
+_shots/
