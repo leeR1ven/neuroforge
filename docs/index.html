@@ -69,6 +69,10 @@ input[type=email]{flex:1 1 240px;padding:11px 13px;border-radius:8px;border:1px 
   background:#0e1118;color:var(--fg);font:inherit;font-size:15px}
 input[type=email]:focus{outline:none;border-color:var(--accent)}
 
+.steps{margin:0;padding-left:22px}
+.steps li{margin:0 0 9px;font-size:14.5px;color:var(--dim);line-height:1.65}
+.steps li b{color:var(--fg);font-weight:600}
+code{background:#1a1f2b;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:13px}
 .contactnum{margin:0 0 6px;font-size:26px;font-weight:700;letter-spacing:.6px;color:var(--accent2)}
 footer{border-top:1px solid var(--line);margin-top:44px;padding:24px 0 44px;font-size:13.5px;color:var(--dim)}
 footer p{margin:0 0 8px}
@@ -140,6 +144,23 @@ footer p{margin:0 0 8px}
     </div>
   </div>
 
+  <h2 data-en="Your first 10 minutes" data-zh="前 10 分钟做什么">Your first 10 minutes</h2>
+  <ol class="steps">
+    <li data-en="<b>Install and open.</b> The installer puts it in your user folder — no admin rights needed. Or just double-click the single-file HTML."
+        data-zh="<b>装好打开。</b>安装包装在当前用户目录，不需要管理员权限。或者直接双击那个单文件 HTML。"><b>Install and open.</b></li>
+    <li data-en="<b>Don't start from a blank space.</b> Open <code>sample-1-onnx-import.nforge</code> (grab it from the release) via File → Open. It's a 45-neuron network that came in from ONNX. Look around first."
+        data-zh="<b>别从空白开始。</b>菜单「文件 → 打开」，打开从 Release 下载的 <code>sample-1-onnx-import.nforge</code>——一个从 ONNX 导入的 45 神经元网络。先四处看看。"><b>Don't start from a blank space.</b></li>
+    <li data-en="Press <code>F9</code> to flip to the structure view — that's the operator graph as it looked before it was flattened into neurons."
+        data-zh="按 <code>F9</code> 翻到「结构视图」，那是它被折成神经元之前的算子图。">Press <code>F9</code> to flip to the structure view.</li>
+    <li data-en="Box-select a few neurons, then hit <b>Simulate</b> in the right panel and watch the signal travel wave by wave."
+        data-zh="框选几个神经元，右侧点「模拟激活」，看信号一波波传过去。">Box-select a few neurons, then hit <b>Simulate</b>.</li>
+    <li data-en="Want to see tied weights? Open <code>sample-2-tied-weights.nforge</code> — the same tensor shared by two operators."
+        data-zh="想看共享参数长什么样？打开 <code>sample-2-tied-weights.nforge</code>——同一个权重张量被两个算子共用。">Want to see tied weights?</li>
+    <li data-en="<b>Now build your own.</b> <code>A</code> places neurons, <code>W</code> wires them, <code>F7</code> compiles."
+        data-zh="<b>现在自己搭一个。</b><code>A</code> 放神经元，<code>W</code> 连线，<code>F7</code> 编译。"><b>Now build your own.</b></li>
+    <li data-en="<b>Stuck?</b> Ask the built-in assistant in plain language — it can place, wire, edit and compile for you."
+        data-zh="<b>卡住了？</b>直接用人话问内置的 AI 助手，放神经元、连线、改权重、编译它都能做。"><b>Stuck?</b> Ask the built-in assistant.</li>
+  </ol>
   <div class="signup">
     <h3 data-en="Questions? Ask me directly" data-zh="有问题直接找我">Questions? Ask me directly</h3>
     <p data-en="A community group is coming once there are enough people. Until then, reach me directly — I read everything."
@@ -166,7 +187,7 @@ footer p{margin:0 0 8px}
   function apply(){
     document.documentElement.lang = zh ? 'zh-CN' : 'en';
     document.querySelectorAll('[data-en]').forEach(function(el){
-      el.textContent = zh ? el.getAttribute('data-zh') : el.getAttribute('data-en');
+      el.innerHTML = zh ? el.getAttribute('data-zh') : el.getAttribute('data-en');
     });
     document.querySelectorAll('[data-en-placeholder]').forEach(function(el){
       el.placeholder = zh ? el.getAttribute('data-zh-placeholder') : el.getAttribute('data-en-placeholder');
