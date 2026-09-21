@@ -53,7 +53,7 @@
 
 > **先把 AI 助手配好，再谈别的。** 这个软件的操作界面就是 AI 助手：你说要什么，它帮你放神经元、
 > 连线、改权重、跑模拟、编译。要么填一个云端 API Key，要么接到本机的模型上（不花钱、
-> 数据也不出本机）。带截图的完整教程：[`docs/ai-setup.zh-CN.md`](docs/ai-setup.zh-CN.md)。
+> 数据也不出本机）。带截图的完整教程：[中文](docs/ai-setup.zh-CN.md) · [English](docs/ai-setup.md)。
 
 ---
 
