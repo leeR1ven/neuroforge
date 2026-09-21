@@ -1822,11 +1822,18 @@ function makeInstanced(geo, mat, cap, colored) {   /* 选中光晕层还在用 *
   }
   return m;
 }
-const nGeo = new THREE.IcosahedronGeometry(1, 1);
+/* 神经元图元：八面体（菱形）。半径就是「顶点到中心的距离」，跟原来的二十面体一个口径，
+   所以拾取（raySphere 用 radiusOf + 0.45）、剔除包围盒（nLayer.ext）、悬停环都不用跟着改。
+   顶点数：二十面体(detail 1) 80 面 240 顶点 → 八面体(detail 0) 8 面 24 顶点，
+   14 万个实例时顶点处理直接省掉一个数量级。OCTA_K 只是把视觉尺寸抬回去——
+   顶点都在半径上，但八面体的面比球「瘦」，不抬会显得比以前小一圈（radiusOf 本身不动）。
+   想要更圆一点就改成 OctahedronGeometry(OCTA_K, 1)（32 面），性能换外观自己权衡。 */
+const OCTA_K = 1.12;
+const nGeo = new THREE.OctahedronGeometry(OCTA_K, 0);
 const nMat = new THREE.MeshStandardMaterial({ roughness: 0.34, metalness: 0.12, flatShading: true });
 const eGeo = new THREE.CylinderGeometry(1, 1, 1, 6, 1, true);
 const eMat = new THREE.MeshStandardMaterial({ roughness: 0.5, metalness: 0.3 });
-const selGeo = new THREE.IcosahedronGeometry(1, 1);
+const selGeo = new THREE.OctahedronGeometry(OCTA_K, 0);
 const selMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.2, depthWrite: false });
 let N_CAP = 8192, E_CAP = 16384;
 let selMesh = makeInstanced(selGeo, selMat, N_CAP, false);
@@ -2109,7 +2116,7 @@ previewLine.visible = false; scene.add(previewLine);
 
 /* 放置预览点 */
 const ghost = new THREE.Mesh(
-  new THREE.IcosahedronGeometry(1.35, 1),
+  new THREE.OctahedronGeometry(1.35 * OCTA_K, 0),
   new THREE.MeshBasicMaterial({ color: 0x2f81f7, transparent: true, opacity: 0.45, wireframe: true })
 );
 ghost.visible = false; scene.add(ghost);
@@ -4526,7 +4533,7 @@ function pickInScreenRect(x0, y0, x1, y1, additive, what) {
    这一点很关键：不这么排，24 个身体特征就对不上那 480 个细胞。 */
 function regionHistogram() {
   const hist = new Map();
-  for (let i = 0; i < G.n; i++) { const h = hexOf(i); hist.set(h, (hist.get(h) || 0) + 1); }
+  for (let i = 0; i < G.n; i++) { const k = hexKeyOf(i); hist.set(k, (hist.get(k) || 0) + 1); }
   return hist;
 }
 /* 同上，但顺带把每个色号（= 每个区）的重心和包围盒也算出来。
@@ -4535,7 +4542,7 @@ function regionHistogram() {
 function regionBoxes() {
   const m = new Map();
   for (let i = 0; i < G.n; i++) {
-    const h = hexOf(i), p = i * 3;
+    const h = hexKeyOf(i), p = i * 3;
     const x = nPos[p], y = nPos[p + 1], z = nPos[p + 2];
     let e = m.get(h);
     if (!e) { e = { n: 0, sx: 0, sy: 0, sz: 0, x0: Infinity, x1: -Infinity, y0: Infinity, y1: -Infinity, z0: Infinity, z1: -Infinity }; m.set(h, e); }
@@ -4613,7 +4620,7 @@ function geoComponents(vs) {
       for (let q = 0; q < arr.length; q++) {
         const i = arr[q], p = i * 3, x = nPos[p], y = nPos[p + 1], z = nPos[p + 2];
         ids.push(i);
-        const hx = hexOf(i); colN.set(hx, (colN.get(hx) || 0) + 1);
+        const hx = hexKeyOf(i); colN.set(hx, (colN.get(hx) || 0) + 1);
         if (x < x0) x0 = x; if (x > x1) x1 = x;
         if (y < y0) y0 = y; if (y > y1) y1 = y;
         if (z < z0) z0 = z; if (z > z1) z1 = z;
@@ -4625,7 +4632,8 @@ function geoComponents(vs) {
       }
     }
     ids.sort((u, v) => (nPos[u * 3 + 1] - nPos[v * 3 + 1]) || (nPos[u * 3 + 2] - nPos[v * 3 + 2]) || (nPos[u * 3] - nPos[v * 3]));
-    const hexes = Array.from(colN.entries()).sort((a, b) => b[1] - a[1]).map((e) => e[0]);
+    /* 数字色号 → 字符串只在这一步做：条数是「这一坨里有几种颜色」，不是神经元个数 */
+    const hexes = Array.from(colN.entries()).sort((a, b) => b[1] - a[1]).map((e) => hexStrOf(e[0]));
     comps.push({ ids: ids, n: ids.length, hexes: hexes, x0: x0, x1: x1, y0: y0, y1: y1, z0: z0, z1: z1 });
   }
   comps.sort((p, q) => q.n - p.n);
@@ -4646,18 +4654,33 @@ function regionMapInfo() {
   const _bx = regionBoxes();
   /* 每项都挂上重心 c 和包围盒 b：AI / 脚本按区摆位置时，有这两个数就够了。 */
   const _putBox = (e) => {
-    const o = _bx.get(e.hex);
-    if (o && o.n) {
-      e.c = [_r3(o.sx / o.n), _r3(o.sy / o.n), _r3(o.sz / o.n)];
-      e.b = [_r3(o.x0), _r3(o.y0), _r3(o.z0), _r3(o.x1), _r3(o.y1), _r3(o.z1)];
+    /* 一个区常常落在不止一个色号上（导入器会把「有名字的细胞」提亮 0.25，于是同一个区
+       有两个色号），所以要把每个色号的盒子并起来：重心按个数加权，包围盒取并集。
+       ★ 这里原先只查 e.hex，而**调色板认出来的项根本没有 .hex 字段**（只有 hexes），
+       结果这份工程里 12 个有名字的区一直拿不到 c / b——region_map 的手册里却写着每项都有，
+       按区摆布局（「把视觉区挪到最后面」）全靠这两个数。改成按 hexes 查之后就都有了。 */
+    const list = (e.hexes && e.hexes.length) ? e.hexes : (e.hex ? [e.hex] : []);
+    let n = 0, sx = 0, sy = 0, sz = 0;
+    let X0 = Infinity, Y0 = Infinity, Z0 = Infinity, X1 = -Infinity, Y1 = -Infinity, Z1 = -Infinity;
+    for (let k = 0; k < list.length; k++) {
+      const o = _bx.get(hexToKey(list[k]));
+      if (!o || !o.n) continue;
+      n += o.n; sx += o.sx; sy += o.sy; sz += o.sz;
+      if (o.x0 < X0) X0 = o.x0; if (o.y0 < Y0) Y0 = o.y0; if (o.z0 < Z0) Z0 = o.z0;
+      if (o.x1 > X1) X1 = o.x1; if (o.y1 > Y1) Y1 = o.y1; if (o.z1 > Z1) Z1 = o.z1;
+    }
+    if (n) {
+      e.c = [_r3(sx / n), _r3(sy / n), _r3(sz / n)];
+      e.b = [_r3(X0), _r3(Y0), _r3(Z0), _r3(X1), _r3(Y1), _r3(Z1)];
     }
     return e;
   };
   const hist = regionHistogram();
   const found = new Map();
   const rest = [];
-  hist.forEach((cnt, hex) => {
-    _rcA.setHex(parseInt(hex.slice(1), 16));   /* 跟 hexOf 同一套转换：sRGB 色号 -> 线性值 */
+  hist.forEach((cnt, key) => {
+    const hex = hexStrOf(key);   /* 字符串只在拼输出时生成，扫色号那一段全程走数字 */
+    _rcA.setHex(key);   /* 跟 hexOf 同一套转换：sRGB 色号 -> 线性值 */
     const r = _rcA.r, g = _rcA.g, b = _rcA.b;
     let best = null, bd = 1e9;
     for (let pi = 0; pi < REGION_PALETTE.length; pi++) {
@@ -4700,9 +4723,10 @@ function regionMapInfo() {
   return out;
 }
 function cellsOfRegion(hexes) {
-  const want = new Set(hexes);
+  const want = new Set();
+  for (let k = 0; k < hexes.length; k++) want.add(hexToKey(hexes[k]));
   const ids = [];
-  for (let i = 0; i < G.n; i++) if (want.has(hexOf(i))) ids.push(i);
+  for (let i = 0; i < G.n; i++) if (want.has(hexKeyOf(i))) ids.push(i);
   const px = nPos;
   ids.sort((a, b) => (px[a * 3 + 1] - px[b * 3 + 1]) || (px[a * 3 + 2] - px[b * 3 + 2]) || (px[a * 3] - px[b * 3]));
   return ids;
@@ -6296,7 +6320,17 @@ function setIOBatch(nodes, io) {
   toast('已把 ' + nodes.length + ' 个神经元设为「' + IO_LABEL[io] + '」');
 }
 /* ---- 颜色 ---- */
-function hexOf(i) { return '#' + baseColorOf(i, _sc1).getHexString(); }
+/* 色号有两套写法：字符串版给人看（右侧面板 / 搜索 / region_map），数字版给「按神经元扫一遍」
+   的循环用。底色是量化过的 8 位 sRGB，getHex() 直接把它打包成一个 24 位整数当键——跟
+   getHexString() 是同一套取整（three 里就是 ('000000' + getHex().toString(16)).slice(-6)），
+   所以数字键和字符串色号一一对应，Map 的分桶跟以前完全一样。
+   为什么要数字版：按区认区那几条路（regionHistogram / regionBoxes / geoComponents /
+   cellsOfRegion）都是「每个神经元取一次色号」，写成 hexOf(i) 就是每个神经元白扔一个字符串——
+   14.4 万神经元跑一趟就是十几万个临时字符串，既费时间又喂垃圾回收。 */
+function hexKeyOf(i) { return baseColorOf(i, _sc1).getHex(); }
+function hexStrOf(k) { return '#' + ('000000' + (k >>> 0).toString(16)).slice(-6); }
+function hexToKey(h) { return parseInt(String(h).slice(-6), 16) | 0; }
+function hexOf(i) { return hexStrOf(hexKeyOf(i)); }
 function parseHex(h) {
   const m = /^#?([0-9a-f]{6})$/i.exec(String(h || '').trim());
   return m ? parseInt(m[1], 16) : null;
@@ -16929,10 +16963,11 @@ function findNodesByColorHex(hex) {
   const tr = parseInt(h.slice(0, 2), 16), tg = parseInt(h.slice(2, 4), 16), tb = parseInt(h.slice(4, 6), 16);
   const out = [];
   for (let i = 0; i < G.n; i++) {
-    const c = hexOf(i);
-    if (Math.abs(parseInt(c.slice(1, 3), 16) - tr) <= 18 &&
-        Math.abs(parseInt(c.slice(3, 5), 16) - tg) <= 18 &&
-        Math.abs(parseInt(c.slice(5, 7), 16) - tb) <= 18) out.push(i);
+    /* 这里同样按数字色号扫：每个神经元省掉一个字符串（见 hexKeyOf） */
+    const c = hexKeyOf(i);
+    if (Math.abs(((c >> 16) & 255) - tr) <= 18 &&
+        Math.abs(((c >> 8) & 255) - tg) <= 18 &&
+        Math.abs((c & 255) - tb) <= 18) out.push(i);
   }
   return out;
 }

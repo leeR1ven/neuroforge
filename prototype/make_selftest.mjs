@@ -4501,6 +4501,42 @@ const TEST = `
     out.push('ERROR | 第 44 组（按几何认区）：' + ((e && e.stack) || e));
   }
 
+  /* ---- 45 组：调色板认出来的区也必须有重心 / 包围盒 ----
+     为什么单独测：region_map 的手册里写着「每项都带重心 c 和包围盒 b」，但**调色板认出来的项**
+     以前没有 .hex 字段（只有 hexes），而查盒子是按 .hex 查的 —— 于是一个都查不到。导入进来的
+     模型（区色就是这套调色板）里 12 个有名字的区全长这样：AI 想「把视觉区挪到后面」拿不到 c / b，
+     只能退回去把几万个编号拉进对话。这一组就是钉住这条路，别再退回去。 */
+  try {
+    NF.clear();
+    await raf();
+    for (let k = 0; k < 6; k++) NF.addNode(k * 10, 0, 0);
+    await raf();
+    /* 调色板里的数是线性空间的（导入器直接把这些数写进颜色数组），而 setColor 收的是 sRGB 色号，
+       所以要先按 sRGB 传输函数编码一遍再点色。base 会让这个区被认成「视觉」，lift 是同一个区
+       被提亮 0.25 的那一半（导入器给「有名字的细胞」提亮）。 */
+    const srgb255 = (v) => Math.round(Math.max(0, Math.min(1, v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055)) * 255);
+    const hexOfRGB = (t) => '#' + t.map((v) => srgb255(v).toString(16).padStart(2, '0')).join('');
+    const base = hexOfRGB([0.20, 0.62, 1.00]);
+    const lift = hexOfRGB([0.45, 0.87, 1.00]);
+    NF.setColor([0, 1, 2], base);
+    NF.setColor([3, 4, 5], lift);
+    await raf();
+    const rm45 = NF.regionMap();
+    const hit45 = rm45.filter((e) => e.hexes && e.hexes.indexOf(base) >= 0)[0];
+    log(!!hit45 && !hit45.geo && Array.isArray(hit45.c) && hit45.c.length === 3 && Array.isArray(hit45.b) && hit45.b.length === 6,
+      '45 调色板认出来的区也带重心 c[3] 和包围盒 b[6]（以前这类区一个都没有）',
+      JSON.stringify(hit45 && { name: hit45.name, n: hit45.n, geo: !!hit45.geo, hexes: hit45.hexes.length, c: hit45.c, b: hit45.b }));
+    log(!!hit45 && hit45.n === 6 && hit45.hexes.length === 2,
+      '45 同一个区的两个色号（原色 + 提亮）并成一项：个数是 6 不是 3，重心是整块的',
+      JSON.stringify(hit45 && { n: hit45.n, hexes: hit45.hexes.length, c: hit45.c }));
+    log(!!hit45 && hit45.b[0] === 0 && hit45.b[3] === 50 && hit45.b[1] === 0 && hit45.b[4] === 0,
+      '45 合并后的包围盒覆盖整个区（x 从 0 到 50，y 都是 0）',
+      JSON.stringify(hit45 && hit45.b));
+  } catch (e) {
+    out.push('ERROR | 第 45 组（调色板区的重心）：' + ((e && e.stack) || e));
+  }
+
+
   /* 收尾：把用户原来的 Key 放回原处（自测绝不给用户留副作用）。
      走的是「用户明确保存」那条路，本机存储、设置文件、备份三份会一起写正确。 */
   try {
