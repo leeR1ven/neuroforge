@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "NeuroForge",
+  "version": "0.1.0",
+  "identifier": "com.neuroforge.editor",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [],
+    "withGlobalTauri": true,
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost; script-src 'self' 'unsafe-inline' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost blob: data: https: http://127.0.0.1:* http://localhost:* http:; worker-src 'self' blob:; media-src 'self' data: blob:",
+      "dangerousDisableAssetCspModification": [
+        "style-src"
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "publisher": "NeuroForge",
+    "category": "DeveloperTool",
+    "shortDescription": "神经元网络搭建器：可视化搭网、一键编译成模型文件",
+    "longDescription": "NeuroForge 神经元搭建器：在 3D 空间里手工搭建神经网络，设置神经元与权重参数，模拟激活验证逻辑，并编译成 PyTorch / ONNX / 独立可执行文件。附带可逆历史、流式载入、模型导入与内置 AI 助手。",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
+        "displayLanguageSelector": false
+      }
+    }
+  }
+}

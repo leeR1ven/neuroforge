@@ -1,0 +1,30 @@
+[package]
+name = "neuroforge"
+version = "0.1.0"
+description = "NeuroForge 神经元搭建器"
+authors = ["NeuroForge"]
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+# 设置文件的读写（Key 的保护就靠它）。tauri 自己就依赖它，已经在下好的缓存里，不会多下一份。
+serde_json = "1"
+rfd = "0.15"
+
+# 系统按键（SendInput）。已经在 tauri 的依赖图里，不会引入新的下载。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

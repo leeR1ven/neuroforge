@@ -1,0 +1,16 @@
+{
+  "name": "neuroforge-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "NeuroForge 神经元搭建器 —— Windows 桌面壳（Tauri 2 + WebView2）",
+  "scripts": {
+    "sync": "node sync_frontend.mjs",
+    "icon": "tauri icon ../_dump/app_icon.png",
+    "check": "node sync_frontend.mjs && tauri build --no-bundle",
+    "build": "node sync_frontend.mjs && tauri build",
+    "dev": "tauri dev"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

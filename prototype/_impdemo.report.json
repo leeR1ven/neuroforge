@@ -1,0 +1,171 @@
+{
+ "counts": {
+  "neurons": 45,
+  "edges": 410
+ },
+ "blocks": 0,
+ "layers": 5,
+ "file": "prototype\\_impdemo.nforge",
+ "source": {
+  "format": 1,
+  "kind": "onnx",
+  "generator": "NeuroForge import_model.py",
+  "model": "_impdemo.onnx",
+  "exact": true,
+  "auto": {
+   "names": true,
+   "positions": true,
+   "layout": "ring",
+   "spacing": 26.0
+  },
+  "layerCount": 5,
+  "nodes": [
+   {
+    "i": 0,
+    "op": "Input",
+    "n": "X",
+    "ly": 0,
+    "out": [
+     [
+      0,
+      8
+     ]
+    ],
+    "nt": "图输入张量 X，静态形状 (1, 8)，按 batch=1 展开成 8 个神经元",
+    "k": "in"
+   },
+   {
+    "i": 1,
+    "op": "Gemm",
+    "n": "fc1g",
+    "ly": 1,
+    "out": [
+     [
+      8,
+      24
+     ]
+    ],
+    "in": [
+     0
+    ],
+    "w": 128,
+    "blk": 0,
+    "fl": [
+     "relu"
+    ]
+   },
+   {
+    "i": 2,
+    "op": "Gemm",
+    "n": "fc2g",
+    "ly": 2,
+    "out": [
+     [
+      24,
+      36
+     ]
+    ],
+    "in": [
+     1
+    ],
+    "w": 192,
+    "blk": 0,
+    "fl": [
+     "gelu"
+    ],
+    "nt": "Dropout 直通（形状没变）；Cast 直通（形状没变）；Cast 直通（形状没变）"
+   },
+   {
+    "i": 3,
+    "op": "Gemm",
+    "n": "fc3g",
+    "ly": 3,
+    "out": [
+     [
+      36,
+      42
+     ]
+    ],
+    "in": [
+     2
+    ],
+    "w": 72,
+    "blk": 0,
+    "fl": [
+     "tanh"
+    ]
+   },
+   {
+    "i": 4,
+    "op": "Gemm",
+    "n": "fc4g",
+    "ly": 4,
+    "out": [
+     [
+      42,
+      45
+     ]
+    ],
+    "in": [
+     3
+    ],
+    "w": 18,
+    "blk": 0,
+    "fl": [
+     "sigmoid"
+    ]
+   }
+  ],
+  "spans": [
+   [
+    0,
+    8,
+    0
+   ],
+   [
+    8,
+    24,
+    1
+   ],
+   [
+    24,
+    36,
+    2
+   ],
+   [
+    36,
+    42,
+    3
+   ],
+   [
+    42,
+    45,
+    4
+   ]
+  ],
+  "notes": [
+   "fc2a_d_h：原模型把数据转成 float16 再往后算；编辑器全程按 float32 计算——精度只会更高，但逐位结果和原模型会有极小差异。",
+   "神经元名字是自动补的：原模型里没有『神经元』这个概念，这里按『算子 + 序号』编号（名字表可以关掉：--no-names）。",
+   "坐标是按拓扑自动铺的（布局 ring）：每一层沿 X 轴分开（间距 26.0），层内按布局铺开。ONNX 里没有坐标，这部分一定是生成出来的；想换形状可以在界面里用『按拓扑重排 / 力导向排布』重排。",
+   "有 1 处 Cast 转成了别的 float 类型（fc2a_d_h→float16）：按 float32 计算，不再复现原模型的降精度步骤。"
+  ],
+  "skipped": [],
+  "casts": [
+   {
+    "n": "fc2a_d_h",
+    "to": "float16"
+   }
+  ],
+  "precision": {
+   "weights": {},
+   "examples": []
+  },
+  "counts": {
+   "ops": 5,
+   "spans": 5,
+   "skipped": 0,
+   "blocks": 0,
+   "blockWeights": 0
+  }
+ }
+}

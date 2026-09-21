@@ -1,0 +1,1121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>NeuroForge 神经元搭建器 v0.1 (原型)</title>
+<style>
+/* 主题变量：默认「深空蓝」；下面每个 html[data-theme=...] 整块覆盖。 */
+/* ==THEMES== */
+:root{
+  --tc-080b10:#080b10;
+  --ovl-0d131c:13,19,28;
+  --ovl-05080c:5,8,12;
+  --ovl-080c13:8,12,19;
+  --ovl-16202d:22,32,45;
+  --ovl-2f81f7:47,129,247;
+  --tc-0a0f16:#0a0f16;
+  --tc-0a0f17:#0a0f17;
+  --tc-0b0e13:#0b0e13;
+  --tc-0b1119:#0b1119;
+  --tc-0c1119:#0c1119;
+  --tc-0c1219:#0c1219;
+  --tc-0d131c:#0d131c;
+  --tc-0d141d:#0d141d;
+  --tc-0f151f:#0f151f;
+  --tc-0f1620:#0f1620;
+  --tc-101822:#101822;
+  --tc-101c2c:#101c2c;
+  --tc-111721:#111721;
+  --tc-111823:#111823;
+  --tc-121924:#121924;
+  --tc-121926:#121926;
+  --tc-121a26:#121a26;
+  --tc-131a25:#131a25;
+  --tc-131c2a:#131c2a;
+  --tc-141b26:#141b26;
+  --tc-141c28:#141c28;
+  --tc-141d29:#141d29;
+  --tc-161d28:#161d28;
+  --tc-161e29:#161e29;
+  --tc-161f2a:#161f2a;
+  --tc-16202c:#16202c;
+  --tc-16202e:#16202e;
+  --tc-182030:#182030;
+  --tc-1a1608:#1a1608;
+  --tc-1a2330:#1a2330;
+  --tc-1a2432:#1a2432;
+  --tc-1b2433:#1b2433;
+  --tc-1b64d9:#1b64d9;
+  --tc-1d120c:#1d120c;
+  --tc-1d2836:#1d2836;
+  --tc-1d2937:#1d2937;
+  --tc-1d2a3c:#1d2a3c;
+  --tc-1e2735:#1e2735;
+  --tc-1e2836:#1e2836;
+  --tc-203042:#203042;
+  --tc-212c3b:#212c3b;
+  --tc-22303f:#22303f;
+  --tc-22304a:#22304a;
+  --tc-2268e0:#2268e0;
+  --tc-22d3ee:#22d3ee;
+  --tc-23303f:#23303f;
+  --tc-242f3d:#242f3d;
+  --tc-26313f:#26313f;
+  --tc-2a3546:#2a3546;
+  --tc-2a3849:#2a3849;
+  --tc-2a3a4d:#2a3a4d;
+  --tc-2b3746:#2b3746;
+  --tc-2f3d4f:#2f3d4f;
+  --tc-2f6fbd:#2f6fbd;
+  --tc-2f81f7:#2f81f7;
+  --tc-331a1f:#331a1f;
+  --tc-3a1f1f:#3a1f1f;
+  --tc-3b8bfa:#3b8bfa;
+  --tc-3d4a5c:#3d4a5c;
+  --tc-3d5570:#3d5570;
+  --tc-3d8ef8:#3d8ef8;
+  --tc-3fb950:#3fb950;
+  --tc-5a2a2a:#5a2a2a;
+  --tc-5aa2ff:#5aa2ff;
+  --tc-5b2a33:#5b2a33;
+  --tc-5c4a1d:#5c4a1d;
+  --tc-5f6f83:#5f6f83;
+  --tc-607a96:#607a96;
+  --tc-61758c:#61758c;
+  --tc-65758a:#65758a;
+  --tc-6a3d22:#6a3d22;
+  --tc-6b7b8f:#6b7b8f;
+  --tc-6d1a1a:#6d1a1a;
+  --tc-7a3a3a:#7a3a3a;
+  --tc-7a8797:#7a8797;
+  --tc-7c8ea3:#7c8ea3;
+  --tc-7f93a8:#7f93a8;
+  --tc-7f95ad:#7f95ad;
+  --tc-7fd4f5:#7fd4f5;
+  --tc-818cf8:#818cf8;
+  --tc-8296ac:#8296ac;
+  --tc-8a2020:#8a2020;
+  --tc-8ea3b8:#8ea3b8;
+  --tc-8ea3ba:#8ea3ba;
+  --tc-8ea3bb:#8ea3bb;
+  --tc-8fa0b5:#8fa0b5;
+  --tc-8fd6a1:#8fd6a1;
+  --tc-93a5b9:#93a5b9;
+  --tc-93a7bd:#93a7bd;
+  --tc-94a4b8:#94a4b8;
+  --tc-9db0c6:#9db0c6;
+  --tc-9db4ca:#9db4ca;
+  --tc-9fb6d0:#9fb6d0;
+  --tc-9fd3ff:#9fd3ff;
+  --tc-a3b6cb:#a3b6cb;
+  --tc-a3e635:#a3e635;
+  --tc-a8b7c9:#a8b7c9;
+  --tc-a9bacd:#a9bacd;
+  --tc-a9c2dc:#a9c2dc;
+  --tc-aab8c9:#aab8c9;
+  --tc-b9cbe0:#b9cbe0;
+  --tc-c0392b:#c0392b;
+  --tc-c2cfe0:#c2cfe0;
+  --tc-c3d3e6:#c3d3e6;
+  --tc-c6d5e8:#c6d5e8;
+  --tc-c9d4e2:#c9d4e2;
+  --tc-cfdcec:#cfdcec;
+  --tc-d29922:#d29922;
+  --tc-d3e4fa:#d3e4fa;
+  --tc-d5e4f8:#d5e4f8;
+  --tc-d9a83c:#d9a83c;
+  --tc-dbe6f3:#dbe6f3;
+  --tc-dbe6f5:#dbe6f5;
+  --tc-dbe7f5:#dbe7f5;
+  --tc-e0a24a:#e0a24a;
+  --tc-e2ecf7:#e2ecf7;
+  --tc-e3c06a:#e3c06a;
+  --tc-e6eefb:#e6eefb;
+  --tc-e9f2fc:#e9f2fc;
+  --tc-eef5fd:#eef5fd;
+  --tc-f0a8b0:#f0a8b0;
+  --tc-f85149:#f85149;
+  --tc-fca5a5:#fca5a5;
+  --tc-ff9b6a:#ff9b6a;
+  --tc-ff9b9b:#ff9b9b;
+  --tc-ff9d97:#ff9d97;
+  --tc-ffadad:#ffadad;
+  --tc-ffd9d9:#ffd9d9;
+  --tc-ffffff:#ffffff;
+}
+/* ===== 主题配色：由 _dump/_theme5.cjs 生成，要改配色请改脚本再跑一次 ===== */
+/* 每个主题整块覆盖 --tc-*（实色）和 --ovl-*（半透明底色的 RGB 通道，透明度留在原处）。 */
+/* 挂在 html 上而不是 body：--bg 这类"中转变量"是在 :root 求值的，覆盖必须落在同一层才有用。 */
+html[data-theme="midnight"]{
+  --tc-080b10:#0b0810;   --tc-0a0f16:#0f0a16;   --tc-0a0f17:#0f0a17;   --tc-0b0e13:#0e0b13;   --tc-0b1119:#100b19;   --tc-0c1119:#110c19;
+  --tc-0c1219:#100c19;   --tc-0d131c:#130d1c;   --tc-0d141d:#130d1d;   --tc-0f151f:#160f1f;   --tc-0f1620:#150e21;   --tc-101822:#160f23;
+  --tc-101c2c:#1a0f2d;   --tc-111721:#181121;   --tc-111823:#181024;   --tc-121924:#191125;   --tc-121926:#1b1127;   --tc-121a26:#1a1127;
+  --tc-131a25:#1a1226;   --tc-131c2a:#1c122b;   --tc-141b26:#1b1327;   --tc-141c28:#1c1329;   --tc-141d29:#1c132a;   --tc-161d28:#1d1529;
+  --tc-161e29:#1d152a;   --tc-161f2a:#1d152b;   --tc-16202c:#1d152d;   --tc-16202e:#1f152f;   --tc-182030:#231731;   --tc-1a1608:#101b07;
+  --tc-1a2330:#221931;   --tc-1a2432:#231933;   --tc-1b2433:#251a34;   --tc-1b64d9:#6915df;   --tc-1d120c:#1b1e0b;   --tc-1d2836:#261c37;
+  --tc-1d2937:#261c38;   --tc-1d2a3c:#291c3d;   --tc-1e2735:#271d36;   --tc-1e2836:#271d37;   --tc-203042:#2b1f43;   --tc-212c3b:#2b203c;
+  --tc-22303f:#2b2140;   --tc-22304a:#34214b;   --tc-2268e0:#731ce6;   --tc-22d3ee:#1c2bf4;   --tc-23303f:#2c2240;   --tc-242f3d:#2d233e;
+  --tc-26313f:#2f2540;   --tc-2a3546:#352947;   --tc-2a3849:#35294a;   --tc-2a3a4d:#36294e;   --tc-2b3746:#342a47;   --tc-2f3d4f:#3a2e50;
+  --tc-2f6fbd:#5f2bc1;   --tc-2f81f7:#7c29fd;   --tc-331a1f:#342919;   --tc-3a1f1f:#3b351e;   --tc-3b8bfa:#8336ff;   --tc-3d4a5c:#493c5d;
+  --tc-3d5570:#4d3b72;   --tc-3d8ef8:#8037fe;   --tc-3fb950:#3bbdb5;   --tc-5a2a2a:#5b5129;   --tc-5aa2ff:#965aff;   --tc-5b2a33:#5c4929;
+  --tc-5c4a1d:#3c5e1b;   --tc-5f6f83:#6b5e84;   --tc-607a96:#715e98;   --tc-61758c:#6f608d;   --tc-65758a:#72648b;   --tc-6a3d22:#5f6c20;
+  --tc-6b7b8f:#776a90;   --tc-6d1a1a:#6f5e18;   --tc-7a3a3a:#7c6e38;   --tc-7a8797:#847998;   --tc-7c8ea3:#897ba4;   --tc-7f93a8:#8b7ea9;
+  --tc-7f95ad:#8d7eae;   --tc-7fd4f5:#857bf9;   --tc-818cf8:#d77dfc;   --tc-8296ac:#8f81ad;   --tc-8a2020:#8d771d;   --tc-8ea3b8:#9a8db9;
+  --tc-8ea3ba:#9c8dbb;   --tc-8ea3bb:#9d8dbc;   --tc-8fa0b5:#9c8eb6;   --tc-8fd6a1:#8dd4d8;   --tc-93a5b9:#9f92ba;   --tc-93a7bd:#a092be;
+  --tc-94a4b8:#a093b9;   --tc-9db0c6:#aa9cc7;   --tc-9db4ca:#a99ccb;   --tc-9fb6d0:#af9ed1;   --tc-9fd3ff:#b89fff;   --tc-a3b6cb:#b0a2cc;
+  --tc-a3e635:#30eb51;   --tc-a8b7c9:#b3a7ca;   --tc-a9bacd:#b4a8ce;   --tc-a9c2dc:#b8a7de;   --tc-aab8c9:#b5a9ca;   --tc-b9cbe0:#c6b8e1;
+  --tc-c0392b:#c4b427;   --tc-c2cfe0:#cdc1e1;   --tc-c3d3e6:#cfc2e7;   --tc-c6d5e8:#d2c5e9;   --tc-c9d4e2:#d2c8e3;   --tc-cfdcec:#d9ceed;
+  --tc-d29922:#7ed71d;   --tc-d3e4fa:#e1d2fb;   --tc-d5e4f8:#e2d4f9;   --tc-d9a83c:#8dde37;   --tc-dbe6f3:#e3daf4;   --tc-dbe6f5:#e5daf6;
+  --tc-dbe7f5:#e4daf6;   --tc-e0a24a:#a7e545;   --tc-e2ecf7:#e9e1f8;   --tc-e3c06a:#a5e766;   --tc-e6eefb:#efe5fc;   --tc-e9f2fc:#efe8fd;
+  --tc-eef5fd:#f3eefd;   --tc-f0a8b0:#f2daa6;   --tc-f85149:#fde144;   --tc-fca5a5:#ffeca2;   --tc-ff9b6a:#ecff6a;   --tc-ff9b9b:#ffeb9b;
+  --tc-ff9d97:#fff097;   --tc-ffadad:#ffefad;   --tc-ffd9d9:#fff7d9;   --tc-ffffff:#ffffff;   --ovl-05080c:8,5,12;   --ovl-080c13:13,8,19;
+  --ovl-0d131c:19,13,28;   --ovl-16202d:30,21,46;   --ovl-2f81f7:124,41,253;
+}
+html[data-theme="teal"]{
+  --tc-080b10:#081010;   --tc-0a0f16:#0a1615;   --tc-0a0f17:#0a1717;   --tc-0b0e13:#0b1313;   --tc-0b1119:#0b1918;   --tc-0c1119:#0c1919;
+  --tc-0c1219:#0c1918;   --tc-0d131c:#0d1c1b;   --tc-0d141d:#0d1d1c;   --tc-0f151f:#0f1f1f;   --tc-0f1620:#0f201f;   --tc-101822:#102220;
+  --tc-101c2c:#0f2d2a;   --tc-111721:#112121;   --tc-111823:#112322;   --tc-121924:#122423;   --tc-121926:#122626;   --tc-121a26:#122625;
+  --tc-131a25:#132524;   --tc-131c2a:#132a29;   --tc-141b26:#142625;   --tc-141c28:#142827;   --tc-141d29:#142927;   --tc-161d28:#162827;
+  --tc-161e29:#162928;   --tc-161f2a:#162a28;   --tc-16202c:#162c2a;   --tc-16202e:#162e2c;   --tc-182030:#183030;   --tc-1a1608:#1a0a08;
+  --tc-1a2330:#1a302f;   --tc-1a2432:#1a3230;   --tc-1b2433:#1b3332;   --tc-1b64d9:#17ddd3;   --tc-1d120c:#1d0c11;   --tc-1d2836:#1d3734;
+  --tc-1d2937:#1c3834;   --tc-1d2a3c:#1c3d3a;   --tc-1e2735:#1e3534;   --tc-1e2836:#1e3634;   --tc-203042:#1f433e;   --tc-212c3b:#203c39;
+  --tc-22303f:#21403b;   --tc-22304a:#214b4a;   --tc-2268e0:#1ee4dd;   --tc-22d3ee:#1ef281;   --tc-23303f:#22403c;   --tc-242f3d:#243d3b;
+  --tc-26313f:#26403d;   --tc-2a3546:#294745;   --tc-2a3849:#294a46;   --tc-2a3a4d:#294e49;   --tc-2b3746:#2a4743;   --tc-2f3d4f:#2e504c;
+  --tc-2f6fbd:#2cc0af;   --tc-2f81f7:#2bfbeb;   --tc-331a1f:#341a30;   --tc-3a1f1f:#3b1e31;   --tc-3b8bfa:#37feed;   --tc-3d4a5c:#3c5d5a;
+  --tc-3d5570:#3c716a;   --tc-3d8ef8:#39fce8;   --tc-3fb950:#7fbb3d;   --tc-5a2a2a:#5b294a;   --tc-5aa2ff:#5affee;   --tc-5b2a33:#5c2954;
+  --tc-5c4a1d:#5d1f1c;   --tc-5f6f83:#5e8480;   --tc-607a96:#5f978f;   --tc-61758c:#608d87;   --tc-65758a:#648b87;   --tc-6a3d22:#6b2136;
+  --tc-6b7b8f:#6a908c;   --tc-6d1a1a:#6f1852;   --tc-7a3a3a:#7b3965;   --tc-7a8797:#799894;   --tc-7c8ea3:#7ba49f;   --tc-7f93a8:#7ea9a2;
+  --tc-7f95ad:#7eaea7;   --tc-7fd4f5:#7df7c8;   --tc-818cf8:#7fddfa;   --tc-8296ac:#81ada7;   --tc-8a2020:#8c1e67;   --tc-8ea3b8:#8db9b2;
+  --tc-8ea3ba:#8dbbb4;   --tc-8ea3bb:#8dbcb6;   --tc-8fa0b5:#8eb6b1;   --tc-8fd6a1:#acd78e;   --tc-93a5b9:#92bab4;   --tc-93a7bd:#92beb8;
+  --tc-94a4b8:#93b9b5;   --tc-9db0c6:#9cc7c1;   --tc-9db4ca:#9ccbc3;   --tc-9fb6d0:#9ed1ca;   --tc-9fd3ff:#9fffeb;   --tc-a3b6cb:#a2ccc6;
+  --tc-a3e635:#eab531;   --tc-a8b7c9:#a7cac6;   --tc-a9bacd:#a8cec9;   --tc-a9c2dc:#a8ddd5;   --tc-aab8c9:#a9cac6;   --tc-b9cbe0:#b8e1dc;
+  --tc-c0392b:#c32881;   --tc-c2cfe0:#c1e1dd;   --tc-c3d3e6:#c2e7e2;   --tc-c6d5e8:#c5e9e5;   --tc-c9d4e2:#c8e3e0;   --tc-cfdcec:#ceede9;
+  --tc-d29922:#d6201e;   --tc-d3e4fa:#d2fbf7;   --tc-d5e4f8:#d4f9f5;   --tc-d9a83c:#dc3c39;   --tc-dbe6f3:#dbf3f0;   --tc-dbe6f5:#daf6f3;
+  --tc-dbe7f5:#daf6f2;   --tc-e0a24a:#e34753;   --tc-e2ecf7:#e2f7f4;   --tc-e3c06a:#e56d68;   --tc-e6eefb:#e6fbfa;   --tc-e9f2fc:#e9fcfa;
+  --tc-eef5fd:#eefdfb;   --tc-f0a8b0:#f1a7e1;   --tc-f85149:#fc45b7;   --tc-fca5a5:#fea3e0;   --tc-ff9b6a:#ff6a9c;   --tc-ff9b9b:#ff9bde;
+  --tc-ff9d97:#ff97d6;   --tc-ffadad:#ffade4;   --tc-ffd9d9:#ffd9f2;   --tc-ffffff:#ffffff;   --ovl-05080c:5,12,11;   --ovl-080c13:8,19,19;
+  --ovl-0d131c:13,28,27;   --ovl-16202d:22,45,43;   --ovl-2f81f7:43,251,235;
+}
+html[data-theme="forest"]{
+  --tc-080b10:#08100b;   --tc-0a0f16:#0a160d;   --tc-0a0f17:#0a170e;   --tc-0b0e13:#0b130e;   --tc-0b1119:#0b190f;   --tc-0c1119:#0c1910;
+  --tc-0c1219:#0c190f;   --tc-0d131c:#0d1c11;   --tc-0d141d:#0d1d11;   --tc-0f151f:#0f1f14;   --tc-0f1620:#0f2014;   --tc-101822:#102215;
+  --tc-101c2c:#102c17;   --tc-111721:#112116;   --tc-111823:#112317;   --tc-121924:#122418;   --tc-121926:#122619;   --tc-121a26:#122618;
+  --tc-131a25:#132519;   --tc-131c2a:#132a1a;   --tc-141b26:#14261a;   --tc-141c28:#14281a;   --tc-141d29:#14291a;   --tc-161d28:#16281c;
+  --tc-161e29:#16291b;   --tc-161f2a:#162a1b;   --tc-16202c:#162c1b;   --tc-16202e:#162e1d;   --tc-182030:#183021;   --tc-1a1608:#1a0811;
+  --tc-1a2330:#1a3020;   --tc-1a2432:#1a3221;   --tc-1b2433:#1b3323;   --tc-1b64d9:#19db56;   --tc-1d120c:#1d0c1c;   --tc-1d2836:#1d3623;
+  --tc-1d2937:#1d3723;   --tc-1d2a3c:#1d3c26;   --tc-1e2735:#1e3525;   --tc-1e2836:#1e3625;   --tc-203042:#204228;   --tc-212c3b:#213b28;
+  --tc-22303f:#223f28;   --tc-22304a:#224a30;   --tc-2268e0:#20e260;   --tc-22d3ee:#43f020;   --tc-23303f:#233f29;   --tc-242f3d:#243d2a;
+  --tc-26313f:#263f2c;   --tc-2a3546:#2a4632;   --tc-2a3849:#2a4932;   --tc-2a3a4d:#2a4d32;   --tc-2b3746:#2b4632;   --tc-2f3d4f:#2f4f37;
+  --tc-2f6fbd:#2ebe52;   --tc-2f81f7:#2df968;   --tc-331a1f:#261a33;   --tc-3a1f1f:#321f3a;   --tc-3b8bfa:#39fc70;   --tc-3d4a5c:#3d5c46;
+  --tc-3d5570:#3c7148;   --tc-3d8ef8:#3bfa6e;   --tc-3fb950:#baa63e;   --tc-5a2a2a:#4c2a5a;   --tc-5aa2ff:#5aff86;   --tc-5b2a33:#432a5b;
+  --tc-5c4a1d:#5d1c42;   --tc-5f6f83:#5f8368;   --tc-607a96:#5f976b;   --tc-61758c:#618c6b;   --tc-65758a:#658a6f;   --tc-6a3d22:#6b2165;
+  --tc-6b7b8f:#6b8f74;   --tc-6d1a1a:#54196e;   --tc-7a3a3a:#67397b;   --tc-7a8797:#7a9781;   --tc-7c8ea3:#7ca385;   --tc-7f93a8:#7fa887;
+  --tc-7f95ad:#7fad89;   --tc-7fd4f5:#80f67e;   --tc-818cf8:#80f9ca;   --tc-8296ac:#82ac8b;   --tc-8a2020:#6b1f8b;   --tc-8ea3b8:#8eb896;
+  --tc-8ea3ba:#8eba98;   --tc-8ea3bb:#8ebb98;   --tc-8fa0b5:#8fb598;   --tc-8fd6a1:#d7d38e;   --tc-93a5b9:#93b99b;   --tc-93a7bd:#93bd9c;
+  --tc-94a4b8:#94b89d;   --tc-9db0c6:#9dc6a6;   --tc-9db4ca:#9dcaa5;   --tc-9fb6d0:#9fd0aa;   --tc-9fd3ff:#9fffae;   --tc-a3b6cb:#a3cbac;
+  --tc-a3e635:#e84133;   --tc-a8b7c9:#a8c9b0;   --tc-a9bacd:#a9cdb1;   --tc-a9c2dc:#a8ddb3;   --tc-aab8c9:#aac9b2;   --tc-b9cbe0:#b9e0c2;
+  --tc-c0392b:#a22ac1;   --tc-c2cfe0:#c2e0ca;   --tc-c3d3e6:#c3e6cb;   --tc-c6d5e8:#c6e8cf;   --tc-c9d4e2:#c9e2cf;   --tc-cfdcec:#cfecd6;
+  --tc-d29922:#d42090;   --tc-d3e4fa:#d3fadd;   --tc-d5e4f8:#d5f8de;   --tc-d9a83c:#db3a9c;   --tc-dbe6f3:#dbf3e1;   --tc-dbe6f5:#dbf5e2;
+  --tc-dbe7f5:#dbf5e1;   --tc-e0a24a:#e249b6;   --tc-e2ecf7:#e2f7e7;   --tc-e3c06a:#e469b2;   --tc-e6eefb:#e6fbed;   --tc-e9f2fc:#e9fced;
+  --tc-eef5fd:#eefdf1;   --tc-f0a8b0:#d3a7f1;   --tc-f85149:#cc47fa;   --tc-fca5a5:#e2a4fd;   --tc-ff9b6a:#ff6afb;   --tc-ff9b9b:#e19bff;
+  --tc-ff9d97:#e697ff;   --tc-ffadad:#e6adff;   --tc-ffd9d9:#f4d9ff;   --tc-ffffff:#ffffff;   --ovl-05080c:5,12,7;   --ovl-080c13:8,19,12;
+  --ovl-0d131c:13,28,17;   --ovl-16202d:22,45,28;   --ovl-2f81f7:45,249,104;
+}
+html[data-theme="amber"]{
+  --tc-080b10:#100e08;   --tc-0a0f16:#16130a;   --tc-0a0f17:#17140a;   --tc-0b0e13:#13110b;   --tc-0b1119:#19150b;   --tc-0c1119:#19160c;
+  --tc-0c1219:#19150c;   --tc-0d131c:#1c180d;   --tc-0d141d:#1d180d;   --tc-0f151f:#1f1b0f;   --tc-0f1620:#201b0f;   --tc-101822:#221c10;
+  --tc-101c2c:#2c2410;   --tc-111721:#211d11;   --tc-111823:#231e11;   --tc-121924:#241f12;   --tc-121926:#262212;   --tc-121a26:#262112;
+  --tc-131a25:#252013;   --tc-131c2a:#2a2413;   --tc-141b26:#262114;   --tc-141c28:#282314;   --tc-141d29:#292314;   --tc-161d28:#282316;
+  --tc-161e29:#292416;   --tc-161f2a:#2a2416;   --tc-16202c:#2c2516;   --tc-16202e:#2e2716;   --tc-182030:#302b18;   --tc-1a1608:#080a1a;
+  --tc-1a2330:#302a1a;   --tc-1a2432:#322b1a;   --tc-1b2433:#332d1b;   --tc-1b64d9:#d9a91b;   --tc-1d120c:#0c151d;   --tc-1d2836:#362e1d;
+  --tc-1d2937:#372e1d;   --tc-1d2a3c:#3c331d;   --tc-1e2735:#352f1e;   --tc-1e2836:#362f1e;   --tc-203042:#423720;   --tc-212c3b:#3b3321;
+  --tc-22303f:#3f3522;   --tc-22304a:#4a4122;   --tc-2268e0:#e0b322;   --tc-22d3ee:#ee5822;   --tc-23303f:#3f3623;   --tc-242f3d:#3d3524;
+  --tc-26313f:#3f3726;   --tc-2a3546:#463f2a;   --tc-2a3849:#493f2a;   --tc-2a3a4d:#4d422a;   --tc-2b3746:#463e2b;   --tc-2f3d4f:#4f452f;
+  --tc-2f6fbd:#bd902f;   --tc-2f81f7:#f7c02f;   --tc-331a1f:#1a3331;   --tc-3a1f1f:#1f363a;   --tc-3b8bfa:#fac33b;   --tc-3d4a5c:#5c533d;
+  --tc-3d5570:#705f3d;   --tc-3d8ef8:#f8c03d;   --tc-3fb950:#b93f98;   --tc-5a2a2a:#2a545a;   --tc-5aa2ff:#ffcd5a;   --tc-5b2a33:#2a5b59;
+  --tc-5c4a1d:#1d275c;   --tc-5f6f83:#83785f;   --tc-607a96:#968360;   --tc-61758c:#8c7e61;   --tc-65758a:#8a7f65;   --tc-6a3d22:#22456a;
+  --tc-6b7b8f:#8f846b;   --tc-6d1a1a:#1a626d;   --tc-7a3a3a:#3a717a;   --tc-7a8797:#978e7a;   --tc-7c8ea3:#a3967c;   --tc-7f93a8:#a8997f;
+  --tc-7f95ad:#ad9d7f;   --tc-7fd4f5:#f5b07f;   --tc-818cf8:#f3f881;   --tc-8296ac:#ac9e82;   --tc-8a2020:#207c8a;   --tc-8ea3b8:#b8a98e;
+  --tc-8ea3ba:#baab8e;   --tc-8ea3bb:#bbac8e;   --tc-8fa0b5:#b5a98f;   --tc-8fd6a1:#d68fbb;   --tc-93a5b9:#b9ac93;   --tc-93a7bd:#bdaf93;
+  --tc-94a4b8:#b8ad94;   --tc-9db0c6:#c6b89d;   --tc-9db4ca:#cab99d;   --tc-9fb6d0:#d0c09f;   --tc-9fd3ff:#ffd89f;   --tc-a3b6cb:#cbbda3;
+  --tc-a3e635:#9035e6;   --tc-a8b7c9:#c9bea8;   --tc-a9bacd:#cdc1a9;   --tc-a9c2dc:#dccaa9;   --tc-aab8c9:#c9bfaa;   --tc-b9cbe0:#e0d3b9;
+  --tc-c0392b:#2b9ec0;   --tc-c2cfe0:#e0d7c2;   --tc-c3d3e6:#e6dbc3;   --tc-c6d5e8:#e8dec6;   --tc-c9d4e2:#e2dac9;   --tc-cfdcec:#ece3cf;
+  --tc-d29922:#2244d2;   --tc-d3e4fa:#faeed3;   --tc-d5e4f8:#f8eed5;   --tc-d9a83c:#3c58d9;   --tc-dbe6f3:#f3ebdb;   --tc-dbe6f5:#f5eddb;
+  --tc-dbe7f5:#f5ecdb;   --tc-e0a24a:#4a74e0;   --tc-e2ecf7:#f7f0e2;   --tc-e3c06a:#6a7de3;   --tc-e6eefb:#fbf6e6;   --tc-e9f2fc:#fcf6e9;
+  --tc-eef5fd:#fdf8ee;   --tc-f0a8b0:#a8eef0;   --tc-f85149:#49d9f8;   --tc-fca5a5:#a5f0fc;   --tc-ff9b6a:#6abaff;   --tc-ff9b9b:#9bf2ff;
+  --tc-ff9d97:#97ebff;   --tc-ffadad:#adf4ff;   --tc-ffd9d9:#d9faff;   --tc-ffffff:#ffffff;   --ovl-05080c:12,10,5;   --ovl-080c13:19,16,8;
+  --ovl-0d131c:28,24,13;   --ovl-16202d:45,38,22;   --ovl-2f81f7:247,192,47;
+}
+html[data-theme="crimson"]{
+  --tc-080b10:#100908;   --tc-0a0f16:#160b0a;   --tc-0a0f17:#170b0a;   --tc-0b0e13:#130c0b;   --tc-0b1119:#190c0b;   --tc-0c1119:#190d0c;
+  --tc-0c1219:#190c0c;   --tc-0d131c:#1c0e0d;   --tc-0d141d:#1d0e0d;   --tc-0f151f:#1f110f;   --tc-0f1620:#20100f;   --tc-101822:#221110;
+  --tc-101c2c:#2c1110;   --tc-111721:#211311;   --tc-111823:#231311;   --tc-121924:#241412;   --tc-121926:#261412;   --tc-121a26:#261412;
+  --tc-131a25:#251513;   --tc-131c2a:#2a1513;   --tc-141b26:#261614;   --tc-141c28:#281614;   --tc-141d29:#291514;   --tc-161d28:#281816;
+  --tc-161e29:#291716;   --tc-161f2a:#2a1716;   --tc-16202c:#2c1616;   --tc-16202e:#2e1716;   --tc-182030:#301b18;   --tc-1a1608:#08161a;
+  --tc-1a2330:#301b1a;   --tc-1a2432:#321b1a;   --tc-1b2433:#331d1b;   --tc-1b64d9:#d72c1d;   --tc-1d120c:#0c1d1a;   --tc-1d2836:#361e1d;
+  --tc-1d2937:#371d1d;   --tc-1d2a3c:#3c1f1d;   --tc-1e2735:#35201e;   --tc-1e2836:#361f1e;   --tc-203042:#422020;   --tc-212c3b:#3b2221;
+  --tc-22303f:#3f2223;   --tc-22304a:#4a2722;   --tc-2268e0:#de3624;   --tc-22d3ee:#ec2474;   --tc-23303f:#3f2323;   --tc-242f3d:#3d2524;
+  --tc-26313f:#3f2726;   --tc-2a3546:#462c2a;   --tc-2a3849:#492b2a;   --tc-2a3a4d:#4d2b2a;   --tc-2b3746:#462c2b;   --tc-2f3d4f:#4f302f;
+  --tc-2f6fbd:#bc3330;   --tc-2f81f7:#f53c31;   --tc-331a1f:#1a3321;   --tc-3a1f1f:#1f3a2c;   --tc-3b8bfa:#f8463d;   --tc-3d4a5c:#5c3f3d;
+  --tc-3d5570:#6f3e3e;   --tc-3d8ef8:#f6453f;   --tc-3fb950:#8940b8;   --tc-5a2a2a:#2a5a40;   --tc-5aa2ff:#fd615c;   --tc-5b2a33:#2a5b38;
+  --tc-5c4a1d:#1e505b;   --tc-5f6f83:#83605f;   --tc-607a96:#956161;   --tc-61758c:#8c6161;   --tc-65758a:#8a6765;   --tc-6a3d22:#23695e;
+  --tc-6b7b8f:#8f6c6b;   --tc-6d1a1a:#1b6c41;   --tc-7a3a3a:#3b7958;   --tc-7a8797:#977b7a;   --tc-7c8ea3:#a37d7c;   --tc-7f93a8:#a87f80;
+  --tc-7f95ad:#ad7f80;   --tc-7fd4f5:#f4809e;   --tc-818cf8:#f7ae82;   --tc-8296ac:#ac8283;   --tc-8a2020:#218952;   --tc-8ea3b8:#b88e90;
+  --tc-8ea3ba:#ba8e8f;   --tc-8ea3bb:#bb8e8e;   --tc-8fa0b5:#b5908f;   --tc-8fd6a1:#c290d5;   --tc-93a5b9:#b99394;   --tc-93a7bd:#bd9394;
+  --tc-94a4b8:#b89594;   --tc-9db0c6:#c69e9d;   --tc-9db4ca:#ca9d9f;   --tc-9fb6d0:#d09fa0;   --tc-9fd3ff:#fea0a7;   --tc-a3b6cb:#cba3a4;
+  --tc-a3e635:#3752e4;   --tc-a8b7c9:#c9a9a8;   --tc-a9bacd:#cda9aa;   --tc-a9c2dc:#dbaaab;   --tc-aab8c9:#c9abaa;   --tc-b9cbe0:#e0bab9;
+  --tc-c0392b:#2cbf7e;   --tc-c2cfe0:#e0c3c2;   --tc-c3d3e6:#e6c4c3;   --tc-c6d5e8:#e8c7c6;   --tc-c9d4e2:#e2cac9;   --tc-cfdcec:#ecd0cf;
+  --tc-d29922:#24b8d0;   --tc-d3e4fa:#fad5d3;   --tc-d5e4f8:#f8d7d5;   --tc-d9a83c:#3ec0d7;   --tc-dbe6f3:#f3dbdb;   --tc-dbe6f5:#f5dcdb;
+  --tc-dbe7f5:#f5dbdb;   --tc-e0a24a:#4cd7df;   --tc-e2ecf7:#f7e2e2;   --tc-e3c06a:#6bcde2;   --tc-e6eefb:#fbe8e6;   --tc-e9f2fc:#fce9e9;
+  --tc-eef5fd:#fdeeee;   --tc-f0a8b0:#a9efc2;   --tc-f85149:#4bf6a3;   --tc-fca5a5:#a6fbce;   --tc-ff9b6a:#6bfee0;   --tc-ff9b9b:#9cfeca;
+  --tc-ff9d97:#98fecd;   --tc-ffadad:#aefed3;   --tc-ffd9d9:#d9ffeb;   --tc-ffffff:#ffffff;   --ovl-05080c:12,5,5;   --ovl-080c13:19,9,8;
+  --ovl-0d131c:28,14,13;   --ovl-16202d:45,23,22;   --ovl-2f81f7:245,60,49;
+}
+html[data-theme="slate"]{
+  --tc-080b10:#0c0c0c;   --tc-0a0f16:#0f1011;   --tc-0a0f17:#101011;   --tc-0b0e13:#0f0f0f;   --tc-0b1119:#111213;   --tc-0c1119:#121213;
+  --tc-0c1219:#121213;   --tc-0d131c:#141415;   --tc-0d141d:#141516;   --tc-0f151f:#161718;   --tc-0f1620:#161719;   --tc-101822:#18191a;
+  --tc-101c2c:#1c1e20;   --tc-111721:#18191a;   --tc-111823:#191a1b;   --tc-121924:#1a1b1c;   --tc-121926:#1b1c1d;   --tc-121a26:#1b1c1d;
+  --tc-131a25:#1b1c1d;   --tc-131c2a:#1d1e20;   --tc-141b26:#1c1d1e;   --tc-141c28:#1d1e1f;   --tc-141d29:#1d1e20;   --tc-161d28:#1e1f20;
+  --tc-161e29:#1e1f21;   --tc-161f2a:#1f2021;   --tc-16202c:#202122;   --tc-16202e:#212223;   --tc-182030:#232425;   --tc-1a1608:#121210;
+  --tc-1a2330:#242526;   --tc-1a2432:#252627;   --tc-1b2433:#262728;   --tc-1b64d9:#6f7785;   --tc-1d120c:#161413;   --tc-1d2836:#28292b;
+  --tc-1d2937:#282a2c;   --tc-1d2a3c:#2b2c2e;   --tc-1e2735:#28292b;   --tc-1e2836:#292a2b;   --tc-203042:#2f3133;   --tc-212c3b:#2c2e30;
+  --tc-22303f:#2f3032;   --tc-22304a:#343538;   --tc-2268e0:#767e8c;   --tc-22d3ee:#7c9194;   --tc-23303f:#2f3133;   --tc-242f3d:#2f3032;
+  --tc-26313f:#313234;   --tc-2a3546:#36383a;   --tc-2a3849:#38393b;   --tc-2a3a4d:#393b3e;   --tc-2b3746:#37383a;   --tc-2f3d4f:#3d3f41;
+  --tc-2f6fbd:#6d757f;   --tc-2f81f7:#87919f;   --tc-331a1f:#282526;   --tc-3a1f1f:#2e2b2b;   --tc-3b8bfa:#8f99a6;   --tc-3d4a5c:#4b4c4e;
+  --tc-3d5570:#53565a;   --tc-3d8ef8:#8f99a6;   --tc-3fb950:#758377;   --tc-5a2a2a:#453f3f;   --tc-5aa2ff:#a3abb6;   --tc-5b2a33:#454041;
+  --tc-5c4a1d:#403e39;   --tc-5f6f83:#6f7173;   --tc-607a96:#787b7e;   --tc-61758c:#747679;   --tc-65758a:#75777a;   --tc-6a3d22:#4a4542;
+  --tc-6b7b8f:#7b7d7f;   --tc-6d1a1a:#483f3f;   --tc-7a3a3a:#5e5656;   --tc-7a8797:#87888a;   --tc-7c8ea3:#8d8f92;   --tc-7f93a8:#919396;
+  --tc-7f95ad:#939699;   --tc-7fd4f5:#b3bdc1;   --tc-818cf8:#b5b7c4;   --tc-8296ac:#94979a;   --tc-8a2020:#5b4f4f;   --tc-8ea3b8:#a0a3a6;
+  --tc-8ea3ba:#a1a4a7;   --tc-8ea3bb:#a2a4a7;   --tc-8fa0b5:#a0a2a4;   --tc-8fd6a1:#aeb7b0;   --tc-93a5b9:#a4a6a8;   --tc-93a7bd:#a5a8ab;
+  --tc-94a4b8:#a4a6a8;   --tc-9db0c6:#afb1b4;   --tc-9db4ca:#b1b4b6;   --tc-9fb6d0:#b5b7ba;   --tc-9fd3ff:#c9cfd5;   --tc-a3b6cb:#b5b7b9;
+  --tc-a3e635:#909883;   --tc-a8b7c9:#b7b8ba;   --tc-a9bacd:#b9bbbd;   --tc-a9c2dc:#bfc2c6;   --tc-aab8c9:#b8b9bb;   --tc-b9cbe0:#cacccf;
+  --tc-c0392b:#7e6e6d;   --tc-c2cfe0:#cfd1d3;   --tc-c3d3e6:#d2d4d7;   --tc-c6d5e8:#d5d7d9;   --tc-c9d4e2:#d4d5d7;   --tc-cfdcec:#dcdddf;
+  --tc-d29922:#857e6f;   --tc-d3e4fa:#e4e6e9;   --tc-d5e4f8:#e4e6e9;   --tc-d9a83c:#948e81;   --tc-dbe6f3:#e6e7e8;   --tc-dbe6f5:#e6e8ea;
+  --tc-dbe7f5:#e6e8ea;   --tc-e0a24a:#9e978c;   --tc-e2ecf7:#ebecee;   --tc-e3c06a:#aeaa9f;   --tc-e6eefb:#eff0f2;   --tc-e9f2fc:#f1f2f4;
+  --tc-eef5fd:#f5f5f6;   --tc-f0a8b0:#d0c8c9;   --tc-f85149:#ab9796;   --tc-fca5a5:#d6cbcb;   --tc-ff9b6a:#bdb1ac;   --tc-ff9b9b:#d3c7c7;
+  --tc-ff9d97:#d1c5c5;   --tc-ffadad:#dbd1d1;   --tc-ffd9d9:#eeeaea;   --tc-ffffff:#ffffff;   --ovl-05080c:8,8,9;   --ovl-080c13:13,13,14;
+  --ovl-0d131c:20,20,21;   --ovl-16202d:32,33,35;   --ovl-2f81f7:135,145,159;
+}
+html[data-theme="paper"]{
+  --tc-080b10:#f0f2f6;   --tc-0a0f16:#eaeef4;   --tc-0a0f17:#e9edf4;   --tc-0b0e13:#edeff3;   --tc-0b1119:#e8ecf2;   --tc-0c1119:#e7ebf2;
+  --tc-0c1219:#e7ecf2;   --tc-0d131c:#e5e9f0;   --tc-0d141d:#e4e9f0;   --tc-0f151f:#e2e6ee;   --tc-0f1620:#e1e6ee;   --tc-101822:#dfe5ed;
+  --tc-101c2c:#d6dfec;   --tc-111721:#e0e4ec;   --tc-111823:#dee3ec;   --tc-121924:#dde2eb;   --tc-121926:#dbe1eb;   --tc-121a26:#dbe1eb;
+  --tc-131a25:#dce1ea;   --tc-131c2a:#d8dfe9;   --tc-141b26:#dbe0e9;   --tc-141c28:#d9dfe9;   --tc-141d29:#d8dfe9;   --tc-161d28:#d9dee7;
+  --tc-161e29:#d8dee7;   --tc-161f2a:#d7dee7;   --tc-16202c:#d5dde7;   --tc-16202e:#d4dbe6;   --tc-182030:#d2d8e4;   --tc-1a1608:#f5f2e7;
+  --tc-1a2330:#d1d8e3;   --tc-1a2432:#d0d7e2;   --tc-1b2433:#cfd6e1;   --tc-1b64d9:#3b74cf;   --tc-1d120c:#f1e9e4;   --tc-1d2836:#ccd4df;
+  --tc-1d2937:#cbd4df;   --tc-1d2a3c:#c6d1df;   --tc-1e2735:#cdd4de;   --tc-1e2836:#ccd3de;   --tc-203042:#c1cddb;   --tc-212c3b:#c7cfdb;
+  --tc-22303f:#c3ceda;   --tc-22304a:#b9c4d9;   --tc-2268e0:#346ac8;   --tc-22d3ee:#27b2c7;   --tc-23303f:#c3cdd9;   --tc-242f3d:#c5cdd8;
+  --tc-26313f:#c3cbd6;   --tc-2a3546:#bcc5d2;   --tc-2a3849:#b9c4d2;   --tc-2a3a4d:#b6c2d1;   --tc-2b3746:#bcc5d1;   --tc-2f3d4f:#b3becd;
+  --tc-2f6fbd:#5184c1;   --tc-2f81f7:#1e5eba;   --tc-331a1f:#e2cfd3;   --tc-3a1f1f:#ddc8c8;   --tc-3b8bfa:#1a58af;   --tc-3d4a5c:#a6b1bf;
+  --tc-3d5570:#95a7bc;   --tc-3d8ef8:#1b5bae;   --tc-3fb950:#53b361;   --tc-5a2a2a:#d0aaaa;   --tc-5aa2ff:#124a93;   --tc-5b2a33:#d0a9b0;
+  --tc-5c4a1d:#dbcdaa;   --tc-5f6f83:#808c9c;   --tc-607a96:#6f8399;   --tc-61758c:#788799;   --tc-65758a:#798696;   --tc-6a3d22:#d5b29d;
+  --tc-6b7b8f:#748090;   --tc-6d1a1a:#dc9b9b;   --tc-7a3a3a:#be8c8c;   --tc-7a8797:#6b7582;   --tc-7c8ea3:#606e7f;   --tc-7f93a8:#5b6b7c;
+  --tc-7f95ad:#57687b;   --tc-7fd4f5:#175973;   --tc-818cf8:#141d71;   --tc-8296ac:#586778;   --tc-8a2020:#d38181;   --tc-8ea3b8:#4c5c6c;
+  --tc-8ea3ba:#4a5a6c;   --tc-8ea3bb:#49596c;   --tc-8fa0b5:#4e5b6c;   --tc-8fd6a1:#31683f;   --tc-93a5b9:#4a5868;   --tc-93a7bd:#475667;
+  --tc-94a4b8:#4b5767;   --tc-9db0c6:#3d4c5e;   --tc-9db4ca:#3a4c5d;   --tc-9fb6d0:#34465b;   --tc-9fd3ff:#0a3356;   --tc-a3b6cb:#384758;
+  --tc-a3e635:#82b72c;   --tc-a8b7c9:#3a4553;   --tc-a9bacd:#364352;   --tc-a9c2dc:#293c50;   --tc-aab8c9:#394452;   --tc-b9cbe0:#233142;
+  --tc-c0392b:#c45a4f;   --tc-c2cfe0:#222c3a;   --tc-c3d3e6:#1d2938;   --tc-c6d5e8:#1b2635;   --tc-c9d4e2:#202833;   --tc-cfdcec:#16202d;
+  --tc-d29922:#ca9d40;   --tc-d3e4fa:#091728;   --tc-d5e4f8:#0b1726;   --tc-d9a83c:#b28c37;   --tc-dbe6f3:#0f1721;   --tc-dbe6f5:#0d1521;
+  --tc-dbe7f5:#0d1621;   --tc-e0a24a:#a5742f;   --tc-e2ecf7:#0a121b;   --tc-e3c06a:#886c29;   --tc-e6eefb:#060d17;   --tc-e9f2fc:#050c14;
+  --tc-eef5fd:#04090f;   --tc-f0a8b0:#4f171d;   --tc-f85149:#a3201a;   --tc-fca5a5:#510c0c;   --tc-ff9b6a:#853710;   --tc-ff9b9b:#590b0b;
+  --tc-ff9d97:#5d100b;   --tc-ffadad:#490909;   --tc-ffd9d9:#220404;   --tc-ffffff:#000000;   --ovl-05080c:244,246,249;   --ovl-080c13:237,240,246;
+  --ovl-0d131c:229,233,240;   --ovl-16202d:213,220,230;   --ovl-2f81f7:30,94,186;
+}
+/* ===== 主题配色结束 ===== */
+
+
+
+
+
+:root{
+  --bg:var(--tc-0b0e13); --panel:var(--tc-111721); --panel2:var(--tc-161d28); --border:var(--tc-242f3d); --border2:var(--tc-2f3d4f);
+  --text:var(--tc-c9d4e2); --dim:var(--tc-7a8797); --accent:var(--tc-2f81f7); --ok:var(--tc-3fb950); --warn:var(--tc-d29922); --err:var(--tc-f85149);
+  --mono:"Cascadia Mono",Consolas,"Courier New",monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);
+  font:12px/1.5 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;user-select:none}
+#app{display:grid;grid-template-columns:238px minmax(420px,1fr) 306px;grid-template-rows:32px 1fr 24px;
+  min-width:1000px;height:100vh}
+body{overflow-x:auto}
+#menubar{grid-column:1/4;display:flex;align-items:stretch;background:linear-gradient(var(--tc-182030),var(--tc-121926));
+  border-bottom:1px solid var(--border2);position:relative;z-index:40}
+#brand{display:flex;align-items:center;gap:7px;padding:0 12px 0 10px;border-right:1px solid var(--border);
+  font-weight:600;letter-spacing:.4px;color:var(--tc-dbe6f5)}
+#brand .dot{width:9px;height:9px;border-radius:50%;background:linear-gradient(135deg,var(--tc-22d3ee),var(--tc-818cf8));
+  box-shadow:0 0 8px rgba(var(--ovl-2f81f7),.9)}
+#brand small{color:var(--dim);font-weight:400;font-size:10px}
+.menu{position:relative;display:flex;align-items:center;padding:0 11px;cursor:default;color:var(--tc-aab8c9)}
+.menu:hover{background:var(--tc-22304a);color:var(--tc-ffffff)}
+.menu.open{background:var(--accent);color:var(--tc-ffffff)}
+.dropdown{display:none;position:absolute;top:100%;left:0;min-width:212px;background:var(--panel2);
+  border:1px solid var(--border2);box-shadow:0 10px 28px rgba(0,0,0,.6);padding:4px 0;z-index:50}
+.menu.open .dropdown{display:block}
+.dropdown div{padding:5px 14px;display:flex;justify-content:space-between;gap:20px;color:var(--tc-c2cfe0);white-space:nowrap}
+.dropdown div:hover{background:var(--accent);color:var(--tc-ffffff)}
+.dropdown div span{color:var(--dim);font-size:11px}
+.dropdown div:hover span{color:var(--tc-d5e4f8)}
+.dropdown hr{border:0;border-top:1px solid var(--border);margin:4px 0}
+#spacer{flex:1}
+#projname{display:flex;align-items:center;padding:0 14px;color:var(--dim);font-family:var(--mono);font-size:11px}
+aside{background:var(--panel);overflow-y:auto;overflow-x:hidden}
+#left{border-right:1px solid var(--border)}
+#right{border-left:1px solid var(--border)}
+aside::-webkit-scrollbar{width:9px}
+aside::-webkit-scrollbar-thumb{background:var(--tc-2b3746)}
+aside::-webkit-scrollbar-track{background:var(--tc-0d131c)}
+.sec{border-bottom:1px solid var(--border)}
+.sec>h3{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;letter-spacing:.6px;
+  color:var(--tc-8fa0b5);background:linear-gradient(var(--tc-182030),var(--tc-131a25));padding:6px 10px;border-bottom:1px solid var(--border)}
+.sec>h3::before{content:"";width:3px;height:11px;background:var(--accent)}
+.sec>h3{cursor:pointer}
+.sec>h3:hover{color:var(--tc-c6d5e8);background:linear-gradient(var(--tc-1e2836),var(--tc-161e29))}
+.sec>h3::after{content:"\25BE";margin-left:auto;font-size:9px;line-height:1;color:var(--tc-65758a);transition:transform .12s ease}
+.sec.collapsed>h3::after{transform:rotate(-90deg)}
+.sec.collapsed>.body{display:none}
+.body{padding:9px 10px;display:flex;flex-direction:column;gap:7px}
+.row{display:flex;gap:6px}
+.row>*{flex:1}
+button{font:inherit;color:var(--tc-c9d4e2);background:linear-gradient(var(--tc-212c3b),var(--tc-1a2330));border:1px solid var(--border2);
+  padding:6px 8px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:5px;white-space:nowrap}
+button:hover{background:linear-gradient(var(--tc-2a3849),var(--tc-203042));color:var(--tc-ffffff);border-color:var(--tc-3d5570)}
+button:active{background:var(--tc-16202c)}
+button.primary{background:linear-gradient(var(--tc-2f81f7),var(--tc-1b64d9));border-color:var(--tc-3b8bfa);color:var(--tc-ffffff);font-weight:600}
+button.primary:hover{background:linear-gradient(var(--tc-3d8ef8),var(--tc-2268e0))}
+button.on{background:linear-gradient(var(--tc-2f81f7),var(--tc-1b64d9));border-color:var(--tc-5aa2ff);color:var(--tc-ffffff);font-weight:600;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.14)}
+button.danger:hover{background:linear-gradient(var(--tc-8a2020),var(--tc-6d1a1a));border-color:var(--tc-c0392b);color:var(--tc-ffd9d9)}
+button:disabled{opacity:.38;cursor:not-allowed}
+button .k{margin-left:auto;color:var(--dim);font-family:var(--mono);font-size:10px}
+button:hover .k{color:var(--tc-b9cbe0)}
+label.f{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--tc-94a4b8);font-size:11px}
+input[type=text],input[type=number],select{font:inherit;font-family:var(--mono);font-size:11px;color:var(--tc-dbe7f5);
+  background:var(--tc-0c1219);border:1px solid var(--border2);padding:4px 6px;width:100%;outline:none}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(var(--ovl-2f81f7),.18)}
+select{cursor:pointer}
+input[type=number]{text-align:right}
+.hint{color:var(--dim);font-size:11px;line-height:1.6}
+.chk{display:flex;align-items:center;gap:7px;color:var(--tc-a8b7c9);font-size:11px;cursor:pointer;padding:2px 0}
+.chk input{accent-color:var(--accent);cursor:pointer}
+.rng{display:flex;align-items:center;gap:6px;color:var(--tc-a8b7c9);font-size:11px;padding:2px 0 3px 20px}
+.rng>span{flex:none;color:var(--dim)}
+.rng input[type=range]{flex:1;width:auto;min-width:48px}
+.rng>b{flex:none;width:32px;text-align:right;font-family:var(--mono);font-weight:400;color:var(--tc-8fa0b5)}
+.rng.off{opacity:.4}
+.rng.off input[type=range]{pointer-events:none}
+.legend{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--tc-a8b7c9)}
+.legend i{width:10px;height:10px;border-radius:50%;display:inline-block}
+.stat{display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;color:var(--tc-a8b7c9)}
+.stat b{color:var(--tc-e6eefb);font-weight:600}
+.sep{height:1px;background:var(--border);margin:2px 0}
+.empty{color:var(--dim);font-size:11px;text-align:center;padding:22px 10px;line-height:1.8}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:5px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px}
+.fld{display:flex;flex-direction:column;gap:3px;font-size:10px;color:var(--tc-94a4b8)}
+.fld input,.fld select{padding:3px 5px;font-size:11px}
+.bar{display:inline-block;width:14px;height:3px;border-radius:1px;margin-right:6px;vertical-align:middle}
+.chips{display:flex;flex-wrap:wrap;gap:5px;max-height:156px;overflow:auto}
+.chip{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);font-size:11px;
+  background:var(--tc-16202e);border:1px solid var(--border2);padding:2px 7px;color:var(--tc-c2cfe0)}
+.chip:hover{background:var(--accent);color:var(--tc-ffffff);cursor:pointer}
+.chip em{color:var(--dim);font-style:normal}
+.chip:hover em{color:var(--tc-e6eefb)}
+input[type=range]{width:100%;accent-color:var(--accent);height:16px}
+label.f input[type=range]{flex:1;width:auto;min-width:60px}
+input[type=color]{padding:1px;height:24px;cursor:pointer}
+#posbadge{position:absolute;left:50%;top:12px;transform:translateX(-50%);display:none;padding:6px 14px;
+  background:rgba(var(--ovl-0d131c),.93);border:1px solid var(--border2);border-left:3px solid var(--accent);
+  font-family:var(--mono);font-size:13px;color:var(--tc-e6eefb);pointer-events:none;white-space:pre;z-index:6}
+#iopanel{position:fixed;inset:0;background:rgba(var(--ovl-05080c),.72);display:none;align-items:center;justify-content:center;z-index:110}
+#iopanel.show{display:flex}
+#iodialog{width:min(1060px,96vw);max-height:86vh;background:var(--panel);border:1px solid var(--border2);
+  display:flex;flex-direction:column;box-shadow:0 24px 70px rgba(0,0,0,.75)}
+#iohead{display:flex;align-items:center;gap:10px;padding:9px 13px;background:linear-gradient(var(--tc-1b2433),var(--tc-141b26));
+  border-bottom:1px solid var(--border2)}
+#iohead b{color:var(--tc-dbe7f5);letter-spacing:.4px}
+#ioclose{margin-left:auto;padding:0 10px;cursor:pointer;color:var(--tc-93a5b9)}
+#ioclose:hover{color:var(--tc-ffffff)}
+#iobody{overflow:auto}
+#iotabs{display:flex;gap:2px;margin-left:4px}
+#iotabs .tab{height:22px;padding:0 12px;border-radius:3px;border-bottom:2px solid transparent;background:var(--tc-141c28)}
+#iotabs .tab.on{background:var(--tc-1d2a3c);border-bottom-color:var(--accent)}
+#iobody .rtrow{display:grid;grid-template-columns:118px 150px 132px 88px 92px 1fr 62px;gap:8px;align-items:center;
+  padding:4px 12px;border-bottom:1px solid var(--tc-121924);font-size:11.5px;color:var(--tc-c2cfe0)}
+#iobody .rtrow.out{grid-template-columns:118px 168px 1fr 70px 62px}
+#iobody .rthd{position:sticky;top:0;background:var(--tc-141b26);color:var(--tc-93a5b9);font-size:11px;z-index:1}
+#iobody .rtrow .idn{font-family:var(--mono);color:var(--tc-dbe7f5);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#iobody .rtrow .idn em{color:var(--dim);font-style:normal}
+#iobody .rtrow .wk{color:var(--tc-5f6f83)}
+#iobody .rtrow .cur{font-family:var(--mono);text-align:right;color:var(--tc-6b7b8f)}
+#iobody .rtrow button{height:22px;padding:0 8px}
+#iobody .rtrow input,#iobody .rtrow select,input[data-rt="inval"],select[data-rt="inkind"],select[data-rt="outkind"],#iobody input[data-rt="port"],#iobody select[data-rt="mode"],#iobody input[data-rt="sendto"],#iobody input[data-rt="hold"],#iobody input[data-rt="speed"],#iobody input[data-rt="inms"],#iobody input[data-rt="ourl"],#iobody input[data-rt="osrc"],#rt-sendmsg{height:22px;font-size:11.5px}
+#iobody .rtrow .argcell{display:flex;gap:6px;align-items:center;min-width:0}
+#iobody .rtrow .argcell input{flex:1;min-width:0}
+#iobody .rtlog{font-family:var(--mono);font-size:11px;padding:2px 0;border-bottom:1px solid var(--tc-121924);color:var(--tc-a9bacd)}
+#iobody .rtlog i{color:var(--tc-5f6f83);font-style:normal;margin-right:6px}
+#iobody .rtlog.in{color:var(--tc-7fd4f5)}
+#iobody .rtlog.out{color:var(--tc-a3e635)}
+#iobody .rtlog.bad{color:var(--tc-fca5a5)}
+#iobody .rcard{border:1px solid var(--tc-1d2836);border-radius:4px;margin:6px 12px;background:var(--tc-101822)}
+#iobody .rcard.off{opacity:.5}
+#iobody .rhead{display:flex;gap:6px;align-items:center;padding:5px 8px;background:var(--tc-141d29);
+  border-bottom:1px solid var(--tc-1d2836);flex-wrap:wrap}
+#iobody .rhead .rname{width:132px;height:22px;font-size:11.5px}
+#iobody .rhead .rtag{font-size:11px;color:var(--tc-93a5b9);padding:0 6px;line-height:20px;border:1px solid var(--tc-26313f);border-radius:3px}
+#iobody .rgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:6px 10px;padding:6px 8px 0}
+#iobody .rcard .rwide{padding:4px 8px 0}
+#iobody .rcard .rstat{font-family:var(--mono);font-size:11px;color:var(--tc-7c8ea3);padding:5px 8px 7px}
+#iobody .rcard .wk{color:var(--tc-5f6f83);font-size:11.5px;display:block;padding:2px 0}
+#iobody .rcard input[type=text],#iobody .rcard input[type=number],#iobody .rcard select{height:22px;font-size:11.5px;min-width:0}
+#iobody .rcard button.danger{background:var(--tc-331a1f);border-color:var(--tc-5b2a33);color:var(--tc-f0a8b0)}
+#iobody .rcard button.danger:hover{background:linear-gradient(var(--tc-8a2020),var(--tc-6d1a1a));border-color:var(--tc-c0392b);color:var(--tc-ffd9d9)}
+#ckpanel{position:fixed;inset:0;background:rgba(var(--ovl-05080c),.72);display:none;align-items:center;justify-content:center;z-index:110}
+#ckpanel.show{display:flex}
+#ckdialog{width:min(940px,94vw);max-height:86vh;background:var(--panel);border:1px solid var(--border2);
+  display:flex;flex-direction:column;box-shadow:0 24px 70px rgba(0,0,0,.75)}
+#ckhead{display:flex;align-items:center;gap:10px;padding:9px 13px;background:linear-gradient(var(--tc-1b2433),var(--tc-141b26));
+  border-bottom:1px solid var(--border2)}
+#ckhead b{color:var(--tc-dbe7f5);letter-spacing:.4px}
+#ckclose{margin-left:auto;padding:0 10px;cursor:pointer;color:var(--tc-93a5b9)}
+#ckclose:hover{color:var(--tc-ffffff)}
+#ckbody{overflow:auto;font-family:var(--mono);font-size:11.5px}
+#ckbody .ckrow{display:grid;grid-template-columns:34px 200px 200px 150px 1fr;gap:8px;
+  padding:4px 12px;align-items:center;border-bottom:1px solid var(--tc-121924);color:var(--tc-c3d3e6);cursor:pointer}
+#ckbody .ckrow:hover{background:var(--tc-121a26)}
+#ckbody .ckrow.on{background:var(--tc-16202e)}
+#ckbody .ckhd{position:sticky;top:0;background:var(--tc-141b26);color:var(--tc-93a5b9);cursor:default;
+  border-bottom:1px solid var(--border2)}
+#ckbody .ckbb{color:var(--tc-607a96);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#ckfoot{display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--tc-111823);border-top:1px solid var(--border2)}
+#ckfoot .hint{margin-left:auto}
+#ckfoot button[disabled]{opacity:.45;cursor:not-allowed}
+#viewport{position:relative;overflow:hidden;background:radial-gradient(ellipse at 50% 0%,var(--tc-131c2a) 0%,var(--tc-080b10) 70%)}
+#c{display:block;width:100%;height:100%;outline:none}
+#mini{position:absolute;border:1px solid var(--border2);pointer-events:none;box-shadow:0 6px 24px rgba(0,0,0,.5)}
+#mini span{position:absolute;left:0;top:0;padding:2px 6px;font-family:var(--mono);font-size:10px;color:var(--tc-9fb6d0);
+  background:rgba(var(--ovl-0d131c),.86);border-right:1px solid var(--border2);border-bottom:1px solid var(--border2)}
+#marquee{position:absolute;border:1px solid var(--accent);background:rgba(var(--ovl-2f81f7),.14);display:none;pointer-events:none}
+#hud{position:absolute;left:10px;top:10px;pointer-events:none;font-family:var(--mono);font-size:11px;color:var(--tc-607a96);line-height:1.7}
+#hud b{color:var(--tc-9fb6d0);font-weight:500}
+/* 「镜头对着空白」的提示：居中浮一层，别挡住交互（只有按钮可点） */
+#voidhint{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:none;pointer-events:none;
+  flex-direction:column;align-items:center;gap:9px;padding:15px 20px;text-align:center;max-width:min(560px,74%);
+  background:rgba(var(--ovl-0d131c),.92);border:1px solid var(--border2);box-shadow:0 12px 30px rgba(0,0,0,.6);z-index:6}
+#voidhint.show{display:flex}
+#voidhint .vh-t{color:var(--tc-dbe6f5);font-size:13px;font-weight:600}
+#voidhint .vh-s{color:var(--tc-7f95ad);font-size:12px;display:flex;align-items:center;gap:3px}
+#voidhint .vh-s b{color:var(--tc-9fd3ff);font-family:var(--mono);font-size:15px;margin:0 3px}
+#voidhint .vh-b{display:flex;gap:6px;pointer-events:auto}
+#voidhint button{padding:5px 11px;font-size:12px}
+#viewbar{position:absolute;right:10px;top:10px;display:flex;gap:5px;background:rgba(var(--ovl-0d131c),.82);
+  border:1px solid var(--border2);padding:5px;z-index:30}
+/* 结构视图：盖住画布但让开右上角那排按钮（#viewbar 的 z-index 更高），
+   所以翻页键在两边都看得见、点得到 */
+#structpanel{position:absolute;inset:0;display:none;flex-direction:column;background:var(--tc-080b10);z-index:8}
+#structpanel.show{display:flex}
+#structhead{display:flex;align-items:center;gap:9px;padding:6px 12px;
+  background:linear-gradient(var(--tc-1b2433),var(--tc-141b26));border-bottom:1px solid var(--border2)}
+#structhead b{color:var(--tc-dbe7f5);letter-spacing:.4px}
+#structhead .grow{flex:1}
+#structhead .hint{color:var(--dim);font-size:11px;max-width:44vw;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.stab{padding:3px 10px;border:1px solid var(--border2);color:var(--tc-aab8c9);cursor:pointer;font-size:11px}
+.stab:hover{background:var(--tc-22304a);color:var(--tc-ffffff)}
+.stab.on{background:linear-gradient(var(--tc-2f81f7),var(--tc-1b64d9));border-color:var(--tc-3b8bfa);color:var(--tc-ffffff);font-weight:600}
+#structbody{flex:1;position:relative;overflow:hidden;display:flex;min-height:0}
+#structc{flex:1 1 0;min-width:0;display:block;height:100%;cursor:grab}
+#structc.drag{cursor:grabbing}
+#structside{width:308px;flex:none;border-left:1px solid var(--border);background:var(--panel);
+  overflow:auto;padding:10px 12px;font-size:11px;line-height:1.7;color:var(--tc-a8b7c9)}
+#structside h4{font-size:11px;color:var(--tc-8fa0b5);margin:12px 0 5px;letter-spacing:.5px;
+  border-bottom:1px solid var(--border);padding-bottom:3px}
+#structside h4:first-child{margin-top:0}
+#structside .it{border-left:2px solid var(--border2);padding:2px 0 2px 8px;margin-bottom:5px}
+#structside .ssum{color:var(--tc-93a5b9);background:var(--tc-0d131c);border:1px solid var(--border);padding:8px 10px;line-height:1.75}
+/* 文字页铺满时别让行宽跑到两千像素，读起来累 */
+#structside .stwrap{max-width:1080px}
+#viewbar button{padding:4px 7px;font-size:11px}
+#viewbar button.on{background:linear-gradient(var(--tc-2f81f7),var(--tc-1b64d9));border-color:var(--tc-3b8bfa);color:var(--tc-ffffff)}
+#statusbar{grid-column:1/4;display:flex;align-items:center;background:linear-gradient(var(--tc-141c28),var(--tc-0f151f));
+  border-top:1px solid var(--border2);font-family:var(--mono);font-size:11px;color:var(--tc-8296ac)}
+#statusbar>div{padding:0 12px;border-right:1px solid var(--border);display:flex;align-items:center;gap:6px;height:100%}
+#statusbar b{color:var(--tc-dbe7f5);font-weight:600}
+#statusbar .grow{flex:1;border-right:0;justify-content:flex-end;color:var(--tc-61758c)}
+#modal{position:fixed;inset:0;background:rgba(var(--ovl-05080c),.72);display:none;align-items:center;justify-content:center;z-index:100}
+#modal.show{display:flex}
+#dialog{width:min(1080px,94vw);height:min(770px,88vh);background:var(--panel);border:1px solid var(--border2);
+  display:grid;grid-template-rows:34px 1fr 46px;box-shadow:0 24px 70px rgba(0,0,0,.75)}
+#dlghead{display:flex;align-items:center;background:linear-gradient(var(--tc-1b2433),var(--tc-141b26));border-bottom:1px solid var(--border2)}
+#dlgtitle{padding:0 14px;font-weight:600;color:var(--tc-dbe7f5);display:flex;align-items:center;gap:8px}
+.tab{padding:0 15px;height:100%;display:flex;align-items:center;cursor:pointer;color:var(--tc-93a5b9);font-size:12px;
+  border-bottom:2px solid transparent}
+.tab:hover{color:var(--tc-dbe7f5);background:var(--tc-1a2432)}
+.tab.on{color:var(--tc-ffffff);border-bottom-color:var(--accent);background:var(--tc-16202e)}
+#dlgbody{overflow:auto;background:var(--tc-080b10)}
+#dlgbody pre{margin:0;padding:14px 16px;font-family:var(--mono);font-size:11.5px;line-height:1.65;
+  color:var(--tc-c3d3e6);white-space:pre;tab-size:4}
+#dlgbody .report{padding:14px 18px}
+.rline{padding:5px 0 5px 22px;position:relative;border-bottom:1px solid var(--tc-121924);font-family:var(--mono);font-size:11.5px}
+.rline::before{position:absolute;left:2px;top:5px}
+.rline.err{color:var(--tc-ff9d97)}.rline.err::before{content:"X";color:var(--err)}
+.rline.warn{color:var(--tc-e3c06a)}.rline.warn::before{content:"!";color:var(--warn)}
+.rline.ok{color:var(--tc-8fd6a1)}.rline.ok::before{content:"v";color:var(--ok)}
+.rline.info{color:var(--tc-9db0c6)}.rline.info::before{content:">";color:var(--tc-607a96)}
+.rtitle{color:var(--tc-dbe7f5);font-weight:600;margin:16px 0 6px;font-size:12px;letter-spacing:.4px}
+.rtitle:first-child{margin-top:0}
+#dlgfoot{display:flex;align-items:center;gap:8px;padding:0 12px;background:var(--tc-111823);border-top:1px solid var(--border2)}
+#dlgfoot .grow{flex:1}
+/* ---- 两侧栏整块收放：把网格列压成 0，画面全给神经元 ---- */
+#app.hide-left{grid-template-columns:0 minmax(420px,1fr) 306px}
+#app.hide-right{grid-template-columns:238px minmax(420px,1fr) 0}
+#app.hide-left.hide-right{grid-template-columns:0 minmax(420px,1fr) 0}
+/* 列位置必须钉死：栏位一变化，自动排布就会把 #viewport 挪到别的列去 */
+#app>#left{grid-column:1;grid-row:2}
+#app>#viewport{grid-column:2;grid-row:2}
+#app>#right{grid-column:3;grid-row:2}
+#app>#statusbar{grid-column:1/4;grid-row:3}
+/* 收放按钮 = 贴在面板内边、居中的那一小块（多数软件的常见做法）：两侧栏是竖直的小竖条，
+   底部 AI 框是横在对话框顶边正中的小横条（收起来时它自己落回视口底边）。
+   它们都挂在 #viewport 里而不是面板里，所以面板整块 display:none 之后按钮照样在，
+   不存在"收起来就找不到"。 */
+.vtog{position:absolute;top:50%;transform:translateY(-50%);width:15px;height:46px;z-index:31;
+  display:flex;align-items:center;justify-content:center;cursor:pointer;user-select:none;
+  background:linear-gradient(180deg,var(--tc-1b2433),var(--tc-141b26));border:1px solid var(--border2);
+  color:var(--tc-8fa0b5);font-size:12px;line-height:1}
+.vtog:hover{background:var(--tc-2a3849);color:var(--tc-ffffff);border-color:var(--tc-3d5570)}
+.vtog.on{background:linear-gradient(180deg,var(--tc-2f81f7),var(--tc-1b64d9));border-color:var(--tc-3b8bfa);color:var(--tc-ffffff)}
+#tab-left{left:0;border-left:0;border-radius:0 3px 3px 0}
+#tab-right{right:0;border-right:0;border-radius:3px 0 0 3px}
+#app.hide-left>#left,#app.hide-right>#right{display:none;overflow:hidden}
+/* ---- 视口底部中间的 AI 对话框 ---- */
+#aiwrap{position:absolute;left:50%;transform:translateX(-50%);bottom:10px;width:min(940px,95%);
+  max-height:68%;display:flex;flex-direction:column;z-index:30}
+#ai{width:100%;min-height:0;display:flex;flex-direction:column;background:rgba(var(--ovl-080c13),.97);
+  border:1px solid var(--border2);box-shadow:0 12px 34px rgba(0,0,0,.6)}
+#aihead{display:flex;align-items:center;gap:7px;padding:7px 11px;flex:none;
+  background:linear-gradient(var(--tc-1b2433),var(--tc-141b26));border-bottom:1px solid var(--border2);font-size:12.5px}
+#aihead b{color:var(--tc-dbe7f5);letter-spacing:.4px;white-space:nowrap}
+#aihead .grow{flex:1}
+#aidot{width:8px;height:8px;border-radius:50%;background:var(--tc-3d4a5c);flex:none}
+#aidot.on{background:var(--ok);box-shadow:0 0 7px rgba(63,185,80,.85)}
+#aidot.busy{background:var(--warn);box-shadow:0 0 7px rgba(210,153,34,.85)}
+#aiinfo{color:var(--tc-8ea3ba);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 本机权限小标：一眼看见"AI 现在碰不碰得到这台机器"。关/只读写/全开三种颜色 */
+#aisyschip{flex:none;font-size:10px;padding:1px 6px;border:1px solid var(--border2);
+  color:var(--tc-7f93a8);background:var(--tc-0f1620);white-space:nowrap}
+#aisyschip.warm{color:var(--tc-d9a83c);border-color:var(--tc-5c4a1d);background:var(--tc-1a1608)}
+#aisyschip.hot{color:var(--tc-ff9b6a);border-color:var(--tc-6a3d22);background:var(--tc-1d120c)}
+/* 顶栏常驻的思考强度：不用展开「设置」就能改（跟设置里那个是同一个值） */
+#aithinkbox{display:flex;align-items:center;gap:4px;cursor:default}
+#aithinkbox:hover{color:var(--tc-93a5b9);background:none;border-color:transparent}
+#ai-think-top{font:inherit;font-size:11px;background:var(--tc-0f1620);color:var(--tc-a3b6cb);border:1px solid var(--border2);border-radius:4px;padding:1px 3px;max-width:118px}
+.aib{padding:2px 7px;cursor:pointer;color:var(--tc-93a5b9);border:1px solid transparent;white-space:nowrap}
+.aib:hover{color:var(--tc-ffffff);background:var(--tc-22304a);border-color:var(--border2)}
+/* 停止键：只在 AI 忙的时候露出来（开局由 aiInfo 兜一遍，省得一进来闪一下红字） */
+#aistop{display:none;color:var(--tc-ff9b9b);border-color:var(--tc-5a2a2a)}
+#aistop:hover{color:var(--tc-ffffff);background:var(--tc-3a1f1f);border-color:var(--tc-7a3a3a)}
+#aiset{display:none;flex-direction:column;gap:7px;padding:10px 12px;overflow:auto;max-height:74%;
+  border-bottom:1px solid var(--border2);background:var(--tc-0f1620)}
+#aiset label{display:flex;align-items:center;gap:7px;color:var(--tc-a3b6cb);font-size:12px}
+#aiset label>span:first-child{width:72px;flex:none;text-align:right;color:var(--dim)}
+#aiset select,#aiset input[type=text],#aiset input[type=password],#aiset textarea{flex:1;min-width:0;font:inherit;
+  background:var(--tc-0c1119);border:1px solid var(--border2);color:var(--tc-c9d4e2);padding:4px 6px}
+#aiset textarea{resize:vertical;min-height:44px;font-family:var(--mono);font-size:11px}
+#aiset .row{display:flex;gap:6px;align-items:center;justify-content:flex-end}
+#aisess{display:none;flex-direction:column;gap:6px;padding:9px 12px;overflow:auto;max-height:46%;
+  border-bottom:1px solid var(--border2);background:var(--tc-0f1620)}
+#aisess .aishead{display:flex;align-items:center;gap:8px;color:var(--tc-a3b6cb);font-size:12px}
+#aisess .aishead .grow{flex:1}
+#aisess .aishead b{color:var(--tc-dbe7f5)}
+#aisess .aishead button{padding:2px 9px;font-size:12px}
+#aisess .aishead2{color:var(--tc-7f93a8);font-size:11.5px;margin-top:5px;border-top:1px solid var(--tc-22303f);padding-top:6px}
+#aisess #aisinfo{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#aislist,#aisarch{display:flex;flex-direction:column;gap:5px;max-height:168px;overflow:auto}
+#aisess .aisrow{border:1px solid var(--tc-1d2937);background:var(--tc-0b1119);padding:5px 8px}
+#aisess .aisrow.on{border-color:var(--tc-2f6fbd);background:var(--tc-101c2c)}
+#aisess .aisrow.arch{opacity:.85}
+#aisess .aistop{display:flex;align-items:center;gap:8px}
+#aisess .aistop b{color:var(--tc-dbe7f5);font-size:12.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#aisess .aisat{color:var(--tc-7f93a8);font-size:11px;margin-left:auto;white-space:nowrap}
+#aisess .aisprev{color:var(--tc-8ea3ba);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}
+#aisess .aisbtns{display:flex;gap:5px;margin-top:4px}
+#aisess .aisbtns span{padding:1px 8px;border:1px solid var(--border2);color:var(--tc-93a5b9);cursor:pointer;font-size:11.5px}
+#aisess .aisbtns span:hover{color:var(--tc-ffffff);background:var(--tc-22304a)}
+#ailog{overflow:auto;padding:10px 13px;display:flex;flex-direction:column;gap:7px;font-size:13px;
+  line-height:1.62;min-height:120px;background:var(--tc-0a0f16);color:var(--tc-e9f2fc)}
+/* 收起来 = 整块让位，跟两侧栏一个规矩（边上那条小横条留在视口里） */
+#ai.folded{display:none}
+.airow{line-height:1.62;white-space:pre-wrap;word-break:break-word}
+.airow b{color:var(--tc-a9c2dc);margin-right:6px;font-weight:700}
+.airow.u{color:var(--tc-d3e4fa)}
+.airow.a{color:var(--tc-eef5fd)}
+.airow.t{color:var(--tc-9db4ca);font-family:var(--mono);font-size:12px}
+.airow.e{color:var(--tc-ffadad)}
+.airow.n{color:var(--tc-93a7bd)}
+.aithink{color:var(--tc-8ea3b8);font-size:12px;white-space:pre-wrap;margin-top:5px;
+  border-left:2px solid var(--tc-2a3a4d);padding-left:7px}
+#aibar{display:flex;gap:6px;align-items:flex-end;padding:7px 9px;flex:none;
+  border-top:1px solid var(--border2);background:var(--tc-0f1620)}
+#aitext{flex:1;min-width:0;resize:none;max-height:220px;font:inherit;font-size:13px;
+  line-height:1.55;background:var(--tc-0c1119);border:1px solid var(--border2);color:var(--tc-e2ecf7);padding:7px 9px}
+#aibar button{padding:5px 12px}
+.htog{flex:none;align-self:center;margin-bottom:-1px;width:46px;height:15px;
+  display:flex;align-items:center;justify-content:center;cursor:pointer;user-select:none;
+  background:linear-gradient(180deg,var(--tc-1b2433),var(--tc-141b26));border:1px solid var(--border2);border-bottom:0;
+  border-radius:3px 3px 0 0;color:var(--tc-8fa0b5);font-size:12px;line-height:1}
+.htog:hover{background:var(--tc-2a3849);color:var(--tc-ffffff);border-color:var(--tc-3d5570)}
+.htog.on{background:linear-gradient(180deg,var(--tc-2f81f7),var(--tc-1b64d9));border-color:var(--tc-3b8bfa);color:var(--tc-ffffff)}
+#toast{position:fixed;right:16px;bottom:38px;display:flex;flex-direction:column;gap:7px;z-index:200;align-items:flex-end}
+.toast{background:rgba(var(--ovl-16202d),.96);border:1px solid var(--border2);border-left:3px solid var(--accent);
+  padding:8px 14px;font-size:12px;box-shadow:0 8px 22px rgba(0,0,0,.55);color:var(--tc-cfdcec)}
+.toast.ok{border-left-color:var(--ok)}.toast.err{border-left-color:var(--err)}.toast.warn{border-left-color:var(--warn)}
+</style>
+</head>
+<body>
+<div id="app">
+  <header id="menubar">
+    <div id="brand"><span class="dot"></span>NeuroForge <small>v0.1 原型</small></div>
+    <div class="menu" data-menu>文件
+      <div class="dropdown">
+        <div data-cmd="new">新建工程<span>Ctrl+N</span></div>
+        <div data-cmd="open">打开工程...<span>Ctrl+O</span></div>
+        <div data-cmd="save">保存工程<span>Ctrl+S</span></div>
+        <div data-cmd="save-spatial">另存为空间分块工程...<span>按 Z 序切块，靠近才解压</span></div>
+        <div data-cmd="save-json">导出 JSON 工程（v2 兼容）</div>
+        <div data-cmd="open-chunks">分块载入...<span>只载入一部分</span></div>
+        <div data-cmd="open-stream">流式载入...<span>先看结构，靠近才解压</span></div>
+        <div data-cmd="open-path">打开大工程（按路径）...<span>不整份进内存，几百 MB 也能开</span></div>
+        <div data-cmd="srcreport">导入报告...<span>来源表 / 精度 / 跳过的算子</span></div>
+        <hr>
+        <div data-cmd="demo">载入示例网络</div>
+        <div data-cmd="stress">压力测试 10,000 神经元</div>
+      </div>
+    </div>
+    <div class="menu" data-menu>编辑
+      <div class="dropdown">
+        <div data-cmd="undo">撤销<span>Ctrl+Z</span></div>
+        <div data-cmd="redo">重做<span>Ctrl+Y</span></div>
+        <hr>
+        <div data-cmd="selall">全选神经元<span>Ctrl+A</span></div>
+        <div data-cmd="selnone">取消选择<span>Esc</span></div>
+        <div data-cmd="del">删除选中<span>Del</span></div>
+      </div>
+    </div>
+    <div class="menu" data-menu>视图
+      <div class="dropdown">
+        <div data-cmd="reset">重置视角<span>Home</span></div>
+        <div data-cmd="focus">聚焦选中（没选就框整图）<span>F</span></div>
+        <div data-cmd="center">以选中为中心（绕它转）<span>Shift+F · 视距不变</span></div>
+        <div data-cmd="follow">选中就换旋转中心<span id="follow-state">关</span></div>
+        <div data-cmd="top">顶视图<span>7</span></div>
+        <hr>
+        <div data-cmd="layout">按拓扑重排（层状）</div>
+        <div data-cmd="layout-line">重排成直线（每层一条）</div>
+        <div data-cmd="layout-grid">重排成网格（每层一块）</div>
+        <div data-cmd="layout-force">力导向排布<span>按连线把关系近的拉在一起</span></div>
+        <hr>
+        <div data-cmd="struct">结构视图 ⇄ 3D 建模<span>F9 · 看算子级结构</span></div>
+        <hr>
+        <div data-cmd="toggle-left">隐藏 / 显示左栏<span>[</span></div>
+        <div data-cmd="toggle-right">隐藏 / 显示右栏<span>]</span></div>
+        <div data-cmd="toggle-both">沉浸模式：两栏一起收<span>\</span></div>
+        <hr>
+        <div data-cmd="ai">AI 助手<span>F8</span></div>
+        <hr>
+        <div data-cmd="view2-top">第二视口：顶视图</div>
+        <div data-cmd="view2-front">第二视口：前视图</div>
+        <div data-cmd="view2-side">第二视口：侧视图</div>
+        <div data-cmd="view2-sync">第二视口：跟随主相机</div>
+        <div data-cmd="view2-off">第二视口：关闭</div>
+        <hr>
+        <div data-cmd="orbit">导出旋转动画 (.webm)<span>绕焦点转一圈</span></div>
+      </div>
+    </div>
+    <div class="menu" data-menu>增强
+      <div class="dropdown">
+        <div data-cmd="mod-lib">模块库...<span>把子图封装成可复用模块</span></div>
+        <div data-cmd="mod-wrap">封装选中为模块</div>
+        <hr>
+        <div data-cmd="seed">随机种子...<span>同种子 = 同结果</span></div>
+        <div data-cmd="hist">历史与内存...<span>分块共享，可逆无损</span></div>
+        <hr>
+        <div data-cmd="nodelist">神经元列表...<span>看状态 / 手动隐藏 / 分组（Ctrl+L）</span></div>
+        <div data-cmd="hide-sel">隐藏选中的<span>H · 只影响显示与拾取，数据不动</span></div>
+        <div data-cmd="show-sel">显示选中的<span>Shift+H</span></div>
+        <div data-cmd="show-all-hidden">显示全部被隐藏的<span>把手动隐藏一次清干净</span></div>
+        <div data-cmd="find">搜索与定位...<span>按名称 / 编号 / 颜色 / 分组找</span></div>
+        <div data-cmd="views">视角书签...<span>一点回到同一个角度</span></div>
+        <div data-cmd="prune">剪枝与清理...<span>按阈值剪、随机稀疏、清无用神经元</span></div>
+        <div data-cmd="dist">权重直方图...<span>看分布，拖一段就能剪</span></div>
+        <hr>
+        <div data-cmd="autosave">自动保存<span id="autosave-state">已开</span></div>
+        <div data-cmd="autosave-now">立即自动保存一次</div>
+        <div data-cmd="autosave-restore">恢复上次自动保存...</div>
+        <div data-cmd="autorestore">启动时接回上次工程<span id="autore-state">先问一句</span></div>
+        <div data-cmd="autosave-forget">删掉本机自动保存</div>
+      </div>
+    </div>
+    <div class="menu" data-menu>编译
+      <div class="dropdown">
+        <div data-cmd="compile">校验并生成模型...<span>F7</span></div>
+        <hr>
+        <div data-cmd="compile-py">目标：PyTorch (.py + 权重)</div>
+        <div data-cmd="compile-onnx">目标：ONNX (.onnx)</div>
+        <div data-cmd="compile-exe">目标：独立可执行文件</div>
+      </div>
+    </div>
+    <div class="menu" id="m-io">接口</div>
+    <div class="menu" id="m-appear" data-menu>外观
+      <div class="dropdown">
+        <div data-cmd="ap-none" style="color:var(--dim)">界面主题</div>
+        <div data-cmd="ap-theme-deep">深空蓝<span id="ap-t-deep"></span></div>
+        <div data-cmd="ap-theme-midnight">午夜紫<span id="ap-t-midnight"></span></div>
+        <div data-cmd="ap-theme-teal">青碧<span id="ap-t-teal"></span></div>
+        <div data-cmd="ap-theme-forest">森林绿<span id="ap-t-forest"></span></div>
+        <div data-cmd="ap-theme-amber">琥珀暖阳<span id="ap-t-amber"></span></div>
+        <div data-cmd="ap-theme-crimson">赤铁<span id="ap-t-crimson"></span></div>
+        <div data-cmd="ap-theme-slate">石墨灰<span id="ap-t-slate"></span></div>
+        <div data-cmd="ap-theme-paper">亮色<span id="ap-t-paper"></span></div>
+        <hr>
+        <div data-cmd="ap-none" style="color:var(--dim)">视口背景</div>
+        <div data-cmd="ap-vbg-theme">跟随主题</div>
+        <div data-cmd="ap-vbg-black">纯黑</div>
+        <div data-cmd="ap-vbg-gray">深灰</div>
+        <div data-cmd="ap-vbg-white">白</div>
+        <hr>
+        <div data-cmd="ap-none" style="color:var(--dim)">神经元配色（整图重上色）</div>
+        <div data-cmd="ap-pal-cool">冷色<span>青 → 蓝</span></div>
+        <div data-cmd="ap-pal-warm">暖色<span>红 → 琥珀</span></div>
+        <div data-cmd="ap-pal-neon">霓虹<span>整圈色相</span></div>
+        <div data-cmd="ap-pal-mono">单色<span>只有明暗</span></div>
+        <hr>
+        <div data-cmd="ap-reset">重置外观</div>
+      </div>
+    </div>
+    <div class="menu" id="m-lang" data-menu>语言
+      <div class="dropdown" id="lang-menu"></div>
+    </div>
+    <div class="menu" data-menu>帮助
+      <div class="dropdown">
+        <div data-cmd="help">快捷键与操作说明</div>
+        <div data-cmd="about">关于本原型</div>
+      </div>
+    </div>
+    <div id="spacer"></div>
+    <div id="projname">未命名工程</div>
+  </header>
+  <aside id="left">
+    <div class="sec" id="sec-tool"><h3 data-fold="tool">工具模式</h3><div class="body">
+      <button id="t-select" class="on">选择 / 拖拽<span class="k">S</span></button>
+      <button id="t-wire">连线<span class="k">W</span></button>
+      <button id="t-add">放置神经元<span class="k">A</span></button>
+      <button id="t-del" class="danger">删除<span class="k">D</span></button>
+      <div class="hint" id="toolhint"></div>
+    </div></div>
+    <div class="sec" id="sec-neuron"><h3 data-fold="neuron">神经元</h3><div class="body">
+      <div class="hint" data-i18n="h-intro">神经元本身<b>不分类型</b>，靠颜色区分就够了。跟外界打交道的那几个用<b>接口</b>标记，编译时会变成模型的输入 / 输出。</div>
+      <div class="hint" data-i18n="h-stateful">激活函数里有三种<b>带状态</b>的：<b>记忆 Memory</b>（把上一拍的值留到下一拍）、<b>漏电积分 Leaky</b>、<b>脉冲 LIF</b>。选了它们，右边的「偏置 bias」就变成<b>保持系数 k</b>：0 = 每拍清空（只剩当拍），1 = 完全不忘。模拟激活和编译出来的模型都按这条算；ONNX 导出不带状态（导出时会提示）。</div>
+      <div class="sep"></div>
+      <div class="legend"><i style="background:#818cf8"></i>内部神经元（默认色）</div>
+      <div class="legend"><i style="background:#22d3ee"></i>接收外界信号（模型输入）</div>
+      <div class="legend"><i style="background:#f59e0b"></i>输出到外界（模型输出）</div>
+      <div class="legend"><i style="background:#a3e635"></i>双向接口</div>
+      <div class="legend"><i style="background:#c084fc"></i>自定义颜色（右上色板可改）</div>
+      <div class="hint" data-i18n="h-keys">选中后按 <b>1</b> 接收外界信号　<b>2</b> 输出到外界　<b>3</b> 双向　<b>4</b> 取消接口</div>
+      <div class="sep"></div>
+      <div class="hint" data-i18n="h-hl">选中神经元后，它的<b>入边</b>与<b>出边</b>会分别高亮，一眼看清数据从哪来、到哪去。</div>
+      <div class="sep"></div>
+      <div class="legend"><span class="bar" style="background:#2ee6ff"></span>入边（数据流入该神经元）</div>
+      <div class="legend"><span class="bar" style="background:#ffb03a"></span>出边（数据流出该神经元）</div>
+      <div class="legend"><span class="bar" style="background:#4aa3ff"></span>正权重　<span class="bar" style="background:#ff5c7a"></span>负权重</div>
+    </div></div>
+    <div class="sec" id="sec-place"><h3 data-fold="place">按坐标放置</h3><div class="body">
+      <div class="grid3">
+        <label class="fld">X<input type="number" id="pl-x" value="0" step="1"></label>
+        <label class="fld">Y<input type="number" id="pl-y" value="0" step="1"></label>
+        <label class="fld">Z<input type="number" id="pl-z" value="0" step="1"></label>
+      </div>
+      <label class="fld">步进单位<input type="number" id="pl-step" value="10" min="0.001" step="1"></label>
+      <div class="grid2">
+        <label class="fld">主步进轴<select id="pl-axis"><option value="0">X 轴</option><option value="1">Y 轴</option><option value="2">Z 轴</option></select></label>
+        <label class="fld">排 / 面<select id="pl-mode"><option value="0">排（单轴）</option><option value="1">面（双轴）</option></select></label>
+      </div>
+      <div class="grid2" id="pl-plane-wrap" style="display:none">
+        <label class="fld">每行数量<input type="number" id="pl-rowlen" value="8" min="1" step="1"></label>
+        <label class="fld">第二轴<select id="pl-axis2"><option value="1">Y 轴</option><option value="2">Z 轴</option><option value="0">X 轴</option></select></label>
+      </div>
+      <button class="primary" id="pl-do">放置神经元<span class="k">Enter</span></button>
+      <div class="grid2">
+        <button id="pl-fromsel">以选中为基准</button>
+        <button id="pl-zero">归零</button>
+      </div>
+      <label class="fld">放置颜色<input type="color" id="pl-color" value="#818cf8"></label>
+      <label class="chk"><input type="checkbox" id="pl-color-on">用这个颜色标记新放置的神经元</label>
+      <label class="chk"><input type="checkbox" id="pl-clickplace">点击视口直接落点（吸附网格）</label>
+      <div class="sep"></div>
+      <div class="grid3">
+        <label class="fld">数量 X<input type="number" id="pl-bnx" value="6" min="1" step="1"></label>
+        <label class="fld">数量 Y<input type="number" id="pl-bny" value="6" min="1" step="1"></label>
+        <label class="fld">数量 Z<input type="number" id="pl-bnz" value="4" min="1" step="1"></label>
+      </div>
+      <div class="grid3">
+        <button id="pl-bulk-line">铺一列</button>
+        <button id="pl-bulk-plane">铺一面</button>
+        <button id="pl-bulk-cube">铺一方</button>
+      </div>
+      <label class="chk"><input type="checkbox" id="pl-blink">铺设后按顺序连成链</label>
+      <div class="hint" data-i18n="h-bulk">快捷铺设用上面的「步进单位」当间距：铺一列 = 数量 X 个沿 X 轴排开；铺一面 = 数量 X × 数量 Y 的一张平面；铺一方 = 三轴都铺成立体块。铺完原点顺移到这一片之后，接着铺下一片不会重叠。</div>
+      <div class="hint" id="pl-info"></div>
+    </div></div>
+    <div class="sec" id="sec-gen"><h3 data-fold="gen">批量生成</h3><div class="body">
+      <label class="f">数量<input type="number" id="gen-n" value="10000" min="10" max="100000" step="1000"></label>
+      <label class="f">层数<input type="number" id="gen-l" value="60" min="2" max="400"></label>
+      <label class="f">扇出<input type="number" id="gen-f" value="4" min="1" max="32"></label>
+      <button id="gen-go">生成测试网络</button>
+      <div class="hint">用于验证规模性能，生成后观察帧耗时与内存占用。</div>
+    </div></div>
+
+    <div class="sec" id="sec-view"><h3 data-fold="view">显示</h3><div class="body">
+      <label class="chk"><input type="checkbox" id="v-grid" checked>地面网格</label>
+      <label class="chk"><input type="checkbox" id="v-axes" checked>坐标轴</label>
+      <label class="chk"><input type="checkbox" id="v-edges" checked>显示连接</label>
+      <label class="chk"><input type="checkbox" id="v-wwidth">连线粗细按权重（看主要连接）</label>
+      <label class="rng" id="r-wwidth"><span>粗细对比度</span><input type="range" id="v-wgain" min="0.5" max="8" step="0.1" value="1"><b id="v-wgain-v">1.0×</b></label>
+      <label class="chk"><input type="checkbox" id="v-wsize">神经元大小按连接强度（看重要神经元）</label>
+      <label class="rng" id="r-wsize"><span>大小对比度</span><input type="range" id="v-sgain" min="0.5" max="8" step="0.1" value="1"><b id="v-sgain-v">1.0×</b></label>
+      <label class="chk"><input type="checkbox" id="v-wmin-on">只显示强连接（按 |权重| 过滤）</label>
+      <label class="rng off" id="r-wmin"><span>权重阈值</span><input type="range" id="v-wmin" min="0" max="1000" step="1" value="0"><b id="v-wmin-v">关</b></label>
+      <div class="row"><button id="v-wmin-p50">p50</button><button id="v-wmin-p90">p90</button><button id="v-wmin-p99">p99</button><button id="v-wmin-clear">全部显示</button></div>
+      <div class="hint" id="wmin-hint"></div>
+      <div class="hint" id="viewscale-hint"></div>
+      <label class="chk"><input type="checkbox" id="v-dim" checked>选中时淡化其他对象</label>
+      <label class="chk"><input type="checkbox" id="v-spin">自动旋转</label>
+      <label class="f">渲染细节
+        <select id="v-lod">
+          <option value="auto">自动（按距离）</option>
+          <option value="high">高 · 完整连线</option>
+          <option value="mid">中 · 细线</option>
+          <option value="low">简 · 抽样点云</option>
+        </select>
+      </label>
+      <div class="hint" id="lod-hint"></div>
+      <div class="sep"></div>
+      <label class="f">视口背景<input type="color" id="v-bg" value="#080b10"></label>
+      <div class="row"><button id="v-bg-theme">背景跟随主题</button><button id="v-bg-default">默认</button></div>
+      <div class="hint" data-i18n="h-lod">模型大起来之后，远看只画抽样点云和细线（看得清大致形状和权重分布），拉近才换成完整连线。要一直看全细节就把上面锁成「高」，代价是帧率。</div>
+    </div></div>
+    <div class="sec" id="sec-cam"><h3 data-fold="cam">相机 / 视角中心</h3><div class="body">
+      <div class="grid3">
+        <span></span><button id="cam-up" title="向上平移：按住持续滑行（键盘 ↑），Shift 更快">↑</button><span></span>
+        <button id="cam-left" title="向左平移：按住持续滑行（键盘 ←），Shift 更快">←</button>
+        <button id="cam-home" title="回到初始视角（Home）">⌂</button>
+        <button id="cam-right" title="向右平移：按住持续滑行（键盘 →），Shift 更快">→</button>
+        <span></span><button id="cam-down" title="向下平移：按住持续滑行（键盘 ↓），Shift 更快">↓</button><span></span>
+      </div>
+      <div class="grid2">
+        <button id="cam-focus" title="把选中对象框进屏幕；什么都没选就框住整张图（F）">聚焦选中</button>
+        <button id="cam-center" title="只把旋转中心换到选中对象，视距和方向都不动（Shift+F）">以选中为中心</button>
+      </div>
+      <label class="chk"><input type="checkbox" id="cam-follow">选中就换旋转中心（自动）</label>
+      <div class="hint" data-i18n="h-cam">右键拖拽 = 旋转，中键拖拽或方向键 = 上下左右平移（按住方向键会持续滑行、松手缓停，不是一格一格跳），滚轮 = 缩放。旋转是绕着「视角中心」转的：默认中心是世界原点，所以只转不挪就会一直盯着原点。选中神经元 / 连线后点「以选中为中心」就换成绕着它们转（视距、方向都不变），「聚焦选中」连视距一起调好。什么都没选时聚焦 = 框住整张图。</div>
+    </div></div>
+    <div class="sec" id="sec-stream" style="display:none"><h3 data-fold="stream">流式载入</h3><div class="body">
+      <div class="hint" data-i18n="h-stream">打开时只读文件头，先把每块的包围盒画成线框；相机靠近哪一块，才把哪一块解压进内存。屏幕外的块不占实例缓冲。</div>
+      <div class="stat"><span>已载入块</span><b id="stm-blocks">0 / 0</b></div>
+      <div class="stat"><span>分块方式</span><b id="stm-order">—</b></div>
+      <div class="stat"><span>神经元</span><b id="stm-n">0 / 0</b></div>
+      <div class="stat"><span>已读 / 全文件</span><b id="stm-bytes">—</b></div>
+      <label class="chk"><input type="checkbox" id="stm-auto" checked>靠近时自动解压</label>
+      <label class="f">细节阈值（屏幕像素）<input type="number" id="stm-px" value="26" min="2" max="400" step="2"></label>
+      <label class="chk"><input type="checkbox" id="stm-evict-on" checked>超预算时驱逐远处的块</label>
+      <label class="f">驻留神经元上限<input type="number" id="stm-mem" value="200000" min="0" max="500000" step="10000"></label>
+      <label class="chk"><input type="checkbox" id="stm-blk">自动载入附近的权重块</label>
+      <div class="stat"><span>已驱逐</span><b id="stm-evict">0</b></div>
+      <div class="stat"><span>权重块分段</span><b id="stm-blkw">0 / 0</b></div>
+      <div class="row"><button id="stm-all">全部载入</button><button id="stm-reset">只看摘要</button></div>
+      <div class="hint" data-i18n="h-blk">权重块在文件里是「一块一段」存的（每段带自己的包围盒），所以可以只读相机附近的那几段，远处的段一个字节都不碰。旧文件整段存的，就只能整段读。</div>
+      <div class="hint" data-i18n="h-stream2">超出上限时，离相机最远的块会被丢掉，腾出地方装新的——这样才能在上限之内一直往前飞。手上正在用的（选中神经元、悬停、连线起点所在的块）不会被丢。要说清楚：驱逐省的不是内存（实例缓冲是静态预分配的），省的是「上限之内能无限漫游」；它还会清空撤销记录——驱逐是资源事件，不是一次编辑。</div>
+    </div></div>
+    <div class="sec" id="sec-stats"><h3 data-fold="stats">工程统计</h3><div class="body">
+      <div class="stat"><span>神经元</span><b id="s-n">0</b></div>
+      <div class="stat"><span>连接</span><b id="s-e">0</b></div>
+      <div class="stat"><span>参数量</span><b id="s-p">0</b></div>
+      <div class="stat"><span>输入 / 输出</span><b id="s-io">0 / 0</b></div>
+    </div></div>
+  </aside>
+  <main id="viewport">
+    <canvas id="c"></canvas>
+    <div id="marquee"></div>
+    <div id="hud"></div>
+    <!-- 镜头对着空白时浮出来：告诉用户模型在屏幕的哪边、多远，并给一键找回 -->
+    <div id="voidhint">
+      <div class="vh-t" data-i18n="void-t">这个方向没有神经元</div>
+      <div class="vh-s"><span data-i18n="void-s1">图在屏幕的</span><b id="vh-away">—</b>
+        <span data-i18n="void-s2">方向 · 约</span><b id="vh-dist">—</b><span data-i18n="void-s3">单位</span></div>
+      <div class="vh-b">
+        <button id="vh-focus" class="primary" data-i18n="void-b1">框住整张图（F）</button>
+        <button id="vh-home" data-i18n="void-b2">回到初始视角</button>
+      </div>
+    </div>
+    <div id="posbadge"></div>
+    <div id="structpanel">
+      <div id="structhead">
+        <b>结构视图</b>
+        <div class="stab on" data-stab="dag">算子图</div>
+        <div class="stab" data-stab="info">模型独有信息</div>
+        <span class="hint" id="struct-sub"></span>
+        <span class="grow"></span>
+        <button id="struct-fit">适应窗口</button>
+        <button id="struct-3d" class="primary">回到 3D 建模</button>
+      </div>
+      <div id="structbody">
+        <canvas id="structc"></canvas>
+        <div id="structside"></div>
+      </div>
+    </div>
+    <div id="viewbar">
+      <button data-cmd="reset">重置</button>
+      <button data-cmd="focus">聚焦</button>
+      <button data-cmd="top">顶视</button>
+      <button data-cmd="nodelist" title="神经元列表：一屏看全每个神经元的状态（编号 / 名称 / 分组 / 接口 / 激活 / 是否被隐藏），可以手动隐藏或显示，也能按分组挑人（Ctrl+L）">神经元列表</button>
+      <button id="vb-struct" data-cmd="struct" title="翻页：算子级结构视图 ⇄ 3D 建模（F9）">结构视图 ⇄</button>
+    </div>
+    <div id="mini" style="display:none"><span id="mini-label">顶视</span></div>
+    <div class="vtog" id="tab-left" data-cmd="toggle-left" title="隐藏 / 显示左栏（[）">‹</div>
+    <div class="vtog" id="tab-right" data-cmd="toggle-right" title="隐藏 / 显示右栏（]）">›</div>
+    <div id="aiwrap">
+      <div class="htog" id="tab-ai" data-cmd="ai" title="收起 / 展开 AI 助手（F8）">∨</div>
+      <div id="ai">
+      <div id="aihead">
+        <span id="aidot"></span><b>AI 助手</b><span id="aiinfo"></span><span id="ailocchip" class="aib" style="pointer-events:none"></span><span id="aisyschip"></span>
+        <span class="aib" id="aithinkbox" title="AI 的思考强度：跟随接口默认 / 关（不思考）/ 低 / 中 / 高 / 最高。跟「设置」里那一项是同一个值，改哪边都行。">思考<select id="ai-think-top"></select></span>
+        <span class="grow"></span>
+        <span class="aib" id="aistop" data-aicmd="stop" title="让 AI 干完手上这一步就停手。已经在跑的命令不会半路掐掉，后台任务（job_*）也还留着——要停那些用 job_kill">■ 停止</span>
+        <span class="aib" data-aicmd="shot" title="截一张现在画面的图发给 AI（需要配好多模态端点）">看画面</span>
+        <span class="aib" data-aicmd="sessions" title="这个工程里存着的所有对话：可以查看、切换、改名、删除。存工程时会跟工程一起写进文件，拷到别的电脑上打开还能接着聊。">对话</span>
+        <span class="aib" data-aicmd="new" title="另起一段新对话（现在这段不删，留在「对话」列表里）">新对话</span>
+        <span class="aib" data-aicmd="set">设置</span>
+      </div>
+      <div id="aiset">
+        <div class="hint" id="ai-locnote" style="margin:0 0 4px"></div>
+        <div class="row" style="flex-wrap:wrap;gap:4px">
+          <select id="ai-local-preset" style="flex:1 1 150px" title="常见本地推理服务：选中后按「填地址」就填好了，不用自己记端口"></select>
+          <button id="ai-local-use" title="把左边选中的那一条的地址填进下面的「接口地址」">填地址</button>
+          <button id="ai-local-probe" title="扫一圈本机常见端口（11434 Ollama / 1234 LM Studio / 8080 llama.cpp / 8000 vLLM / 9997 Xinference / 5001 KoboldCpp / 5000 text-generation-webui），哪个在开就用哪个">探测本机</button>
+          <button id="ai-local-models" title="把这个地址上的模型列出来（OpenAI 兼容端点的 GET /v1/models）">拉模型列表</button>
+          <button id="ai-local-test" title="真的发一句话过去：量多久回来、模型回没回话、认不认 tools 参数（小模型很多不认，那就把「工具调用」改成「文字命令」）">测试连接</button>
+        </div>
+        <div class="hint" id="ai-localnote" style="margin:2px 0 4px"></div>
+        <label><span>模型列表</span><select id="ai-local-mlist" style="flex:1"><option value="">（按「拉模型列表」，或者直接在下面「模型」那一栏手填）</option></select></label>
+        <label><span>API Key</span><input id="ai-key" type="password" placeholder="sk-...（存在本机，不上传别处；打完自动保存）"></label>
+        <div class="hint" id="ai-keynote" style="margin:0 0 2px"></div>
+        <label><span>接口地址</span><input id="ai-base" type="text" placeholder="https://api.deepseek.com/v1/chat/completions"></label>
+        <label><span>模型</span><input id="ai-model" type="text" placeholder="deepseek-flash（能看图的就是它）"></label>
+        <label><span>温度</span><input id="ai-temp" type="text" style="flex:none;width:62px" placeholder="0.2"><span style="text-align:left;width:auto;color:#93a5b9">0–2，越大越放飞。本地小模型老重复 / 老跑偏时动它</span></label>
+        <label><span>最大输出</span><input id="ai-maxtok" type="text" style="flex:none;width:72px" placeholder="0"><span style="text-align:left;width:auto;color:#93a5b9">一次最多吐多少 token，0 = 用默认（3000 / 流式 4000）。本地模型显存小就压到 512–2048</span></label>
+        <label><span>思考强度</span><select id="ai-think"></select></label>
+        <label><span>手册与工具</span><select id="ai-slim" style="flex:none;width:150px">
+          <option value="auto">自动（本机端点就瘦身）</option>
+          <option value="on">瘦身（小上下文模型）</option>
+          <option value="off">完整</option>
+        </select><span style="text-align:left;width:auto;color:#93a5b9">完整提示词约 6.4 万字符（约 4 万 token）；瘦身只发 7 个工具 + 手册大纲，其余现查</span></label>
+        <label><span>工具调用</span><select id="ai-toolmode" style="flex:none;width:150px">
+          <option value="auto">自动（不认 tools 就退回文字）</option>
+          <option value="native">只用原生 tools</option>
+          <option value="text">只用文字命令</option>
+        </select><span style="text-align:left;width:auto;color:#93a5b9">本地小模型很多不认 tools 参数；不认就改成「文字命令」，它会写在回复里</span></label>
+        <div class="hint" id="ai-thinknote" style="margin:0 0 2px"></div>
+        <label style="align-items:flex-start"><span>附加要求</span><textarea id="ai-extra" rows="3" placeholder="每次新开对话都会把这段话一起发给 AI，优先级最高。比如：这个工程是给电机控制器用的，神经元命名请用 U/V/W 开头。"></textarea></label>
+        <label><span></span><input id="ai-autorun" type="checkbox" style="flex:none"><span style="text-align:left;width:auto;color:#93a5b9">自动执行（关掉后 AI 只列命令，不动你的图）</span></label>
+        <label><span></span><input id="ai-noask" type="checkbox" style="flex:none"><span style="text-align:left;width:auto;color:#93a5b9">大改动先问我（清空 / 打开 / 大批量删改）</span></label>
+        <div class="hint" style="margin:0 0 2px">「大改动先问我」勾着的时候，这类操作会弹一个框等你点——<b>没人点它会一直等下去</b>，任务就停在那儿。你要是经常让 AI 连着干一串活，把勾去掉更顺手；去掉之后这类操作直接执行，但对话里会留一行「没问，直接做了」的记录，而且大部分能用 Ctrl+Z 撤销。</div>
+        <label><span></span><input id="ai-stream" type="checkbox" style="flex:none"><span style="text-align:left;width:auto;color:#93a5b9">流式输出（边写边显示；端点不认就自动退回一次性返回）</span></label>
+        <label><span>最多来回</span><input id="ai-maxturns" type="text" style="flex:none;width:62px" placeholder="80"><span style="text-align:left;width:auto;color:#93a5b9">轮工具调用（4–400，只是防它绕死；到顶了说句「继续」接着跑）</span></label>
+        <div class="hint" style="margin:2px 0 0"><b>下面这组可以整个留空。</b>留空就直接用上面的接口、模型和 Key——DeepSeek 官方的 <b>deepseek-flash</b> 本身就收图（同一个地址、同一个 Key，「看画面」直接可用；<b>deepseek-v4-pro 不收图</b>）。只有当你的主接口是纯文本、另外还有别的多模态端点时，才需要在这里分开填：填了以后只给「看画面」用，文本对话照旧走上面那套。<b>视觉 Key</b> 留空则复用上面的 Key。模型到底认不认图由接口回话，软件不替你下结论。</div>
+        <label><span>视觉接口</span><input id="ai-vbase" type="text" placeholder="https://api.openai.com/v1/chat/completions"></label>
+        <label><span>视觉模型</span><input id="ai-vmodel" type="text" placeholder="gpt-4o / qwen-vl-max / glm-4v"></label>
+        <label><span>视觉 Key</span><input id="ai-vkey" type="password" placeholder="留空则复用上面的 Key"></label>
+        <div class="hint" style="margin:2px 0 0;border-top:1px solid #22303f;padding-top:6px"><b>外部操作</b>（桌面版专属，默认关）：打开后 AI 才碰得到这台机器——装软件、下模型、跑脚本都靠它。这等于把本机的操作权交给对面的模型，而且<b>每次打开软件都要重新勾一次</b>（故意不记住）。用不上就让它关着。</div>
+        <label><span></span><input id="ai-sysfs" type="checkbox" style="flex:none"><span style="text-align:left;width:auto;color:#93a5b9">允许 AI 操作本机：按路径读写文件、从网上下东西</span></label>
+        <label><span></span><input id="ai-sysrun" type="checkbox" style="flex:none"><span style="text-align:left;width:auto;color:#e0a24a">允许 AI 在本机运行命令（高风险：装软件 / 跑脚本 / 调 git）</span></label>
+        <div class="hint" id="ai-sysnote" style="margin:0"></div>
+        <div class="hint" id="ai-toolsnote" style="margin:2px 0 0;border-top:1px solid #22303f;padding-top:6px"></div>
+        <div class="row" style="justify-content:flex-start"><button id="ai-tools-reload">重新加载自定义工具</button></div>
+        <div class="row">
+          <button id="ai-save">保存</button>
+          <button id="ai-keyclear" title="真的把已经保存的 Key 删掉：本机存储、设置文件、备份三份一起清">清掉 API Key</button>
+          <button id="ai-clear" title="另起一段新对话（现在这段不丢，留在「对话」列表里，随时能切回去）">另起一段</button>
+        </div>
+      </div>
+      <div id="aisess">
+        <div class="aishead"><b>这个工程里的对话</b><span id="aisinfo" class="hint"></span>
+          <span class="grow"></span>
+          <button data-aicmd="new" title="另起一段新对话">新开一段</button></div>
+        <div id="aislist"></div>
+        <div class="aishead2">本机存着的别的工程（兜底留的，删了不影响工程文件里的那份）</div>
+        <div id="aisarch"></div>
+      </div>
+      <div id="ailog"></div>
+      <div id="aibar">
+        <textarea id="aitext" rows="1" placeholder="让 AI 帮你操作：例如「在 (0,0,0) 沿 X 放 20 个神经元，步进 10，再按轴串成一条链」"></textarea>
+        <button id="aisend" class="primary">发送</button>
+      </div>
+    </div>
+    </div>
+  </main>
+  <aside id="right"><div id="inspector"></div></aside>
+  <footer id="statusbar">
+    <div>神经 <b id="st-n">0</b> / 连接 <b id="st-e">0</b> / 选中 <b id="st-s">0</b></div>
+    <div>帧耗时 <b id="st-ms">0.0</b> ms</div>
+    <div>模式 <b id="st-mode">选择</b></div>
+    <div>接口运行时 <b id="st-rt">关</b></div>
+    <div class="grow" id="st-msg">就绪</div>
+  </footer>
+</div>
+<div id="modal"><div id="dialog">
+  <div id="dlghead">
+    <div id="dlgtitle">模型编译</div>
+    <div class="tab on" data-tab="code">生成代码</div>
+    <div class="tab" data-tab="report">校验报告</div>
+    <div class="tab" data-tab="target">目标平台</div>
+    <div class="tab" data-tab="train">训练</div>
+    <div class="tab" data-tab="quant">量化</div>
+    <div id="spacer"></div>
+    <div class="tab" id="dlgclose" style="padding:0 16px">X</div>
+  </div>
+  <div id="dlgbody"></div>
+  <div id="dlgfoot">
+    <button id="dl-save" class="primary">下载模型文件</button>
+    <button id="dl-bin">下载权重与结构 (.bin)</button>
+    <button id="dl-report">导出报告 (.txt)</button>
+    <div class="grow"></div>
+    <span class="hint" id="dl-info"></span>
+  </div>
+</div></div>
+<div id="iopanel"><div id="iodialog">
+  <div id="iohead">
+    <b>接口</b>
+    <div id="iotabs"></div>
+    <span class="hint">外界信号 ↔ 软件</span>
+    <div id="ioclose">X</div>
+  </div>
+  <div id="iobody"></div>
+</div></div>
+<div id="ckpanel"><div id="ckdialog">
+  <div id="ckhead">
+    <b>分块载入</b>
+    <span class="hint" id="ckfile">—</span>
+    <div id="ckclose">X</div>
+  </div>
+  <div id="ckbody"></div>
+  <div id="ckfoot">
+    <button id="ck-all">全选</button>
+    <button id="ck-none">全不选</button>
+    <button id="ck-load" class="primary">载入选中的块</button>
+    <span class="hint" id="ckinfo"></span>
+  </div>
+</div></div>
+<div id="toast"></div>
+<script src="./dist/bundle.js"></script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 开发用的落盘目录（_serve.mjs 的 POST /__dump 输出）
+_dump/
+
+# esbuild 打包产物（由 build.mjs 生成）
+prototype/dist/
+
+# 对拍 / 演示用的生成物
+prototype/cross_doc.json
+prototype/cross_cfg.json
+prototype/cross_from_py.nforge
+prototype/cross_from_py_spatial.nforge
+prototype/torch_demo.nforge
+prototype/_blockdemo_raw.nforge
+prototype/_streamdemo_raw.nforge
+
+# 根目录下的临时脚本 / 中间文件（调试时随手写的，别提交）
+/_*.mjs
+/_*.py
+/_*.json
+/_*.nforge
+/_*.txt
+prototype/cross_from_py_whole.nforge
+
+# 依赖与构建产物。node_modules 必须写通配：desktop（Tauri 壳）和 prototype（打包器）
+# 各有一份，只挡 desktop 那份的话 prototype/node_modules 会被提交进来。
+node_modules/
+desktop/src-tauri/target/
+desktop/dist/
+
+
+# 构建产物：build.mjs 用 template.html + dist/bundle.js 生成下面这两份，内容完全相同。
+# 发布用的成品走 GitHub Releases，不入库（每次构建都会重写，diff 会被污染）。
+prototype/index.html
+prototype/神经元编辑器原型.html
+
+# 自测页：make_*.mjs 把测试代码注入成品页生成，每份约 3 MB，19 份就是 57 MB。
+prototype/_*.html
+
+# MuJoCo 桥跑起来留下的日志（每次运行重写）
+MUJOCO_LOG.TXT
