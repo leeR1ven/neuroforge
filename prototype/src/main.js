@@ -672,6 +672,54 @@ let adjCount = 0;
    所以流式那边只标脏，真要用邻接表的那些入口自己 adjEnsure() 一下再往下走。 */
 let adjStale = false;
 function adjEnsure() { if (adjStale) rebuildAdjacency(); }
+/* ---- 「现在这张邻接表是按哪一份拓扑建出来的」 ------------------------------------
+   撤销里最贵的一步就是重建这张表（1681 万条边实测 ~135 ms），而最常见的撤销
+   （改权重 / 拖坐标 / 改颜色 / 改名 / 改选中）根本不动拓扑 —— 白重建。
+   判据为什么可以只看「分块表」：边号 == 数组下标（邻接表里存的就是边号），而拓扑写入只有
+   三条路 —— 追加一条边（addEdge）、压缩（deleteNeurons / deleteEdges / 剪枝）、快照整段写回
+   （restore）—— 三种都会换掉 eSrc / eDst 的分块表。分块表里的块是只读的、字节不共享
+   （见 2.0 节），所以「两张分块表逐块的**对象身份**都一样」就等于「内容一字不差」。
+
+     topoChgSeq  —— 每拍快照若发现 eSrc / eDst 的内容跟上一拍不一样就 +1
+     adjBasisSeq —— 建表那一刻的 topoChgSeq。建表之后还没快照观察过就记 -1，
+                    第一次快照观察到什么号就把它钉上去（那一刻没人写过数组，看到的就是建表用的那份）
+   于是 adjBasisSeq === topoChgSeq ⟺ 从建表到现在没有任何一次被观察到的拓扑改动。
+   判错就会把一张对不上的邻接表留在图上（度数 / 模拟激活跟着错），所以另外配了 adjAudit()
+   裁判：按当前 eSrc / eDst 从头算一遍逐条比。自测里每步撤销后都调一次。 */
+let topoChgSeq = 0, adjBasisSeq = -1, adjSkips = 0;
+let histObsSrc = null, histObsDst = null;
+/* 两张分块表是不是同一份内容：逐块比**对象身份**。块表只有 ~513 块，比 1681 万个元素便宜 4 个数量级。
+   块是只读的、字节不共享，所以身份相同 = 内容相同（长度也一起编码进去了）。 */
+function sameHistList(a, b) {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let k = 0; k < a.length; k++) if (a[k] !== b[k]) return false;
+  return true;
+}
+/* 裁判：把邻接表按当前 eSrc / eDst 从头算一遍，跟驻留的那张逐条比。
+   返回坏掉的位置数（0 = 一致）。adjStart 只比 0..n（n 之外是上一张图的残留，没人读）。 */
+function adjAudit() {
+  const n = G.n, e = G.e;
+  const start = new Uint32Array(n + 1);
+  for (let i = 0; i < e; i++) { start[eSrc[i] + 1]++; start[eDst[i] + 1]++; }
+  for (let i = 0; i < n; i++) start[i + 1] += start[i];
+  const cur = start.slice();
+  const list = new Uint32Array(e * 2);
+  for (let i = 0; i < e; i++) { list[cur[eSrc[i]]++] = i; list[cur[eDst[i]]++] = i; }
+  let badStart = 0, badList = 0, first = -1;
+  for (let i = 0; i <= n; i++) if (adjStart[i] !== start[i]) { badStart++; if (first < 0) first = i; }
+  for (let k = 0; k < e * 2; k++) if (adjList[k] !== list[k]) { badList++; if (first < 0) first = k; break; }
+  return { badStart: badStart, badList: badList, first: first, n: n, e: e, count: adjCount };
+}
+/* 裁判：选中的连接列表（selEList）跟「逐位扫一遍 selE」是不是一份。
+   统计选中数 / 取选中连接号都改用它了（1681 万条扫一遍 ~13 ms，而这个列表本来就一直在维护），
+   一旦哪条路偷偷写了 selE 却没维护列表，这里会当场看出来。 */
+function selListAudit() {
+  let scan = 0, bad = 0;
+  for (let e = 0; e < G.e; e++) if (selE[e]) scan++;
+  for (let k = 0; k < selEList.length; k++) { const e = selEList[k]; if (!(e >= 0 && e < G.e) || !selE[e]) bad++; }
+  return { list: selEList.length, scan: scan, bad: bad };
+}
 /* 「这一趟见过没有」的标记表。
    refreshEdgeHighlight / updateEdgesOf / applyEdgeSelection 原来都用 Set<边号> 去重，
    可是 V8 的 Set 有 2^24（16,777,216）条目的硬上限，而连接数的绝对上限是 2^26。
@@ -715,6 +763,9 @@ function rebuildAdjacency() {
   }
   rebuildBlockAdjacency();
   topoTouch();
+  /* 这张表是按「现在」这份拓扑建的：号先打成「未知」(-1)，等下一次快照观察到什么就钉什么
+     （见 adjBasisSeq。建表之后可能还有写入，所以这一刻不能凭空认一个号）。 */
+  adjBasisSeq = -1;
   adjStale = false;
 }
 
@@ -1363,6 +1414,10 @@ histReg(eId, 1, () => G.e, () => eId, 'edge', 'eId');
 histReg(eHid, 1, () => G.e, () => eHid, 'edge', 'eHid');
 histReg(selN, 1, () => G.n, () => selN);
 histReg(selE, 1, () => G.e, () => selE, 'sel', 'selE');
+/* 注册顺序就是列号。拓扑那两列（eSrc / eDst）在撤销里要按号直接问，不每次都按 tag 找。
+   找不到（-1）就永远不走近路 —— 判据里那个 adjBasisSeq >= 0 会挡住。 */
+const HIST_CI_SRC = HIST.cols.findIndex((c) => c.tag === 'eSrc');
+const HIST_CI_DST = HIST.cols.findIndex((c) => c.tag === 'eDst');
 /* 历史占了多少：分块按对象身份去重，所以这个数字就是真实驻留内存 */
 function histStats() {
   const seen = new Set();
@@ -1721,6 +1776,17 @@ function captureState() {
   /* 每一格记下当时的**分块宽度**：分块宽度会随容量增长重算（见 histRebind），
      快照自己不带宽度的话，撤销时按「现在的宽度」去索引老块就会错位。 */
   for (let ci = 0; ci < HIST.cols.length; ci++) { sizes[ci] = HIST.cols[ci].size; cols[ci] = histCaptureCol(HIST.cols[ci]); }
+  /* 拓扑的观察（见 topoChgSeq）：这一拍 eSrc / eDst 的内容跟上一拍是不是一份。
+     必须在「这一拍已经拍完」之后做 —— 拍完的 cols 才是数组的真实内容；
+     也必须比对象身份浅一层（逐块的同一性，~513 块），不然「登记脏了但其实没变」
+     （比如只改了 eHid）会把建表基号白白顶掉，近路就再也走不上了。 */
+  if (adjBasisSeq >= 0 || HIST_CI_SRC >= 0) {
+    const obsSrc = cols[HIST_CI_SRC], obsDst = cols[HIST_CI_DST];
+    if (!sameHistList(obsSrc, histObsSrc) || !sameHistList(obsDst, histObsDst)) topoChgSeq++;
+    histObsSrc = obsSrc; histObsDst = obsDst;
+    /* 建表之后第一次观察：看到的就是建表用的那份（这中间没人写过数组，写入都得先拍快照）。 */
+    if (adjBasisSeq < 0) adjBasisSeq = topoChgSeq;
+  }
   /* 拍完才清登记（不是拍前）：扫描期间万一还有写入，那一笔必须留给下一拍，不能被吞掉。
      也不能写在 histCaptureCol 里面：一个组有好几列，第一列扫完就清的话，同组后面的列
      会误以为「没动过」而整张沿用。 */
@@ -1762,6 +1828,17 @@ function snapshot() {
 }
 function restore(s) {
   gbTouch();
+  /* 邻接表能不能留着 —— **必须在把 s 写回去之前判**：写回那一步会把每一列的「当前值」
+     换成 s 那一份，判据当场被自己抹平。两条都要成立：
+       ① 从建表到现在没有观察到的拓扑改动（adjBasisSeq === topoChgSeq）
+       ② 这一格要还原的 eSrc / eDst 跟现在这份内容一字不差；另外「上一个快照之后没人写过
+          边数组」也要成立（histEdgeDirty，靠 61 个写入点的登记 + check_histhook 静态闸保证）
+     不成立就照旧整张重建 —— 宁可多花 130 ms，也不能留一张对不上的邻接表。 */
+  const keepAdj = !adjStale && !histEdgeDirty && adjBasisSeq >= 0 && adjBasisSeq === topoChgSeq &&
+                  s.e === G.e &&
+                  HIST_CI_SRC >= 0 && HIST_CI_DST >= 0 &&
+                  sameHistList(s.cols[HIST_CI_SRC], HIST.cols[HIST_CI_SRC].prev) &&
+                  sameHistList(s.cols[HIST_CI_DST], HIST.cols[HIST_CI_DST].prev);
   G.n = s.n; G.e = s.e; G.name = s.name;
   /* 先把每个数组的 live 区间按分块写回去。块里存的是原样的字节，所以是无损还原；
      G.n / G.e 必须先设好——count() 读的就是它们。 */
@@ -1818,7 +1895,13 @@ function restore(s) {
   if (s.opLand) { for (let i = 0; i < opList.length && i < s.opLand.length; i++) opList[i].land = s.opLand[i]; }
   selOps = new Set(s.selOps || []);
   hoverOp = 0;
-  rebuildAdjacency(); rebuildScene(); refreshAll();
+  if (keepAdj) {
+    /* 邻接表原样留着（拓扑一字没动），块拓扑也只跟块有关，重建一下就好（本来就是 O(块数)） */
+    viewStatsTouch(); rebuildBlockAdjacency(); topoTouch(); adjStale = false; adjSkips++;
+  } else {
+    rebuildAdjacency();
+  }
+  rebuildScene(); refreshAll();
 }
 /* 先拍了快照、结果操作又没通过校验时，把这一格撤掉 */
 function unSnapshot() {
@@ -5074,23 +5157,21 @@ function pointerToPlane(ray, plane) {
   const p = new THREE.Vector3();
   return ray.intersectPlane(plane, p) ? p : null;
 }
+/* 选中的连接号一直有人维护着（selEList：改选中 / 压缩 / 撤销三处都会更新），
+   所以统计和取号都直接用那份列表，不再每次都把 G.e 扫一遍 —— 1681 万条扫一遍 ~13 ms，
+   而 refreshAll（每次改动、每帧选中变化）都要调它。列表的正确性由 selListAudit() 兜底。 */
+let selEList = [];
 function selectionCount() {
-  let n = 0, e = 0;
+  let n = 0;
   for (let i = 0; i < G.n; i++) if (selN[i]) n++;
-  for (let i = 0; i < G.e; i++) if (selE[i]) e++;
-  return { n, e };
+  return { n, e: selEList.length };
 }
 function selectedNodes() {
   const out = [];
   for (let i = 0; i < G.n; i++) if (selN[i]) out.push(i);
   return out;
 }
-function selectedEdges() {
-  const out = [];
-  for (let i = 0; i < G.e; i++) if (selE[i]) out.push(i);
-  return out;
-}
-let selEList = [];
+function selectedEdges() { return selEList.slice(); }
 /* 连接选中改成"先清旧的、再设新的"，只重绘真正变化的边 */
 function applyEdgeSelection(edges) {
   const next = edges || [];
@@ -19185,6 +19266,15 @@ window.NF = {
   seed: (v) => (v === undefined ? G.seed : seedRand(v)),
   /* 历史统计：分块与内存的真实数字（测试用来验“结构共享真的省了”） */
   histStats: () => histStats(),
+  /* 裁判：邻接表跟图逐条对得上吗（按当前 eSrc / eDst 从头算一遍比对）。
+     「拓扑没变就整张沿用」这条近路一旦判错，撤销之后度数 / 模拟激活都会跟着错，
+     而且看不出来 —— 所以留一个能当场抓住它的对拍入口。 */
+  adjAudit: () => adjAudit(),
+  /* 裁判：选中连接的那份列表跟逐位扫一遍 selE 是不是一份 */
+  selListAudit: () => selListAudit(),
+  /* 撤销走「跳过重建邻接表」这条近路的次数，以及建表基号的状态（自测靠它断言近路真的在跑） */
+  adjSkipStats: () => ({ skips: adjSkips, basis: adjBasisSeq, chg: topoChgSeq, stale: !!adjStale,
+    dirty: !!histEdgeDirty, sameCol: HIST_CI_SRC >= 0 }),
   /* 撤销登记的裁判开关：打开之后每一拍检查点照旧整列比一遍，并核对「登记说没动、实际动了」。
      自测 / 排障用；平时关着——关着才有那条「不扫没变过的列」的快速路。 */
   histVerify: (v) => { HIST_VERIFY = v !== false; return HIST_VERIFY; },

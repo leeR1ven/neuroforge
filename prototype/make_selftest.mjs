@@ -1653,6 +1653,58 @@ const TEST = `
     const gD = grab();
     log(gD.length === gC.length && gD.every((v, i) => Object.is(v, gC[i])), '重做后逐位还原', gC.length + ' 个数值');
 
+    /* ---- 撤销的近路：拓扑没变就不重建邻接表（1681 万条边实测 ~135 ms） ----
+       判据一旦判错，撤销之后邻接表就跟图对不上（度数 / 模拟激活全跟着错）而且看不出来，
+       所以配了裁判 adjAudit()：按当前 eSrc / eDst 从头算一遍逐条比。 */
+    NF.histVerify(false);
+    const aq0 = NF.adjAudit();
+    log(aq0.badStart === 0 && aq0.badList === 0 && aq0.count === aq0.e * 2,
+        '邻接表跟图逐条对得上（基准）', JSON.stringify(aq0));
+    const ask0 = NF.adjSkipStats().skips;
+    NF.snapshot(); NF.setW(0, 0.85);
+    NF.undo();
+    const ask1 = NF.adjSkipStats().skips;
+    log(ask1 === ask0 + 1, '只改权重的撤销跳过「重建邻接表」这一步', ask0 + ' -> ' + ask1);
+    const aq1 = NF.adjAudit();
+    log(aq1.badStart === 0 && aq1.badList === 0, '走完近路邻接表仍然逐条一致', JSON.stringify(aq1));
+    const askA = NF.adjSkipStats().skips;
+    NF.undo(); NF.undo(); NF.redo(); NF.redo(); NF.undo(); NF.undo();
+    const askB = NF.adjSkipStats().skips;
+    log(askB > askA, '重做 / 撤销来回走也一直走近路（这一趟 ' + (askB - askA) + ' 次）', askA + ' -> ' + askB);
+    /* 真加一条边（拓扑变了）：那次撤销必须整张重建，重建完还得逐条对得上 */
+    const ask2 = NF.adjSkipStats().skips;
+    NF.snapshot();
+    const at1 = NF.addNode(9000, 9000, 0), at2 = NF.addNode(9010, 9000, 0);
+    NF.addEdge(at1, at2, 1.25);
+    const ask3 = NF.adjSkipStats().skips;
+    NF.undo();
+    log(NF.adjSkipStats().skips === ask3, '加过边的撤销不走近路（照旧整张重建）',
+        ask2 + ' -> ' + ask3 + ' -> ' + NF.adjSkipStats().skips);
+    const aq2 = NF.adjAudit();
+    log(aq2.badStart === 0 && aq2.badList === 0, '重建之后邻接表逐条一致', JSON.stringify(aq2));
+    /* 删（压缩拓扑）那条路的撤销：不断言走哪条，只断言走完结果一定对 */
+    NF.snapshot();
+    const at3 = NF.addNode(9200, 9200, 0), at4 = NF.addNode(9210, 9200, 0);
+    NF.addEdge(at3, at4, 0.9);
+    NF.pruneOrphans(false);
+    NF.undo();
+    const aq3 = NF.adjAudit();
+    log(aq3.badStart === 0 && aq3.badList === 0, '删孤立子图（压缩拓扑）撤销之后邻接表逐条一致', JSON.stringify(aq3));
+    /* 选中连接的统计 / 取号走的是维护好的列表：跟逐位扫必须永远是一份 */
+    const selA0 = NF.selListAudit();
+    log(selA0.bad === 0 && selA0.list === selA0.scan, '选中连接列表跟逐位扫一致（空选择）', JSON.stringify(selA0));
+    const epick = [];
+    for (let e = 0; e < NF.graph().e && epick.length < 5; e += 7) epick.push(e);
+    NF.select([], epick);
+    const selA1 = NF.selListAudit();
+    log(selA1.bad === 0 && selA1.list === epick.length && selA1.scan === epick.length,
+        '选了若干连接后：统计数 / 取号 / 逐位扫三者一致', JSON.stringify(selA1));
+    log(NF.stats().selEdges === epick.length, '状态栏那个「已选中连接」读的就是这份列表', String(NF.stats().selEdges));
+    NF.select([], []);
+    const selA2 = NF.selListAudit();
+    log(selA2.list === 0 && selA2.scan === 0 && selA2.bad === 0, '清空选中后列表也清空', JSON.stringify(selA2));
+    NF.histVerify(true);
+
 
     /* ---- 24. 自动保存（本机 IndexedDB） ---- */
     log(NF.autosaveOn() === true, '自动保存默认开着', String(NF.autosaveOn()));
