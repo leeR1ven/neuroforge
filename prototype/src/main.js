@@ -20958,6 +20958,8 @@ window.NF = {
   aiSessionReset: (why) => { aiResetSessions(why || '脚本'); return AI.sid; },
   /* 存进工程文件里的那一份长什么样（自测 / 探针用，不落盘） */
   aiSessionDoc: () => aiSessDoc(),
+  /* 给一段日志，返回清过的那份（自测验「同一条提示不叠」用；不落盘、不动当前状态） */
+  aiLogCleanTest: (log) => aiLogClean(Array.isArray(log) ? log : []),
   /* 本机那份对话存档：列 / 拿回来 / 删 */
   aiArchive: () => aiArchList(),
   aiArchiveLoad: (pid) => aiArchLoad(pid),
@@ -23582,11 +23584,30 @@ function aiSessMs(v) { return (typeof v === 'number' && isFinite(v) && v > 0) ? 
 /* 老版本有个 bug：时间戳用 | 0 处理 Date.now()（一万七千亿），32 位溢出后
    在日志里印成 1969 年。那行是自动生成的提示行（不是人和 AI 说的话），
    已经落在老工程文件 / 老存档里了，载入时按年份清掉，免得一直跟着走。 */
+/* 一条提示在日志里只该出现一次。
+   认法：优先看 e.k（新记号）；老存档里那两条没有 k，按文本前缀认。
+   为什么非去重不可：这些行会跟着工程存进文件，载入时原样回来，再被追加一条，
+   于是「打开一次 = 多一条」，几十次之后日志里全是同一句话。 */
+function aiNoteKey(e) {
+  if (!e || typeof e !== 'object' || e.role !== 'note') return '';
+  if (e.k) return String(e.k);
+  const t = String(e.text == null ? '' : e.text);
+  if (t.indexOf('这段对话是跟着这份工程一起存下来的') === 0) return 'sess-file';
+  if (t.indexOf('已经切到这段对话') === 0) return 'sess-switch';
+  return '';
+}
 function aiLogClean(log) {
   const out = [];
+  const seen = new Map();   /* 记号 -> 这条在 out 里的下标 */
   for (let i = 0; i < (log || []).length; i++) {
     const e = log[i];
     if (e && typeof e === 'object' && e.role === 'note' && /\uff081[89]\d\d\//.test(String(e.text == null ? '' : e.text))) continue;
+    const nk = aiNoteKey(e);
+    if (nk) {
+      const o = seen.get(nk);
+      if (o !== undefined) { out[o] = e; continue; }   /* 留在原地，只换成最新那条 */
+      seen.set(nk, out.length);
+    }
     out.push(e);
   }
   return out;
@@ -23621,7 +23642,8 @@ function aiSessUse(id, why, fromFile) {
   AI.runs = 0; AI.lastErr = ''; AI.stop = false;
   AI.live = ''; AI.liveThink = '';
   AI.sessFile = fromFile ? 1 : 0;
-  aiPush({ role: 'note', text: (fromFile ? '这段对话是跟着这份工程一起存下来的' : '已经切到这段对话') +
+  aiPush({ role: 'note', k: fromFile ? 'sess-file' : 'sess-switch',
+    text: (fromFile ? '这段对话是跟着这份工程一起存下来的' : '已经切到这段对话') +
     (why ? '（' + why + '）' : '') + '：' + aiSessLabel(s) + '，共 ' +
     fmt(Math.max(0, AI.msgs.length - 1)) + ' 条上下文。' +
     (s.mv && s.mv !== AI_MANUAL_VERSION
@@ -23893,6 +23915,17 @@ async function aiArchCmd(cmd, pid) {
 }
 /* ---- 16.6 对话与界面 ---- */
 function aiPush(e) {
+  /* 同一条提示只留一份。
+     这些 role:'note' 的行是软件自己打印的、可重复的提示，不是人和 AI 说过的话，
+     偏偏它们还会跟着工程存回文件里：以前每打开一次工程就追一条「这段对话是跟着
+     这份工程一起存下来的」，存回去、下次打开再追一条 —— 开十次文件就叠十条，
+     把真正的内容挤出窗口。认法见 aiNoteKey（新记号走 e.k，老存档按文本前缀认）。 */
+  const nk = aiNoteKey(e);
+  if (nk) {
+    for (let i = AI.log.length - 1; i >= 0; i--) {
+      if (aiNoteKey(AI.log[i]) === nk) { AI.log[i] = e; aiSessPersist(); return; }
+    }
+  }
   AI.log.push(e);
   if (AI.log.length > AI_LOG_MAX) AI.log.splice(0, AI.log.length - AI_LOG_MAX);
   aiSessPersist();   /* 静默 5 秒之后把这段对话写进本机那份（防抖，别每行都写盘） */
@@ -24069,9 +24102,23 @@ function aiLiveFlush() {
   if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
   else setTimeout(run, 40);
 }
+/* 有人正在日志里拖选、或者已经选中了一段文字时先别重画：innerHTML 一换，
+   选中的东西当场就没了 —— 复制到一半被打断，怎么看都像「这段文字选不中」。
+   推迟到选择清掉之后补一次（见 aiBind 里的 selectionchange）。 */
+let aiRenderPend = 0;
+function aiSelInLog(box) {
+  const sel = typeof window.getSelection === 'function' ? window.getSelection() : null;
+  if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+  const n = sel.anchorNode;
+  return !!(n && box.contains(n));
+}
 function aiRender() {
   const box = document.getElementById('ailog');
   if (!box) return;
+  if (aiSelInLog(box)) { aiRenderPend = 1; return; }
+  aiRenderPend = 0;
+  /* 贴底才跟着滚（跟 aiLiveFlush 一个规矩）：翻上去看历史 / 复制时别把人拽回底部 */
+  const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
   const rows = AI.log.map((e) => {
     if (e.role === 'user') return '<div class="airow u"><b>你</b>' + aiEsc(e.text) + '</div>';
     if (e.role === 'assistant') {
@@ -24085,7 +24132,7 @@ function aiRender() {
   if (AI.busy) rows.push(AI.live ? aiLiveHTML()
     : '<div class="airow n">… ' + (AI.stop ? '正在停手（跑完手上这一步就停）' : '正在跑（第 ' + (AI.turns || 1) + ' 步）') + '</div>');
   box.innerHTML = rows.join('');
-  box.scrollTop = box.scrollHeight;
+  if (stick) box.scrollTop = box.scrollHeight;
 }
 function aiSetUI(o) {
   o = o || {};
@@ -24119,6 +24166,13 @@ function aiBind() {
   } catch (e) {}
   const ai = document.getElementById('ai');
   if (!ai) return;
+  /* 选中被清掉（点了别处）之后，把刚才为了保住选择而推迟的那次重画补上（见 aiRender） */
+  document.addEventListener('selectionchange', () => {
+    if (!aiRenderPend) return;
+    const box = document.getElementById('ailog');
+    if (box && aiSelInLog(box)) return;
+    aiRender();
+  });
   ai.addEventListener('click', (ev) => {
     /* 「对话」列表里的行和按钮先处理：它们挂在面板里，不是标题栏的按钮 */
     const sc = ev.target.closest('[data-sesscmd]');

@@ -230,6 +230,76 @@ const TEST = `
         lg ? JSON.stringify(lg.map(e => String(e.role))) : '(没读到日志)');
     log(!!lg && has('2026/9/20 16:33:43'), '同一段里正常的日志行不受影响');
     log(!!lg && has('得原样留着'), '只有自动生成的提示行会被清，人和 AI 说的话一个字都不动');
+    /* ---------- 13) 同一条提示不叠：以前每打开一次工程追一条，日志被一句话刷屏 ---------- */
+    const dupNote = (n) => ({ role: 'note', k: 'sess-file',
+      text: '这段对话是跟着这份工程一起存下来的（打开工程）：A，共 ' + n + ' 条上下文。接着往下说就行。' });
+    const cleaned = NF.aiLogCleanTest([dupNote(3), { role: 'user', text: '这是人说的话' },
+      dupNote(4), dupNote(5)]);
+    const dupLeft = cleaned.filter(e => e && e.k === 'sess-file').length;
+    log(dupLeft === 1 && cleaned.length === 2,
+        '同一类提示只留一条（其余就地换掉，不是往后追）', dupLeft + ' 条提示 / 共 ' + cleaned.length + ' 条');
+    log(cleaned.length && String(cleaned[0].text).indexOf('共 5 条上下文') >= 0, '留下的是最新那一条',
+        String(cleaned.length && cleaned[0].text).slice(0, 34) + '…');
+    log(cleaned[1] && cleaned[1].role === 'user', '人和 AI 说过的话不受影响', cleaned[1] && cleaned[1].role);
+    /* 老存档里那两条没有 k（按文本前缀认），普通提示重复出现照留 */
+    const legacy = NF.aiLogCleanTest([
+      { role: 'note', text: '这段对话是跟着这份工程一起存下来的（打开工程）：A，共 3 条上下文。' },
+      { role: 'note', text: '这段对话是跟着这份工程一起存下来的（打开工程）：A，共 4 条上下文。' },
+      { role: 'note', text: '已经切到这段对话：B，共 2 条上下文。' },
+      { role: 'note', text: '已经切到这段对话：B，共 2 条上下文。' },
+      { role: 'note', text: '普通提示，重复出现也要留着' },
+      { role: 'note', text: '普通提示，重复出现也要留着' }]);
+    log(legacy.length === 4, '老存档里的重复提示也认（没有 k 就按文本前缀），普通提示原样不动',
+        legacy.length + ' 条');
+    /* 真·现场：走一遍「打开工程」，文件里那份日志带着一堆重复提示 */
+    const baseDoc = NF.serializeV2();
+    const spamDoc = (times) => {
+      const d = JSON.parse(JSON.stringify(baseDoc));
+      d.ai.sid = d.ai.sessions[0].id;
+      d.ai.sessions[0].log = [];
+      for (let k = 0; k < times; k++) d.ai.sessions[0].log.push({ role: 'note',
+        text: '这段对话是跟着这份工程一起存下来的（打开工程）：A，共 3 条上下文。接着往下说就行。' });
+      return d;
+    };
+    const spamCount = () => NF.aiLog().filter(e =>
+      String((e && e.text) || '').indexOf('这段对话是跟着这份工程一起存下来的') === 0).length;
+    NF.aiSessionReset('自测：提示不叠');
+    NF.loadV2(spamDoc(6));
+    log(spamCount() === 1, '载入一份被重复提示刷屏的老工程，只留一条', spamCount() + ' 条');
+    const lLen0 = NF.aiLog().length;
+    NF.loadV2(spamDoc(6));
+    NF.loadV2(spamDoc(6));
+    log(spamCount() === 1 && NF.aiLog().length === lLen0,
+        '再打开几次也不会又追一条（这才是「每次打开都刷一句」的根源）',
+        spamCount() + ' 条 · 日志 ' + lLen0 + ' -> ' + NF.aiLog().length);
+    NF.loadV2(spamDoc(1));
+    log(spamCount() === 1 && NF.aiLog().length === lLen0,
+        '文件里本来就只有一条时，也不会变成两条',
+        spamCount() + ' 条 · 日志 ' + NF.aiLog().length);
+    /* ---------- 14) AI 对话框里的字能选中、能复制 ---------- */
+    const logEl = document.getElementById('ailog');
+    const rowEl = document.querySelector('#ailog .airow');
+    const taEl = document.getElementById('aitext');
+    log(!!logEl && getComputedStyle(logEl).userSelect === 'text',
+        'AI 对话框里的字可以选中（全站默认是 none，够不到这里就永远复制不了）',
+        logEl ? getComputedStyle(logEl).userSelect : '(没有 #ailog)');
+    log(!!rowEl && getComputedStyle(rowEl).userSelect === 'text', '每一行内容也能选中',
+        rowEl ? getComputedStyle(rowEl).userSelect : '(面板里还没有行)');
+    log(!!taEl && getComputedStyle(taEl).userSelect === 'text', '打字框里也能选中',
+        taEl ? getComputedStyle(taEl).userSelect : '(没有 #aitext)');
+    log(getComputedStyle(document.body).userSelect === 'none',
+        '别处还是不可选中（拖视角不该拖出一片蓝）', getComputedStyle(document.body).userSelect);
+    /* 选中一段文字后来一次重画：选中的东西不能被抹掉（以前 innerHTML 一换就没了） */
+    const sel = window.getSelection();
+    const rng = document.createRange();
+    rng.selectNodeContents(rowEl);
+    sel.removeAllRanges(); sel.addRange(rng);
+    const picked = String(sel.toString());
+    NF.aiSessionLoad(S().当前);        /* 内部会调 aiRender，正是会抹掉选择的那一下 */
+    log(picked.length > 0 && String(sel.toString()) === picked,
+        '选中文字时来一次重画，选中的东西还在（推迟到选择清掉之后再画）',
+        picked.length + ' 字 -> ' + String(sel.toString()).length + ' 字');
+    sel.removeAllRanges();
     const fails = out.filter(l => l.startsWith('FAIL')).length;
     done('NFSESS ' + (out.length - fails) + 'P/' + fails + 'F' + (fails ? ' BAD' : ''));
   } catch (e) {

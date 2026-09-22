@@ -662,6 +662,9 @@ input[type=color]{padding:1px;height:24px;cursor:pointer}
 #aisess .aisbtns span:hover{color:var(--tc-ffffff);background:var(--tc-22304a)}
 #ailog{overflow:auto;padding:10px 13px;display:flex;flex-direction:column;gap:7px;font-size:13px;
   line-height:1.62;min-height:120px;background:var(--tc-0a0f16);color:var(--tc-e9f2fc)}
+/* 全站默认 user-select:none（这是 3D 编辑器，拖视角时不该拖出一片蓝），
+   但 AI 对话框里的字是要能选中、复制的，打字框同理 —— 这一块单独放开。 */
+#ailog,#ailog *,#aitext{user-select:text;-webkit-user-select:text}
 /* 收起来 = 整块让位，跟两侧栏一个规矩（边上那条小横条留在视口里） */
 #ai.folded{display:none}
 .airow{line-height:1.62;white-space:pre-wrap;word-break:break-word}
