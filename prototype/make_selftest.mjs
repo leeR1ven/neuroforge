@@ -1188,6 +1188,41 @@ const TEST = `
     NF.redo();
     log(hb2 === hb1 + 1 && NF.graph().n === hb2, '改动之后重做失效（redo 尾巴被丢掉）',
         hb1 + ' → ' + hb2 + ' → ' + NF.graph().n);
+    /* ---- 重做之后立刻撤销：必须真的退一步 ----
+       以前这里是**空操作**（还把光标退了一格）：重做把当前状态正好放在 stack[head] 上，
+       撤销却先 captureState 再覆盖 stack[head]、再 restore 同一个 stack[head] —— 原地踏步。
+       用户看到「已撤销」但画面没变，再按一次撤销就一口气退两步。 */
+    NF.clear();
+    const rIds = [];
+    NF.snapshot(); rIds.push(NF.addNode(0, 0, 0));
+    NF.snapshot(); rIds.push(NF.addNode(10, 0, 0));
+    NF.snapshot(); NF.addEdge(rIds[0], rIds[1], 0.5);
+    const rN2 = NF.graph().n;
+    NF.snapshot(); NF.addNode(20, 0, 0);
+    const rN3 = NF.graph().n;
+    NF.undo(); const rU1 = NF.graph().n;
+    NF.redo(); const rR1 = NF.graph().n;
+    NF.undo(); const rU2 = NF.graph().n;
+    log(rU1 === rN2 && rR1 === rN3, '撤销 / 重做各退进一步（基准）', [rN3, rU1, rR1].join(' → '));
+    log(rU2 === rN2, '重做之后再撤销必须真的退回去（以前这里是空操作）', rU2 + '（期望 ' + rN2 + '）');
+    NF.redo();
+    log(NF.graph().n === rN3, '上面那次撤销没把重做的尾巴弄丢（还能重做回去）', String(NF.graph().n));
+    NF.undo(); const rD1 = NF.graph().n;
+    NF.undo(); const rD2 = NF.graph().n;
+    log(rD1 === rN2 && rD2 === rN2 - 1, '连按撤销是一格一格地退（不是一次退两步）', [rN3, rD1, rD2].join(' → '));
+    /* 权重那条路也一样：改 - 撤 - 重 - 撤 必须回到原值 */
+    NF.clear();
+    const rwIds = [];
+    NF.snapshot(); rwIds.push(NF.addNode(0, 0, 0));
+    NF.snapshot(); rwIds.push(NF.addNode(10, 0, 0));
+    NF.snapshot(); NF.addEdge(rwIds[0], rwIds[1], 0.5);
+    const wp0 = NF.edge(0).w;
+    NF.snapshot(); NF.setW(0, 0.75);
+    NF.undo(); const wpA = NF.edge(0).w;
+    NF.redo(); const wpB = NF.edge(0).w;
+    NF.undo(); const wpC = NF.edge(0).w;
+    log(wpA === wp0 && wpB === 0.75 && wpC === wp0, '改权重 - 撤销 - 重做 - 撤销，最后必须回到原值',
+        [wp0, wpA, wpB, wpC].join(' → '));
 
     /* ---- 18. 两侧界面：分区折叠 / 放置面板跟随工具 / 模拟激活设置搬到右栏 ---- */
     NF.simClear();
@@ -2351,8 +2386,11 @@ const TEST = `
     NF.snapshot(); NF.setW(0, 2);
     NF.snapshot(); NF.setW(0, 3);
     const m28b = NF.histStats();
-    log(m28b.nameBytes === m28a.nameBytes && m28b.nameSegsUnique === m28a.nameSegsUnique,
-        '名字表：没改名字的那几步一个段都没重拷（结构共享）',
+    /* 只保证「不涨」而不是「不变」：这几步改权重之前，上一段撤销 / 重做在栈顶留了一格
+       重做的尾巴（那份改过名字的状态），新的改动一进来它就该被丢掉（改动之后重做失效），
+       所以名字表的驻留段数是**可能往下走**的，往下走是对的，往上走才是漏拷。 */
+    log(m28b.nameBytes <= m28a.nameBytes && m28b.nameSegsUnique <= m28a.nameSegsUnique,
+        '名字表：没改名字的那几步一个段都没多拷（结构共享，只可能往下掉）',
         m28a.nameBytes + ' B -> ' + m28b.nameBytes + ' B / ' + m28a.nameSegsUnique + ' -> ' + m28b.nameSegsUnique + ' 段');
     log(m28b.bytes >= m28b.nameBytes && m28b.nameBytes > 0 && m28b.naive >= m28b.nameBytes,
         '历史占用与「不共享」的对比数字里都算上了名字表',

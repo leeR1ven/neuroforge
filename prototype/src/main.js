@@ -1824,6 +1824,9 @@ function snapshot() {
   history.stack.push(s);
   if (history.stack.length > history.limit) history.stack.shift();
   history.head = history.stack.length - 1;
+  /* 拍完这一格，当前状态 == stack[head]；但紧接着就会有一次改动把它顶掉，
+     所以这里必须记「不在站定态」——撤销要按"有未提交的改动"那条路走。 */
+  histOnCp = false;
   updateUndoButtons();
 }
 function restore(s) {
@@ -1909,22 +1912,46 @@ function unSnapshot() {
   /* 撤掉的那一格才是"当前值"的准确记录（快照之后数组没再动过），所以认它 */
   histAdopt(history.stack.pop());
   history.head = history.stack.length - 1;
+  histOnCp = true;   /* 回滚到被撤掉的那一格上：当前状态就是 stack[head]，我们又站定了 */
   updateUndoButtons();
 }
 /* 撤销。栈里存的是"每次改动之前"的状态，所以 stack[head] 就是上一次改动的落点。
    但那样"改动之后"的状态就没地方放了，重做会退错一格（一次退两步），
-   所以先把当前状态写回 stack[head]，再退一格——重做才能原路回到改动之后。 */
+   所以先把当前状态写回 stack[head]，再退一格——重做才能原路回到改动之后。
+
+   histOnCp = 「当前状态就是 stack[head] 那一格」（刚重做过来 / 刚在同一格上站定）。
+   为什么非要有这个标记：重做之后 head 正好落在"当前状态那一格"上，
+   而撤销的老写法是「captureState → 覆盖 stack[head] → restore(stack[head])」——
+   等于把当前状态原地写回去再读出来：**空操作**。用户看到「已撤销」但画面一点没变，
+   再按一次撤销还会一口气退两步（这两点都是实测出来的，见自测里那两条）。
+   站定态下撤销 = 直接退到 stack[head-1]，栈不动（重做的尾巴照样留着）。 */
+let histOnCp = false;
 function undo() {
   if (history.head <= 0) return;
-  const cur = captureState();
-  restore(history.stack[history.head]);
-  history.stack[history.head] = cur;
-  history.head--;
+  if (histOnCp) {
+    history.head--; restore(history.stack[history.head]);
+    /* 退到的这一格就是当前状态：还是站定态，连按撤销才会一格一格地退 */
+  } else {
+    const cur = captureState();
+    restore(history.stack[history.head]);
+    history.stack[history.head] = cur;
+    history.head--;
+    histOnCp = false;
+  }
   updateUndoButtons(); toast('已撤销', 'warn');
 }
 function redo() {
   if (history.head >= history.stack.length - 1) return;
-  history.head++; restore(history.stack[history.head]);
+  /* 重做也要把「当前」写回它正要离开的那一格 —— 跟撤销完全对称。
+     不写回来会丢一格状态：重做之后紧接着按撤销，那次撤销要回去的正是
+     「重做之前的那个状态」，而它只存在于内存里、栈里没有备份，
+     于是撤销只能退回更早的一格（用户看到的是「重做完按撤销，一次退了两步」）。
+     顺带把重做的落点记成站定态（histOnCp）：接着按撤销才不会原地打转。 */
+  const cur = captureState();
+  restore(history.stack[history.head + 1]);
+  history.stack[history.head] = cur;
+  history.head++;
+  histOnCp = true;
   updateUndoButtons(); toast('已重做', 'warn');
 }
 function resetHistory() {
