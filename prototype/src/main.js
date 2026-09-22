@@ -2954,6 +2954,35 @@ function writeSel(i) {
   selMesh.setMatrixAt(i, _m);
 }
 let selList = [];
+/* 上一次画高亮时「选中」的是哪些号（升序）。选择一变，就拿它跟这一次比。 */
+let selShown = [];
+/* 并集超过这个数就不逐条刷、改成整图重刷：逐条刷要给每个号挂一个上传区间，
+   几千个区间比写数据本身还贵（框选那套 MARQUEE_BATCH_MIN 是同一个理由）。 */
+const SEL_REPAINT_FULL = 2000;
+/* 选中的神经元自己的实例颜色（neuronColorOf 里「选中 = 白」）只有几条路会写：
+   整图重刷 recolorAllNeurons、悬停 setHover、脉冲、以及撤销快路写完一个实例。
+   小图上「聚焦淡化」会顺手把全图重刷一遍（syncFocusDim），把这件事盖住了；
+   大图上淡化是关掉的（computeDimState 直接 return false），于是取消选中之后
+   那几个还白着，非要等鼠标再扫过它们才恢复 —— 用户看到的就是这个。
+   所以选择一变，就把「上一次选中的 ∪ 这一次选中的」逐个重刷一遍。 */
+function selRepaintColors(a, b) {
+  if (SIM.active) return;                   /* 模拟跑着的时候颜色归它管，别抢 */
+  if (!a.length && !b.length) return;
+  if (!neuronMesh.instanceColor) return;    /* 神经元层还没建好（载入早期） */
+  if (a.length + b.length >= SEL_REPAINT_FULL) { recolorAllNeurons(); requestRender(); return; }
+  for (let i = 0, j = 0; i < a.length || j < b.length; ) {
+    let v;
+    if (i >= a.length) v = b[j++];
+    else if (j >= b.length) v = a[i++];
+    else if (a[i] === b[j]) { v = a[i]; i++; j++; }
+    else if (a[i] < b[j]) v = a[i++];
+    else v = b[j++];
+    if (v >= G.n) continue;                 /* 上一次的号可能刚被删掉 */
+    setNeuronColor(v, neuronColorOf(v, _c1));
+    dirtyN(v);
+  }
+  requestRender();
+}
 function rebuildSelMesh() {
   selList = [];
   for (let i = 0; i < G.n; i++) if (selN[i] && !nHid[i]) selList.push(i);
@@ -2968,6 +2997,10 @@ function rebuildSelMesh() {
   }
   selMesh.instanceMatrix.clearUpdateRanges();
   selMesh.instanceMatrix.needsUpdate = true;
+  /* 高亮圈之外还有一层：神经元自己的颜色。这一步漏了，就是「取消选中之后还白着，
+     非要等鼠标再扫过它才恢复」。 */
+  selRepaintColors(selShown, selList);
+  selShown = selList;
   CAM.sig++;      /* 选择变了（「选中就换旋转中心」靠这个判断） */
 }
 function invalidateSimPaint() {
@@ -20716,6 +20749,8 @@ window.NF = {
   },
   selectOps: (ids) => { selOps = new Set(ids || []); opTintFill(); refreshAll(); return Array.from(selOps).sort(); },
   setHoverOp: (id) => { setHoverOp((id === null || id === undefined) ? -1 : id); return hoverOp; },
+  /* 神经元悬停：自测要能复现"鼠标扫过再离开"那一下（它会把颜色烘进实例缓冲） */
+  setHoverNode: (i) => { setHover((i === null || i === undefined) ? -1 : (i | 0)); return S.hover; },
   opColorOf: (id) => { const o = opById(id); return o ? '#' + opColorOf(o, _opCol).getHexString() : null; },
   opSetPos: (id, x, y, z) => {
     const o = opById(id);

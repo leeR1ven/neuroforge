@@ -328,6 +328,39 @@ const TEST = `
     await sleep(80);
     log(NF.selectedEdges().length === 0 && NF.highlight().length === 0, '取消选中：高亮和选中一起清干净', 'hl=' + NF.highlight().length);
 
+    /* ============ I. 取消选中之后，神经元自己的颜色必须跟着退回去 ============ */
+    /* 大模型上「聚焦淡化」是关着的（computeDimState 直接 return false），
+       颜色不会被整图重刷；以前取消选中后那个神经元一直白着，非等鼠标再扫过它才恢复。
+       这里把淡化关掉，在小图上复现同一个条件。 */
+    const dimBox = document.getElementById('v-dim');
+    const dimWas = dimBox ? dimBox.checked : null;
+    if (dimBox && dimBox.checked) { dimBox.checked = false; dimBox.dispatchEvent(new Event('change')); }
+    await sleep(80);
+    const selI = gch[2];
+    const baseI = NF.node(selI).color;
+    log(NF.renderColor(selI) === baseI, '没选中时，实例颜色就是底色', NF.renderColor(selI) + ' / ' + baseI);
+    NF.select([selI], []);
+    /* 用户那条路：选中之后鼠标扫过它再离开 —— 这一下会把"选中=白"烘进实例颜色，
+       取消选中之后要是没人管它，就一直是白的。 */
+    NF.setHoverNode(selI); NF.setHoverNode(-1);
+    await sleep(80);
+    const whiteI = NF.renderColor(selI);
+    log(whiteI === '#ffffff', '选中之后神经元自己是白的（鼠标扫过再离开，白被烘进实例缓冲）',
+        baseI + ' -> ' + whiteI);
+    NF.select([], []);
+    await sleep(80);
+    const backI = NF.renderColor(selI);
+    log(backI !== '#ffffff', '取消选中之后不再是白的', whiteI + ' -> ' + backI);
+    log(backI === baseI, '取消选中之后立刻退回底色（不用等鼠标再扫过它）',
+        '底色 ' + baseI + '，现在是 ' + backI);
+    /* Shift 加选 / 减选那一条路也要一样 */
+    NF.select([selI], []);
+    await sleep(80);
+    NF.select([], []);
+    await sleep(80);
+    log(NF.renderColor(selI) === baseI, '再走一遍还是对的（不是只修了第一次）', NF.renderColor(selI));
+    if (dimBox && dimWas !== null) { dimBox.checked = dimWas; dimBox.dispatchEvent(new Event('change')); }
+    await sleep(60);
     mark("\\u00b7 \\u5408\\u8ba1 " + pass + " PASS / " + fail + " FAIL");
     document.title = (fail ? "NFWMIN BAD " + fail + "F" : "NFWMIN OK") + " " + pass + "P/" + fail + "F";
   } catch (e) {
