@@ -153,8 +153,18 @@ def main():
             continue
         got = getattr(net, f"o{i}_p{k}")
         n_par += 1
-        if not isinstance(got, torch.nn.Parameter):
-            bad.append(f"#{i}.{pname} 不是可训练参数")
+        # 角色决定它该是 nn.Parameter 还是 buffer（B04）：weight 才可训练，
+        # running mean / var 是 stat —— 之前这里一律要求 Parameter，
+        # 正是 B04 要修的那种「统计量被当成可训练参数」的行为。
+        role = next((p.get("role", "weight") for p in ops[i]["params"] if p["name"] == pname), "weight")
+        if role == "weight":
+            if not isinstance(got, torch.nn.Parameter):
+                bad.append(f"#{i}.{pname} 是可训练权重，却是 buffer")
+        elif role in ("stat", "const", "int"):
+            if isinstance(got, torch.nn.Parameter):
+                bad.append(f"#{i}.{pname} 的角色是 {role}，不该是可训练参数")
+        else:
+            bad.append(f"#{i}.{pname} 的角色 {role} 认不出来")
         if iname is None:
             continue
         a = got.detach().numpy().reshape(-1)

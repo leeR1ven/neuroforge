@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { I18N } from './i18n.js';
 import { AI_MANUAL, AI_MANUAL_VERSION, AI_MENU_COMMANDS, AI_MANUAL_CMD_IDS } from './ai_manual.js';
+import { isGPT6Model, usesResponses, responsesURL, buildResponsesRequest, decodeResponses, readResponsesStream } from './ai_responses.js';
 
 /* ==========================================================================
    0. 界面语言
@@ -212,6 +213,10 @@ const PLAST_RULE_ID = {};
 for (let i = 0; i < PLAST_RULES.length; i++) PLAST_RULE_ID[PLAST_RULES[i][0]] = i;
 const PLAST_NONE = { name: "固定（不学习）", rule: "none", lr: 0, tau: 20, wmin: -4, wmax: 4, decay: 0 };
 let PLAST = { list: [Object.assign({}, PLAST_NONE)] };
+/* 学习档位表最多几项（含第 0 项「固定（不学习）」）。
+   为什么是 255 而不是随便涨：每个神经元的档位号最后写成一个字节，超了会静默回绕成别的档位；
+   文件格式校验（checkV3Header）也按这个数拒。要扩容得先升文件格式、改字段位宽并做迁移。 */
+const PLAST_MAX = 255;
 let plastVer = 0;                 /* 档位表 / 指派一变就 ++，用来让"可塑边表"失效重算 */
 function plastBump() { plastVer++; }
 function plastNormRule(r) { return (typeof r === "string" && PLAST_RULE_ID[r] !== undefined) ? r : "none"; }
@@ -398,6 +403,14 @@ function groupEnsure(name) {
   G.groups.push(name);
   G.gsets.push({ a: new Uint32Array(0) });
   return G.groups.length;
+}
+/* 只查不建：groupEnsure 顺手就会推一个新分组，所以「按名字查」不能拿它当查询用 ——
+   查询不该改工程，更不该为此往撤销栈里塞一格（审计 B03）。 */
+function groupLookup(name) {
+  const s = String(name == null ? '' : name).trim();
+  if (!s) return 0;
+  for (let i = 0; i < G.groups.length; i++) if (G.groups[i] === s) return i + 1;
+  return 0;
 }
 function groupCount(id) { const w = (id > 0) ? G.gsets[id - 1] : null; return (w && w.a) ? w.a.length : 0; }
 function groupMembers(id) { const w = (id > 0) ? G.gsets[id - 1] : null; return (w && w.a) ? Array.prototype.slice.call(w.a) : []; }
@@ -652,6 +665,12 @@ const IFACE = {
      等于把一个核吃掉一半、界面开始掉帧。设个上限（比如 20）就变成「每 50 ms 算一次，
      中间收到的观测只更新信号位、不重算」，控制流照发，算力省下来给渲染。 */
   minGapMs: 0, lastFeedAt: 0,
+  /* 状态型神经元（记忆 / 漏电积分 / 脉冲）的膜电位在导出模型里是跨 forward 调用保留的。
+     编辑器这边给两种模式，好让界面上的连续运行和导出模型对得上：
+       'reset' 每一帧都从零开始（默认，等于以前的行为，适合看单帧效果）；
+       'keep'  跨帧保留，和导出的 PyTorch 模型连续 forward 是同一个状态机。
+     st 就是那份保留的膜电位；stKey 记它是按哪张图算出来的，图一变就不复用。 */
+  stMode: 'reset', st: null, stKey: '',
   tab: 'mark',
 };
 const IFACE_LOG_MAX = 60;
@@ -659,6 +678,19 @@ const IFACE_IN_KINDS = [['none', '不接线'], ['key', '键盘按键'], ['const'
 const IFACE_OUT_KINDS = [['log', '提示 + 日志'], ['key', '软件内按键'], ['syskey', '系统按键'],
                          ['http', 'HTTP POST'], ['script', '运行脚本']];
 const IFACE_QUICK_KEYS = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6', 'Digit7', 'Digit8', 'Digit9'];
+/* 这张图里有没有状态型神经元（记忆 / 漏电积分 / 脉冲）。判据和编译侧的 modelHasState 一致。 */
+function graphHasState() { for (let i = 0; i < G.n; i++) if (nAct[i] >= ACT_STATE_FROM) return true; return false; }
+/* 当前图的身份：拓扑或工程一换就不复用保留下来的膜电位 */
+function ifaceStateKey() { return G.name + '/' + G.n + '/' + G.e; }
+/* 清空内部状态。名字和生成模型上的 net.reset_state() 对齐，方便两边对着调。 */
+function ifaceResetState(quiet) {
+  const had = !!IFACE.st;
+  IFACE.st = null; IFACE.stKey = '';
+  const el = document.getElementById('rt-st');
+  if (el) el.textContent = '—';
+  if (!quiet) toast(had ? '已清空内部状态（膜电位归零）' : '当前没有保留的内部状态');
+  return { cleared: had, mode: IFACE.stMode };
+}
 
 /* 邻接表（CSR）：每个节点存其关联的边索引，拖动时只更新受影响的边 */
 let adjStart = new Uint32Array(MAX_N + 1);
@@ -917,6 +949,21 @@ function blockIndexById(id) {
 }
 function blockById(id) { const i = blockIndexById(id); return i < 0 ? null : blocks[i]; }
 
+/* 建块前的语义校验。抽出来是为了让「载入前预检」能用**新编号**先跑同一套规矩：
+   makeBlock 里的越界判据是 G.n（当前图），预检时图还没换，拿它判会误杀。 */
+function blockCheck(src, dst, w, nTotal) {
+  const k = src.length, n = dst.length;
+  if (k * n !== w.length) throw new Error('块尺寸与权重个数对不上：' + k + '×' + n + ' vs ' + w.length);
+  if (k * n > BLOCK_MAX_W) throw new Error('单块权重数 ' + k * n + ' 超过上限 ' + BLOCK_MAX_W + '，请先切块');
+  if (k === 0 || n === 0) throw new Error('块的任一边都不能是 0');
+  for (let i = 0; i < k; i++) if (src[i] >= nTotal) throw new Error('块起点 id ' + src[i] + ' 越界');
+  for (let j = 0; j < n; j++) if (dst[j] >= nTotal) throw new Error('块终点 id ' + dst[j] + ' 越界');
+  const seenD = new Set();
+  for (let j = 0; j < n; j++) {
+    if (seenD.has(dst[j])) throw new Error('块终点 id ' + dst[j] + ' 重复了，同一列出现两次语义不明确');
+    seenD.add(dst[j]);
+  }
+}
 /* 建块。src/dst 是起点 / 终点神经元 id 列表，w 是行主序 k×n。
    dst 必须唯一：同一列出现两次，在 matmul 语义里会被隐式求和，太含糊。 */
 function makeBlock(srcIds, dstIds, w, opt) {
@@ -924,16 +971,7 @@ function makeBlock(srcIds, dstIds, w, opt) {
   const k = srcIds.length, n = dstIds.length;
   const src = srcIds instanceof Uint32Array ? srcIds : Uint32Array.from(srcIds);
   const dst = dstIds instanceof Uint32Array ? dstIds : Uint32Array.from(dstIds);
-  if (k * n !== w.length) throw new Error('块尺寸与权重个数对不上：' + k + '×' + n + ' vs ' + w.length);
-  if (k * n > BLOCK_MAX_W) throw new Error('单块权重数 ' + k * n + ' 超过上限 ' + BLOCK_MAX_W + '，请先切块');
-  if (k === 0 || n === 0) throw new Error('块的任一边都不能是 0');
-  for (let i = 0; i < k; i++) if (src[i] >= G.n) throw new Error('块起点 id ' + src[i] + ' 越界');
-  for (let j = 0; j < n; j++) if (dst[j] >= G.n) throw new Error('块终点 id ' + dst[j] + ' 越界');
-  const seenD = new Set();
-  for (let j = 0; j < n; j++) {
-    if (seenD.has(dst[j])) throw new Error('块终点 id ' + dst[j] + ' 重复了，同一列出现两次语义不明确');
-    seenD.add(dst[j]);
-  }
+  blockCheck(src, dst, w, G.n);
   const b = {
     id: blockSeq++, k: k, n: n, src: src, dst: dst,
     w: w instanceof Float32Array ? w : Float32Array.from(w),
@@ -1471,6 +1509,8 @@ histReg(nColOn, 1, () => G.n, () => nColOn);
 histReg(nThr, 1, () => G.n, () => nThr);
 histReg(nGroup, 1, () => G.n, () => nGroup);
 histReg(nHid, 1, () => G.n, () => nHid);
+histReg(nPlast, 1, () => G.n, () => nPlast);
+histReg(nHard, 1, () => G.n, () => nHard);
 histReg(eSrc, 1, () => G.e, () => eSrc, 'topo', 'eSrc');
 histReg(eDst, 1, () => G.e, () => eDst, 'topo', 'eDst');
 histReg(eW, 1, () => G.e, () => eW, 'w', 'eW');
@@ -1652,8 +1692,35 @@ function opNormRef(r) {
   throw new Error('认不出的算子输入类型：' + (r && r.k));
 }
 
+/* 参数的角色：决定它在生成的 PyTorch 模型里是 nn.Parameter（可训练）还是 buffer（不可训练）。
+   weight —— 可训练权重（卷积核、全连接矩阵、BN 的 scale / bias）。
+   stat   —— 运行统计量（BN 的 running mean / var）。必须是 buffer：F.batch_norm 在带梯度的
+             前向里不允许 running_mean / running_var 带 requires_grad，否则直接报
+             "not differentiable with respect to argument 'running_mean'"。
+   const  —— 字面常量（ONNX Constant 折进来的、固定缩放系数）。当 buffer，优化器不该动它。
+   int    —— 整型 / 布尔的索引与常量，本来就是 buffer。
+   老工程没有 role 字段：一律按 weight 处理，只有 BN / LN 的 mean、var 按名字兜底成 stat ——
+   那就是加角色之前唯一生成不出来的组合，其余行为跟以前一模一样。 */
+const OP_ROLE_FLOAT = { f32: 1, f16: 1, f64: 1 };
+const OP_ROLES = { weight: 1, stat: 1, const: 1, int: 1 };
+/* 角色表的查询必须走 hasOwnProperty：OP_ROLES["__proto__"] 是 Object.prototype（真值），
+   直接当字典查的话 "__proto__" / "constructor" 这种角色名会被当成合法值。 */
+function opRoleKnown(tbl, v) { return Object.prototype.hasOwnProperty.call(tbl, v); }
+function opParamRoleByName(op, name) {
+  const o = String(op || ""), nm = String(name || "");
+  if ((o === "BatchNormalization" || o === "LayerNormalization") && (nm === "mean" || nm === "var")) return "stat";
+  return "";
+}
+function opParamRole(role, dtype, op, name) {
+  const r = String(role || "");
+  if (opRoleKnown(OP_ROLES, r)) return r;
+  const byName = opParamRoleByName(op, name);
+  if (byName) return byName;
+  return opRoleKnown(OP_ROLE_FLOAT, String(dtype)) ? "weight" : "int";
+}
+
 /* 参数张量。形状 + 数值个数必须对上，类型必须是表里的那几种。 */
-function opMakeParam(name, dtype, shape, data) {
+function opMakeParam(name, dtype, shape, data, role, op, same) {
   const d = (typeof dtype === 'number') ? opDtypeOf(dtype) : opDtypeByName(dtype);
   if (!d) throw new Error('认不出的参数类型：' + dtype);
   const sh = (shape || []).slice();
@@ -1668,7 +1735,8 @@ function opMakeParam(name, dtype, shape, data) {
     if (data instanceof arr.constructor) arr.set(data);
     else for (let i = 0; i < want; i++) arr[i] = data[i];
   }
-  return { name: String(name), dtype: d.name, shape: sh, data: arr, uid: opParamSeq++ };
+  return { name: String(name), dtype: d.name, shape: sh, data: arr, uid: opParamSeq++,
+           role: opParamRole(role, d.name, op, name), same: same ? String(same) : "" };
 }
 
 /* 建一个算子节点。检查一律在这里做：宁可现在报错，也不要生成一个编译不过的图。
@@ -1689,7 +1757,7 @@ function makeOp(op, name, opt) {
       if (land[i] >= G.n) throw new Error('算子 ' + name + ' 的落点越界：神经元 ' + land[i] + '（一共才 ' + G.n + ' 个）');
     }
   }
-  const params = (opt.params || []).map((p) => opMakeParam(p.name, p.dtype, p.shape, p.data));
+  const params = (opt.params || []).map((p) => opMakeParam(p.name, p.dtype, p.shape, p.data, p.role, op, p.same));
   /* 读文件时把原来的身份号带回来：算子之间是按身份号互相引用的，
      重新发号会让引用错位（撤销 / 往返都会对不上）。 */
   let id = 0;
@@ -1816,10 +1884,18 @@ function makeOpFromDir(dir, params, remap) {
   }
   const land = mapIds(dir.land);
   if (dir.land && !land) throw new Error('算子 ' + dir.name + ' 的落点神经元这次没载入');
+  /* 角色（weight / stat / const / int）与「跟谁共享」记在文件头目录那一份里，按名字对回参数体。
+     老文件没有这两个键 -> role 为空，opMakeParam 按老规矩兜底（浮点 = weight，BN 的 mean/var = stat）。 */
+  const dpOf = new Map();
+  if (Array.isArray(dir.params)) for (const dp of dir.params) if (dp && dp.name !== undefined) dpOf.set(String(dp.name), dp);
+  const merged = (params || []).map((p) => {
+    const dp = dpOf.get(String(p.name));
+    return dp ? { name: p.name, dtype: p.dtype, shape: p.shape, data: p.data, role: dp.role, same: dp.same } : p;
+  });
   return makeOp(dir.op, dir.name, {
     id: dir.id, ins: ins, outShape: dir.out, land: land,
     attrs: dir.attrs, fold: dir.fold, note: dir.note, color: dir.color, colOn: dir.colOn,
-    pos: dir.pos, params: params,
+    pos: dir.pos, params: merged,
   });
 }
 /* 文件头目录里所有参数张量的元素个数之和（像素级统计用，不碰数值） */
@@ -1840,7 +1916,8 @@ function opInfo(id) {
     ins: o.ins.map((r) => r.k === 'n' ? { k: 'n', count: r.ids.length, shape: opShapeStr(r.shape) }
                                       : { k: 'o', id: r.id, name: opNameOf(r.id), shape: opShapeStr(r.shape) }),
     fold: o.fold.slice(),
-    params: o.params.map((p) => ({ name: p.name, dtype: p.dtype, shape: opShapeStr(p.shape), count: p.data.length })),
+    params: o.params.map((p) => ({ name: p.name, dtype: p.dtype, shape: opShapeStr(p.shape), count: p.data.length,
+                                   role: p.role || "weight", same: p.same || "" })),
     bytes: o.params.reduce((s, p) => s + opParamBytes(p), 0),
     note: o.note, attrs: Object.assign({}, o.attrs),
   };
@@ -1870,6 +1947,7 @@ function captureState() {
   return {
     n: G.n, e: G.e, name: G.name,
     nmc: nameCapture(),
+    plast: PLAST.list.map((p) => Object.assign({}, p)),
     groups: G.groups.slice(),
     /* 分组成员表只存对象引用：归属一改就是换一份新表，老快照抓着的还是老表，
        撤销天生就是对的（跟块、跟名字段同一个路子）。 */
@@ -1904,6 +1982,7 @@ function snapshot() {
      所以这里必须记「不在站定态」——撤销要按"有未提交的改动"那条路走。 */
   histOnCp = false;
   updateUndoButtons();
+  return s;   /* 交给调用方：通用接口的事务外壳要用它认自己那一格（审计 B03） */
 }
 function restore(s) {
   gbTouch();
@@ -1964,6 +2043,8 @@ function restore(s) {
     c.live = liveLen;  /* 还原之后 prev 覆盖的就是 live 区间：下一拍能直接整张沿用 */
   }
   nameRestore(s.nmc);
+  if (s.plast) PLAST = { list: s.plast.map((p) => Object.assign({}, p)) };
+  plastBump();   /* 撤销学习档位或指派后，可塑边缓存也必须重新计算。 */
   /* 分组：成员表跟着快照走（这一行就把归属关系整个换回去了），主分组缓存由上面的分块列还原。
      没有 gsets 的老快照（此版之前拍的）只能按主分组退化——会少掉多归属，但绝不会报错。 */
   G.groups = (s.groups || []).slice();
@@ -3969,15 +4050,17 @@ function starterAskAI(kind) {
   aiSetUI({ folded: false });
   aiAsk(STARTER_ASK[kind === 'imp' ? 'imp' : 'net']);
 }
-/* 「不配 API Key 也能用」：扫一圈本机常见端口，谁在开就把地址和模型填好。
+/* 「不配 API Key 也能用」：扫一圈本机常见端口，填好地址并列出模型供用户选择。
    跟设置面板里那个「探测本机」是同一套判断（aiLocalProbe / aiLocalUse），
    只是把结果写在这张卡片上说给人听——新手十有八九卡在「没有 Key」。 */
 async function starterOllama() {
+  const scope = aiModelsSyncScope(), seq = AI_MODELS.seq;
   const el = document.getElementById('starter-note');
   const say = (h) => { if (el) el.innerHTML = h; };
   say(TL('正在扫本机常见端口……', 'Scanning the usual local ports…'));
   let hits = [];
   try { hits = await aiLocalProbe(); } catch (e) { hits = []; }
+  if (seq !== AI_MODELS.seq || !aiModelsScopeSame(scope, aiModelsScope())) return;
   if (!hits.length) {
     say('<b style="color:#e0a24a">' + TL('本机上没探到推理服务。', 'No local inference server found.') + '</b>' +
       TL('常见端口都试过了。先把服务起起来：', ' Every common port was tried. Start one of these first:') +
@@ -3990,14 +4073,13 @@ async function starterOllama() {
   const h = hits[0];
   aiLocalUse(h.id);                 /* 填地址：它自己会存配置、刷界面 */
   aiLocalFillList(h.models);
-  if (h.models.length && h.models.indexOf(AI.model) < 0) { AI.model = h.models[0]; aiFillCfg(); aiSaveCfg(); aiInfo(); }
   aiLocalFill();
   say('<b style="color:#5ac8a0">' + TL('探到了 ', 'Found ') + aiEsc(h.name) + '（' + h.port + '）</b>' +
-    TL('，地址和模型已经填好，不用 API Key。', ' — the address and model are filled in; no API key needed.') +
+    TL('，地址已经填好，不用 API Key。', ' — the address is filled in; no API key needed.') +
     (h.models.length
       ? '<br>' + TL('它挂着的模型：', 'Models on it: ') + aiEsc(h.models.slice(0, 10).join('、'))
       : '<br>' + TL('（它没报出模型清单，模型名在设置里手填一个）', '(it did not report a model list — type a model name in Settings)')) +
-    '<br>' + TL('现在直接去下面的 AI 对话框打字就能用。', 'Now just type in the AI panel below.'));
+    '<br>' + TL('请在 AI 助手设置的「选择模型」里选一个支持对话的模型，再开始聊天。', 'Choose a chat model under “Choose model” in AI settings before chatting.'));
   toast(TL('已接上本机 ', 'Connected to local ') + h.name, 'ok');
 }
 function starterBind() {
@@ -8324,7 +8406,7 @@ function analyzeGraph() {
   let frozenN = 0, frozenE = 0;
   for (let i = 0; i < G.n; i++) if (nLock[i]) frozenN++;
   for (let e = 0; e < G.e; e++) if (eLock[e]) frozenE++;
-  if (frozenN || frozenE) info.push('已冻结 ' + frozenN + ' 个神经元偏置、' + frozenE + ' 条权重（编译为可训练目标时会写入 requires_grad=False 清单）');
+  if (frozenN || frozenE) info.push('已冻结 ' + frozenN + ' 个神经元偏置、' + frozenE + ' 条权重（训练骨架自动屏蔽梯度并保护优化器更新；外部优化器需调用 net.protect_frozen(opt)）');
   /* 手动隐藏和分组都是「只影响编辑器显示」的东西，不进产物——报告里必须说明白，
      不然人会以为「我藏起来的那一批怎么还编进去了」，或者反过来以为隐藏等于剪枝。 */
   {
@@ -8614,6 +8696,22 @@ function modelHasState(m) {
 const TRAIN_DEFAULTS = {
   optimizer: 'adam', lr: 0.001, weight_decay: 0, loss: 'mse',
   epochs: 100, batch_size: 32, data: 'data.npz', device: 'auto', seed: 0,
+  /* 有状态神经元（记忆 / 漏电积分 / 脉冲）的膜电位是跨 forward 调用保留的。
+     训练时默认按「独立样本」处理：每个批次之前清空，免得同一批次槽位的后一个样本
+     继承前一个样本的残余状态。确需连续轨迹的填 'keep'，此时批次顺序就是时间顺序
+     （生成的 DataLoader 也会自动改成 shuffle=False）。 */
+  state: 'reset',
+  /* ---- 验证集与报表（F07）----
+     val_split 默认 0 = 不划验证集，训练集就是全部数据（跟以前的骨架逐位一样）。
+     划了以后每轮（或每 val_every 轮）在验证集上算一次损失 + 指标：
+     分类看准确率（metrics='auto' 且 loss='ce'），回归看 MAE。 */
+  val_split: 0, val_every: 1, metrics: 'auto',
+  /* 每几轮往终端打一行进度（1 = 每轮都打）。轮数很大时把它调大，日志不会淹掉终端；
+     每轮的完整指标不受影响，照样全进 --history 的 JSON。 */
+  log_every: 1,
+  /* ---- 调度器与梯度裁剪（F08 配套）----
+     scheduler: none / cosine / step；grad_clip > 0 才裁剪。 */
+  scheduler: 'none', scheduler_step: 10, scheduler_gamma: 0.1, grad_clip: 0,
 };
 function pyLit(v) {
   if (typeof v === 'number' && Number.isFinite(v)) return String(v);
@@ -8727,8 +8825,14 @@ function opExpr(i) {
     case 'GlobalMaxPool':
       return fold('F.adaptive_max_pool2d(' + N(0) + ', 1)');
     case 'BatchNormalization':
+      /* training 跟 PyTorch 自己的模块一样跟着 self.training 走：.eval() 用运行统计量
+         （跟 ONNX 推理图对得上），.train() 用批统计量并更新 running mean/var。
+         mean/var 是 stat 角色 -> buffer（requires_grad=False），
+         否则带梯度的前向会直接报 "not differentiable with respect to running_mean"。 */
       return fold('F.batch_norm(' + N(0) + ', ' + P('mean') + ', ' + P('var') + ', ' +
-                  P('scale') + ', ' + P('B') + ', training=False, eps=' + (a.epsilon === undefined ? 1e-5 : a.epsilon) + ')');
+                  P('scale') + ', ' + P('B') + ', training=self.training, momentum=' +
+                  (a.momentum === undefined ? 0.1 : a.momentum) + ', eps=' +
+                  (a.epsilon === undefined ? 1e-5 : a.epsilon) + ')');
     case 'LayerNormalization': {
       const ns = (a.normalized_shape || []).map((d) => String(d | 0)).join(', ');
       const w = P('scale'), b2 = P('B');
@@ -8864,19 +8968,36 @@ function opBuffersCode(m) {
   L.push('        self.op_ptr = torch.tensor(' + intLiteral(m.opPtr, 12, 24) + ', dtype=torch.long)');
   L.push('        self.op_idx = torch.tensor(' + intLiteral(m.opIdx, 12, 24) + ', dtype=torch.long)');
   L.push('        _of, _oi = ' + OF + ', ' + OI + '   # 算子参数在 model.bin 里的起点');
+  /* same = 同一个 ONNX 初始化器被多个算子引用：只建一份，后面的直接指向它（权值共享）。
+     绝不能按数值相等去合并——两份初值一样的独立权重必须能各自更新。 */
+  const sharedParam = new Map();
   for (let i = 0; i < m.ops.length; i++) {
     const o = m.ops[i], e = m.opBin.ops[i];
     for (let k = 0; k < o.params.length; k++) {
       const p = o.params[k], pe = e.params[k];
       const shape = p.shape.length ? p.shape.map((d) => String(d | 0)).join(', ') : '1';
-      if (pe.f) {
-        L.push('        self.' + opParamName(i, k) + ' = nn.Parameter(torch.from_numpy(raw[_of + ' + pe.off +
-               ':_of + ' + (pe.off + p.data.length) + '].copy()).view(' + shape + '))   # ' + o.name + '.' + p.name);
-      } else {
-        L.push('        self.register_buffer("' + opParamName(i, k) + '", torch.from_numpy(idx[_oi + ' + pe.off +
-               ':_oi + ' + (pe.off + p.data.length) + '].astype("' + (OP_TORCH_DTYPE[p.dtype] === 'torch.bool' ? 'bool' : 'int64') +
-               '").copy()).view(' + shape + '))   # ' + o.name + '.' + p.name);
+      const pn = opParamName(i, k), prole = p.role || 'weight', psame = p.same || '';
+      const prev = psame ? sharedParam.get(psame) : null;
+      if (prev && prev.role === prole) {
+        L.push('        self.' + pn + ' = self.' + prev.name + '   # ' + o.name + '.' + p.name +
+               '：与 ' + prev.name + ' 共用同一份参数（权值共享）');
+        continue;
       }
+      if (pe.f && prole === 'weight') {
+        L.push('        self.' + pn + ' = nn.Parameter(torch.from_numpy(raw[_of + ' + pe.off +
+               ':_of + ' + (pe.off + p.data.length) + '].copy()).view(' + shape + '))   # ' + o.name + '.' + p.name);
+      } else if (pe.f) {
+        /* 浮点但不是可训练权重（stat / const）：当 buffer，不进 net.parameters()，优化器碰不到它。 */
+        L.push('        self.register_buffer("' + pn + '", torch.from_numpy(raw[_of + ' + pe.off +
+               ':_of + ' + (pe.off + p.data.length) + '].copy()).view(' + shape + '))   # ' + o.name + '.' + p.name +
+               '（' + prole + '：不参与训练）');
+      } else {
+        /* 整型 / 布尔的索引与常量：数值在 int32 段（idx），本来就是 buffer。 */
+        L.push('        self.register_buffer("' + pn + '", torch.from_numpy(idx[_oi + ' + pe.off +
+               ':_oi + ' + (pe.off + p.data.length) + '].astype("' + (OP_TORCH_DTYPE[p.dtype] === 'torch.bool' ? 'bool' : 'int64') +
+               '").copy()).view(' + shape + '))   # ' + o.name + '.' + p.name + '（' + prole + '：不参与训练）');
+      }
+      if (psame) sharedParam.set(psame, { name: pn, role: prole });
     }
     for (let j = 0; j < o.ins.length; j++) {
       const r = o.ins[j], re = e.ins[j];
@@ -8948,7 +9069,9 @@ function recForwardCode(m) {
   L.push('        prev = torch.zeros_like(self.bias.unsqueeze(0).expand(B, -1))   # 第 0 拍的回边输入是 0');
   if (hasState) {
     L.push('        if self.st is None or self.st.shape[0] != B:');
-    L.push('            self.st = torch.zeros(B, self.num_neurons, dtype=self.bias.dtype)');
+    L.push('            self.st = self.bias.new_zeros(B, self.num_neurons)');
+    L.push('        else:');
+    L.push('            self.st = self.st.to(self.bias)');
   }
   L.push('        outs = []');
   L.push('        for step in range(T):');
@@ -8980,12 +9103,13 @@ function recForwardCode(m) {
   L.push('');
   L.push('                # 前向边：读这一拍已经算好的值');
   L.push('                ea, eb = self.ptr[k], self.ptr[k + 1]');
-  L.push('                if eb > ea:');
   if (hasBlocks) {
-    L.push('                    ba, bb = self.bptr[k], self.bptr[k + 1]');
+    L.push('                ba, bb = self.bptr[k], self.bptr[k + 1]');
+    L.push('                if eb > ea or bb > ba:');
     L.push('                    delta = torch.zeros_like(h)');
-    L.push('                    contrib = h.index_select(1, self.src[ea:eb]) * self.weight[ea:eb]');
-    L.push('                    delta = delta.scatter_add(1, self.dst[ea:eb].unsqueeze(0).expand(B, -1), contrib)');
+    L.push('                    if eb > ea:');
+    L.push('                        contrib = h.index_select(1, self.src[ea:eb]) * self.weight[ea:eb]');
+    L.push('                        delta = delta.scatter_add(1, self.dst[ea:eb].unsqueeze(0).expand(B, -1), contrib)');
     L.push('                    # 权重块：一次矩阵乘顶上成千上万条连接。只算本波次用到的那几列，');
     L.push('                    # 块的行可以来自任意更早的波次（矩阵本身不关心拓扑）。');
     L.push('                    if bb > ba:');
@@ -9001,6 +9125,7 @@ function recForwardCode(m) {
     L.push('                    pre = pre + delta.index_select(1, idx)');
     L.push('');
   } else {
+    L.push('                if eb > ea:');
     L.push('                    contrib = h.index_select(1, self.src[ea:eb]) * self.weight[ea:eb]');
     L.push('                    delta = torch.zeros_like(h).scatter_add(1, self.dst[ea:eb].unsqueeze(0).expand(B, -1), contrib)');
     L.push('                    pre = pre + delta.index_select(1, idx)');
@@ -9159,8 +9284,8 @@ function generatePyTorch(m, opts) {
     if (pl.pairSrc.length) {
       L.push('# 强硬抑制型: 有 ' + fmt(pl.hardSrc.length) + ' 个神经元是「强硬抑制型」（共 ' + fmt(pl.pairSrc.length) + ' 条压制边）——');
       L.push('#          它们一亮，下游在这一拍**直接不许激活**（跟权重无关），下一拍才恢复。这条语义已经');
-      L.push('#          编进 forward 的波次里了（先摁住、再判激活）。判「一亮」用的是「输出的激活值 != 0」：');
-      L.push('#          对 ReLU / linear 跟编辑器的阈值判定完全一致，别的激活函数是近似。');
+      L.push('#          编进 forward 的波次里了。外界输入非零就算亮，其余源以「输出激活值 > 0」判亮。');
+      L.push('#          模拟器还会检查神经元阈值，导出模型使用上述激活值判据，阈值门控是近似。');
     } else if (pl.hardSrc.length) {
       L.push('# 强硬抑制型: 有 ' + fmt(pl.hardSrc.length) + ' 个神经元标了强硬抑制，但它们没有出边，不构成压制。');
     }
@@ -9314,7 +9439,7 @@ function generatePyTorch(m, opts) {
       L.push('        self.register_buffer("plast_dt", torch.tensor(' + literal(pl.dt, 12, 12) + ', dtype=torch.float32))');
       L.push('        self.register_buffer("plast_src", torch.tensor(' + intLiteral(pl.ix.map((k) => m.src[k]), 12, 24) + ', dtype=torch.long))');
       L.push('        self.register_buffer("plast_dst", torch.tensor(' + intLiteral(pl.ix.map((k) => m.dst[k]), 12, 24) + ', dtype=torch.long))');
-      L.push('        self.register_buffer("plast_frozen", torch.tensor(' + JSON.stringify(pl.ix.map((k) => !!m.wFrozen[k])) + ', dtype=torch.bool))');
+      L.push('        self.register_buffer("plast_frozen", torch.tensor(' + intLiteral(pl.ix.map((k) => m.wFrozen[k] ? 1 : 0), 12, 24) + ', dtype=torch.bool))');
     } else if (pl.ix.length) {
       /* ★ 大模型这条路不能内联。表按 [count, ...ix, ...prof, ...dt] 存进 model.bin 的整型段；
          plast_src / plast_dst / plast_frozen 由 plast_ix 从已读进来的 src / dst / w_frozen 里现取，
@@ -9347,10 +9472,12 @@ function generatePyTorch(m, opts) {
     }
   }
   if (pHard) {
+    const inputs = new Set(m.inputNodes);
     L.push('        # ---- 强硬抑制：下面这些神经元一亮，它的下游在这一拍直接不许激活（跟权重无关）----');
     L.push('        self.num_hard_pairs = ' + pl.pairSrc.length);
     L.push('        self.register_buffer("hpair_src", torch.tensor(' + intLiteral(pl.pairSrc, 12, 24) + ', dtype=torch.long))');
     L.push('        self.register_buffer("hpair_dst", torch.tensor(' + intLiteral(pl.pairDst, 12, 24) + ', dtype=torch.long))');
+    L.push('        self.register_buffer("hpair_input", torch.tensor(' + intLiteral(pl.pairSrc.map((i) => inputs.has(i) ? 1 : 0), 12, 24) + ', dtype=torch.bool), persistent=False)');
   }
   L.push('');
   if (inline) {
@@ -9414,7 +9541,7 @@ function generatePyTorch(m, opts) {
          hand_built_net.py 直接变成 89 MB —— Python 光解析就要好几分钟，也没人打得开。
          改成"按少数那一方存下标"放进 model.bin 的整型段，这里只留一行读数代码。 */
       if (frozenW) L.push('        self.register_buffer("w_frozen", _frozen_from(idx, _fz, self.num_edges))');
-      if (frozenB) L.push('        self.register_buffer("b_frozen", _frozen_from(idx, ' + (frozenW ? '_fb' : '_fz') + ', self.num_neurons))');
+      if (frozenB) L.push('        self.register_buffer("b_frozen", _frozen_from(idx, _fb, self.num_neurons))');
     } else {
       if (frozenW) L.push('        self.register_buffer("w_frozen", torch.tensor(' + literal(Array.from(m.wFrozen), 12, 40) + ', dtype=torch.bool))');
       if (frozenB) L.push('        self.register_buffer("b_frozen", torch.tensor(' + literal(Array.from(m.bFrozen), 12, 40) + ', dtype=torch.bool))');
@@ -9434,16 +9561,73 @@ function generatePyTorch(m, opts) {
   }
   L.push('');
   L.push('    def apply_freeze(self):');
-  L.push('        """把编辑器里标记为冻结的权重屏蔽掉梯度。"""');
-  L.push('        if hasattr(self, "w_frozen"):');
-  L.push('            self.weight.register_hook(lambda g: g * (~self.w_frozen).to(g.dtype))');
-    L.push('        if hasattr(self, "b_frozen"):');
-    L.push('            self.bias.register_hook(lambda g: g * (~self.b_frozen).to(g.dtype))');
-    L.push('        if hasattr(self, "blk_frozen"):');
-    L.push('            self.bw.register_hook(lambda g: g * (~self.blk_frozen).to(g.dtype))');
+  L.push('        """屏蔽冻结位置的梯度；优化器的衰减/动量由 protect_frozen() 保护。"""');
+  L.push('        for handle in getattr(self, "_freeze_hooks", []):');
+  L.push('            handle.remove()');
+  L.push('        self._freeze_hooks = []');
+  L.push('        for name, mask_name in (("weight", "w_frozen"), ("bias", "b_frozen"), ("bw", "blk_frozen")):');
+  L.push('            if hasattr(self, mask_name):');
+  L.push('                self._freeze_hooks.append(getattr(self, name).register_hook(');
+  L.push('                    lambda g, mn=mask_name: g.masked_fill(getattr(self, mn), 0.0)))');
+  L.push('');
+  L.push('    def protect_frozen(self, optimizer):');
+  L.push('        """保护冻结位置不被 SGD/Adam/AdamW 的 weight_decay 或动量改写。');
+  L.push('');
+  L.push('        内置 make_optimizer() 自动调用。外部创建优化器后也要调用一次：');
+  L.push('            opt = net.protect_frozen(torch.optim.AdamW(net.parameters(), lr=1e-3))');
+  L.push('        可以重复调用；不改变 Parameter 名字和 state_dict 的布局。');
+  L.push('        此保护作用于 optimizer.step()：自定义优化器直接改参数、绕过 step，');
+  L.push('        或一步内反复调用 closure 的优化器，需要自行保持冻结约束。"""');
+  L.push('        pairs = (("weight", "w_frozen"), ("bias", "b_frozen"), ("bw", "blk_frozen"))');
+  L.push('        if not any(hasattr(self, mask_name) for _, mask_name in pairs):');
+  L.push('            return optimizer');
+  L.push('        guards = getattr(optimizer, "_nf_freeze_guards", {})');
+  L.push('        if id(self) in guards:');
+  L.push('            return optimizer');
+  L.push('        if not hasattr(optimizer, "register_step_pre_hook") or not hasattr(optimizer, "register_step_post_hook"):');
+  L.push('            raise RuntimeError("冻结参数保护需要支持 optimizer step hooks 的 PyTorch 版本")');
+  L.push('        saved = []');
+  L.push('        def before_step(opt, args, kwargs):');
+  L.push('            saved.clear()');
+  L.push('            for name, mask_name in pairs:');
+  L.push('                if hasattr(self, mask_name):');
+  L.push('                    p, mask = getattr(self, name), getattr(self, mask_name)');
+  L.push('                    saved.append((p, mask, p.detach()[mask].clone()))');
+  L.push('        def after_step(opt, args, kwargs):');
+  L.push('            with torch.no_grad():');
+  L.push('                for p, mask, values in saved:');
+  L.push('                    p[mask] = values');
+  L.push('                    # 清除冻结位置的动量，恢复 checkpoint 后也不会残留旧更新。');
+  L.push('                    for state in opt.state.get(p, {}).values():');
+  L.push('                        if torch.is_tensor(state) and state.shape == p.shape:');
+  L.push('                            state.masked_fill_(mask.to(state.device), 0.0)');
+  L.push('            saved.clear()');
+  L.push('        guards[id(self)] = (optimizer.register_step_pre_hook(before_step),');
+  L.push('                            optimizer.register_step_post_hook(after_step))');
+  L.push('        optimizer._nf_freeze_guards = guards');
+  L.push('        return optimizer');
   L.push('');
   for (const ln of opMethodCode(m)) L.push(ln);
   for (const ln of plastMethodCode(m)) L.push(ln);
+  if (hasState) {
+    /* 状态型神经元的膜电位默认跨 forward 调用保留（这正是「把信号存住」的用法）。
+       训练「互相独立的样本」时不复位就会串用，所以给一对明确的公开接口。 */
+    L.push('    def reset_state(self):');
+    L.push('        """清空内部状态（记忆 / 漏电积分 / 脉冲的膜电位）。');
+    L.push('');
+    L.push('        状态型神经元的值跨 forward 调用保留，这是设计如此；但训练互相独立的样本');
+    L.push('        之前必须先清空，否则同一批次槽位的后一个样本会继承前一个样本的残余膜电位。');
+    L.push('        train() 按 TRAIN_CFG["state"] 自动处理；手写训练循环时自己调这一个。"""');
+    L.push('        self.st = None');
+    L.push('        return self');
+    L.push('');
+    L.push('    def detach_state(self):');
+    L.push('        """把内部状态从计算图上摘下来（截断跨批次的反向传播）。"""');
+    L.push('        if self.st is not None:');
+    L.push('            self.st = self.st.detach()');
+    L.push('        return self');
+    L.push('');
+  }
   if (m.recurrent) {
     /* 循环网：接 (B, T, K) 的输入序列，回边读上一拍的值 */
     for (const ln of recForwardCode(m)) L.push(ln);
@@ -9454,11 +9638,12 @@ function generatePyTorch(m, opts) {
   L.push('        # \uff08\u5b9e\u6d4b\u504f\u5dee 1.76\uff09\u3002scatter_add \u8bed\u4e49\u4e00\u6a21\u4e00\u6837\uff0c\u4e14\u80fd\u6b63\u786e\u5bfc\u51fa\u6210 ONNX \u7684 ScatterElements(reduction=add)\u3002');
   L.push('        """x: (B, ' + m.inputNodes.length + ') -> (B, ' + m.outputNodes.length + ')"""');
   L.push('        b = x.size(0)');
-  if (pHard) L.push('        blocked = torch.zeros(b, self.num_neurons, dtype=torch.bool)   # 本拍被上游强硬压住的神经元');
   L.push('        # 所有神经元先取自己的偏置');
   if (hasState) {
     L.push('        if self.st is None or self.st.shape[0] != b:');
-    L.push('            self.st = torch.zeros(b, self.num_neurons, dtype=self.bias.dtype)');
+    L.push('            self.st = self.bias.new_zeros(b, self.num_neurons)');
+    L.push('        else:');
+    L.push('            self.st = self.st.to(self.bias)');
     L.push('        # 状态型神经元的 bias 是保持系数，不当加法偏置用');
     L.push('        h = (self.bias * self.keep_bias).unsqueeze(0).expand(b, -1).clone()');
   } else {
@@ -9514,6 +9699,14 @@ function generatePyTorch(m, opts) {
       L.push('');
     }
   L.push('            code = self.act_code.index_select(0, idx)');
+  if (pHard) {
+    L.push('            # 当前波次的所有前驱已经求值；输入接口的非零信号也能施加压制。');
+    L.push('            hv = h.index_select(1, self.hpair_src)');
+    L.push('            fired = torch.where(self.hpair_input.unsqueeze(0), hv != 0, hv > 0)');
+    L.push('            blocked = torch.zeros_like(h).scatter_add(');
+    L.push('                1, self.hpair_dst.unsqueeze(0).expand(b, -1), fired.to(h.dtype)) > 0');
+    L.push('            suppressed = blocked.index_select(1, idx)   # (B, 本波节点数)，多源压制按 OR 合并');
+  }
   L.push('            out = pre');
   L.push('            for aid in USED_ACT_IDS:');
   L.push('                m = (code == aid)');
@@ -9527,18 +9720,13 @@ function generatePyTorch(m, opts) {
     L.push('            snew = kk.unsqueeze(0) * stp + pre                        # s = k·s + Σw·x');
     L.push('            sp = (code == 10)                                         # 是不是脉冲型');
     L.push('            fire = torch.where(snew >= 1.0, torch.ones_like(snew), torch.zeros_like(snew)) * sp.to(snew.dtype).unsqueeze(0)');
-    L.push('            self.st = self.st.index_copy(1, idx, (snew - fire).detach())');
+    L.push('            self.st = self.st.index_copy(1, idx, ' + (pHard ? 'torch.where(suppressed, stp, snew - fire)' : '(snew - fire)') + '.detach())');
     L.push('            out = torch.where((code == 8).unsqueeze(0) | (code == 9).unsqueeze(0), snew, out)');
     L.push('            out = torch.where(sp.unsqueeze(0), fire, out)');
   }
   if (pHard) {
     L.push('            # ---- 强硬抑制：被压住的这一拍不许激活（权重再大也没用），下一拍才恢复 ----');
-    L.push('            if self.num_hard_pairs:');
-    L.push('                out = out.masked_fill(blocked.index_select(1, idx).unsqueeze(0), 0.0)');
-    L.push('                _fired = torch.zeros(b, self.num_neurons, dtype=torch.bool).scatter(');
-    L.push('                    1, idx.unsqueeze(0).expand(b, -1), out > 0)   # 「一亮」= 输出的激活值不为 0');
-    L.push('                blocked = blocked.scatter(1, self.hpair_dst.unsqueeze(0).expand(b, -1),');
-    L.push('                                           _fired.index_select(1, self.hpair_src))');
+    L.push('            out = out.masked_fill(suppressed, 0.0)');
   }
   L.push('            h = torch.scatter(h, 1, idx.unsqueeze(0).expand(b, -1), out)');
   L.push('');
@@ -9554,6 +9742,7 @@ function generatePyTorch(m, opts) {
   L.push('# ==============================================================');
   L.push('NUM_INPUTS = ' + m.inputNodes.length);
   L.push('NUM_OUTPUTS = ' + m.outputNodes.length);
+  L.push('RECURRENT = ' + (m.recurrent ? 'True' : 'False'));
   if (m.recurrent) {
     L.push('');
     L.push('# 循环网按时间展开的步数。改这里就行——模型结构自动跟着走，不用回编辑器重编译。');
@@ -9563,6 +9752,13 @@ function generatePyTorch(m, opts) {
   L.push('TRAIN_CFG = {');
   for (const k of Object.keys(T)) L.push('    ' + pyLit(k) + ': ' + pyLit(T[k]) + ',');
   L.push('}');
+  if (hasState) {
+    L.push('');
+    L.push('# 有状态神经元（记忆 / 漏电积分 / 脉冲）的膜电位是跨 forward 调用保留的：');
+    L.push('# "独立样本"（state=reset，默认）每个批次之前清空；');
+    L.push('# "连续轨迹"（state=keep）跨批次保留，此时批次顺序就是时间顺序（shuffle 也跟着关掉）。');
+    L.push('STATE_RESET = str(TRAIN_CFG.get("state", "reset")).lower() != "keep"');
+  }
   L.push('');
   if (wantOnnx) {
     L.push('# ==============================================================');
@@ -9615,27 +9811,63 @@ function generatePyTorch(m, opts) {
   L.push('# 这是「可视化搭好的网络 → 能训练」的最小骨架，不是成品训练框架。');
   L.push('# 优化器 / 学习率 / 损失 / 轮数 / 批大小 / 数据，就是上面那份 TRAIN_CFG，');
   L.push('# 它在编辑器的「编译 → 训练」页里定义。数据默认读 .npz：');
-  L.push('#   X 形状 (样本数, ' + m.inputNodes.length + ')   Y 形状 (样本数, ' + m.outputNodes.length + ')');
-  if (frozenW || frozenB || frozenK) L.push('# 编辑器里标了「冻结」的参数：apply_freeze() 已经挂了梯度钩子，训练时会自动被屏蔽。');
+  L.push('#   X 形状 ' + (m.recurrent
+    ? '（样本数, 时间步, ' + m.inputNodes.length + '）'
+    : '（样本数, ' + m.inputNodes.length + '）'));
+  L.push('#   Y：loss=ce 时可以写整数类别号——' + (m.recurrent ? '（样本数, 时间步）' : '（样本数,）')
+    + '，也可以写跟输出同形的软标签' + (m.recurrent ? '（样本数, 时间步, ' + m.outputNodes.length + '）' : ''));
+  L.push('#   其它损失（mse / l1 / bce）要浮点目标，形状跟输出一致。');
+  if (frozenW || frozenB || frozenK) {
+    L.push('# 冻结参数由梯度钩子 + 优化器 step 保护，weight_decay / 动量也不会改写。');
+    L.push('# make_optimizer() 已自动保护；自己创建优化器时调用 net.protect_frozen(opt)。');
+  }
+  if (hasState) {
+    L.push('');
+    L.push('# 状态说明: 这张图里有状态型神经元（记忆 / 漏电积分 / 脉冲）。它们的膜电位在 self.st 里');
+    L.push('#           跨 forward 调用保留——连续推理（接口运行时逐帧喂）就是这个语义。');
+    L.push('#           训练互相独立的样本时要复位：net.reset_state()。train() 按 TRAIN_CFG["state"]');
+    L.push('#           自动处理（reset = 每个批次前清空；keep = 跨批次保留，批次顺序即时间顺序）。');
+    L.push('#           状态不进 state_dict（它不是参数也不是 buffer）：要从某个检查点接着跑连续轨迹，');
+    L.push('#           接着喂就行；想从零开始就先 reset_state()。');
+  }
   L.push('def load_dataset(cfg):');
   L.push('    import numpy as np');
   L.push('    d = np.load(cfg["data"])');
   L.push('    X = np.asarray(d["X"], dtype=np.float32)');
-  L.push('    Y = np.asarray(d["Y"], dtype=np.float32)');
+  L.push('    Y = np.asarray(d["Y"])');
+  L.push('    # 只把浮点目标转成 float32。整数（类别号）保持原样：CE 要的是 long，');
+  L.push('    # 强行转成 float32 会把"第 3 类"变成"软标签 3.0"，损失和梯度都是错的。');
+  L.push('    if Y.dtype.kind == "f":');
+  L.push('        Y = Y.astype(np.float32)');
   if (m.recurrent) {
     L.push('    if X.ndim != 3 or X.shape[2] != NUM_INPUTS:');
     L.push('        raise ValueError("X 的形状是 %s，但循环网要的是 (样本数, 时间步, %d)——把每个样本按时间铺成序列" % (X.shape, NUM_INPUTS))');
-    L.push('    if Y.ndim != 3 or Y.shape[2] != NUM_OUTPUTS:');
-    L.push('        raise ValueError("Y 的形状是 %s，但循环网要的是 (样本数, 时间步, %d)" % (Y.shape, NUM_OUTPUTS))');
-    L.push('    if Y.shape[1] != X.shape[1]:');
-    L.push('        raise ValueError("X 有 %d 个时间步，Y 只有 %d 个——序列长度必须一致" % (X.shape[1], Y.shape[1]))');
+    L.push('    if Y.dtype.kind == "f":                      # 浮点 = 软标签 / 回归目标');
+    L.push('        if Y.ndim != 3 or Y.shape[2] != NUM_OUTPUTS:');
+    L.push('            raise ValueError("Y 的形状是 %s，但循环网要的是 (样本数, 时间步, %d)" % (Y.shape, NUM_OUTPUTS))');
+    L.push('        if Y.shape[1] != X.shape[1]:');
+    L.push('            raise ValueError("X 有 %d 个时间步，Y 只有 %d 个——序列长度必须一致" % (X.shape[1], Y.shape[1]))');
+    L.push('    else:                                        # 整数 = 每个时间步一个类别号');
+    L.push('        if Y.ndim != 2:');
+    L.push('            raise ValueError("序列分类的整数标签要写成 (样本数, 时间步)，每个时间步一个类别号；现在是 %s" % (Y.shape,))');
+    L.push('        if Y.shape[1] != X.shape[1]:');
+    L.push('            raise ValueError("X 有 %d 个时间步，Y 只有 %d 个——序列长度必须一致" % (X.shape[1], Y.shape[1]))');
   } else {
     L.push('    if X.ndim != 2 or X.shape[1] != NUM_INPUTS:');
     L.push('        raise ValueError("X 的形状是 %s，但模型要的是 (样本数, %d)" % (X.shape, NUM_INPUTS))');
-    L.push('    if Y.ndim == 1:');
-    L.push('        Y = Y.reshape(-1, 1)');
-    L.push('    if Y.shape[1] != NUM_OUTPUTS:');
-    L.push('        raise ValueError("Y 的形状是 %s，但模型给的是 (样本数, %d)" % (Y.shape, NUM_OUTPUTS))');
+    L.push('    if Y.dtype.kind == "f":                      # 浮点 = 软标签 / 回归目标');
+    L.push('        if Y.ndim == 1:');
+    L.push('            Y = Y.reshape(-1, 1)');
+    L.push('        if Y.shape[1] != NUM_OUTPUTS:');
+    L.push('            raise ValueError("Y 的形状是 %s，但模型给的是 (样本数, %d)" % (Y.shape, NUM_OUTPUTS))');
+    L.push('    else:                                        # 整数 = 类别号，CE 用');
+    L.push('        if Y.ndim == 2 and Y.shape[1] == 1:');
+    L.push('            Y = Y.reshape(-1)');
+    L.push('        if Y.ndim != 1:');
+    L.push('            raise ValueError("整数类别标签要写成 (样本数,)：输出已经是 (样本数, %d) 的 '
+      + 'logits，标签不用再铺成 %d 列；现在是 %s" % (NUM_OUTPUTS, NUM_OUTPUTS, Y.shape))');
+    L.push('        if Y.shape[0] != X.shape[0]:');
+    L.push('            raise ValueError("X 有 %d 个样本，Y 有 %d 个" % (X.shape[0], Y.shape[0]))');
   }
   L.push('    return torch.from_numpy(X), torch.from_numpy(Y)');
   L.push('');
@@ -9644,10 +9876,10 @@ function generatePyTorch(m, opts) {
   L.push('    name = str(cfg["optimizer"]).lower()');
   L.push('    lr, wd = float(cfg["lr"]), float(cfg["weight_decay"])');
   L.push('    if name == "sgd":');
-  L.push('        return torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=wd)');
+  L.push('        return net.protect_frozen(torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=wd))');
   L.push('    if name == "adamw":');
-  L.push('        return torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=wd)');
-  L.push('    return torch.optim.Adam(net.parameters(), lr=lr, weight_decay=wd)');
+  L.push('        return net.protect_frozen(torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=wd))');
+  L.push('    return net.protect_frozen(torch.optim.Adam(net.parameters(), lr=lr, weight_decay=wd))');
   L.push('');
   L.push('');
   L.push('def make_loss(cfg):');
@@ -9661,40 +9893,338 @@ function generatePyTorch(m, opts) {
   L.push('    return torch.nn.MSELoss()');
   L.push('');
   L.push('');
+  L.push('def prepare_batch(out, y, cfg):');
+  L.push('    """把一批 (输出, 目标) 整理成损失函数要的形状。');
+  L.push('');
+  L.push('    分类有两件很容易被忽略的事，这里都处理掉：');
+  L.push('      · 整数类别标签：CE 要 long，也不能强行转 float32；');
+  L.push('      · 序列的类别轴：循环网的输出是 (样本数, 时间步, 类别数)，类别在**最后一维**，');
+  L.push('        而 CrossEntropyLoss 把第 1 维当类别维——直接喂进去算的是"时间"而不是"类别"，');
+  L.push('        不报错、但损失和梯度都是错的，所以这里自己转轴');
+  L.push('        （整数标签整片展平成 (样本数×时间步, 类别数)，软标签转成 (样本数, 类别数, 时间步)）。');
+  L.push('    """');
+  L.push('    name = str(cfg["loss"]).lower()');
+  L.push('    is_ce = name in ("ce", "cross_entropy")');
+  L.push('    if not is_ce:');
+  L.push('        if y.dtype not in (torch.float32, torch.float64):');
+  L.push('            raise ValueError("损失 %s 要浮点目标，Y 现在是 %s——分类任务请把 loss 设成 ce"');
+  L.push('                             % (cfg["loss"], y.dtype))');
+  L.push('        return out, y.to(out.dtype)');
+  L.push('    if y.dtype not in (torch.float32, torch.float64):');
+  L.push('        y = y.long()');
+  L.push('    if RECURRENT:');
+  L.push('        if out.dim() != 3:');
+  L.push('            raise ValueError("循环网的输出应该是 (样本数, 时间步, %d)，现在是 %s"');
+  L.push('                             % (NUM_OUTPUTS, tuple(out.shape)))');
+  L.push('        if y.dim() == 2:                         # 整数类别：(样本数, 时间步)');
+  L.push('            flat = y.reshape(-1)');
+  L.push('            _check_class_range(flat, out.shape[2])');
+  L.push('            return out.reshape(-1, out.shape[2]), flat');
+  L.push('        if y.dim() == 3:                         # 软标签：(样本数, 时间步, 类别数)');
+  L.push('            if y.shape[2] != out.shape[2]:');
+  L.push('                raise ValueError("Y 的最后一维是 %d，但类别数是 %d" % (y.shape[2], out.shape[2]))');
+  L.push('            return out.transpose(1, 2), y.to(out.dtype).transpose(1, 2)');
+  L.push('        raise ValueError("序列 CE 的目标要么是 (样本数, 时间步) 的整数类别，要么是"');
+  L.push('                         "(样本数, 时间步, %d) 的软标签；现在是 %s" % (NUM_OUTPUTS, tuple(y.shape)))');
+  L.push('    if y.dim() == 2 and y.shape[1] == 1 and y.dtype not in (torch.float32, torch.float64):');
+  L.push('        y = y.reshape(-1)');
+  L.push('    if y.dtype in (torch.float32, torch.float64):           # 软标签：跟 logits 同形');
+  L.push('        if tuple(y.shape) != tuple(out.shape):');
+  L.push('            raise ValueError("Y 的形状是 %s，跟输出的 %s 对不上——软标签要和输出同形，"');
+  L.push('                             "整数类别写 (样本数,)" % (tuple(y.shape), tuple(out.shape)))');
+  L.push('        return out, y.to(out.dtype)');
+  L.push('    flat = y.reshape(-1)');
+  L.push('    _check_class_range(flat, out.shape[1])');
+  L.push('    return out, flat');
+  L.push('');
+  L.push('');
+  L.push('def _check_class_range(flat, classes):');
+  L.push('    """整数类别号必须在 [0, 类别数) 里——不然 CE 会拿越界下标去取值。"""');
+  L.push('    if flat.numel():');
+  L.push('        lo, hi = int(flat.min()), int(flat.max())');
+  L.push('        if lo < 0 or hi >= classes:');
+  L.push('            raise ValueError("Y 里有超出 [0, %d) 的类别号：最小 %d / 最大 %d" % (classes, lo, hi))');
+  L.push('');
+  L.push('');
+  L.push('def split_dataset(X, Y, cfg):');
+  L.push('    """按 cfg["val_split"] 划训练集 / 验证集，返回 ((Xt, Yt), (Xv, Yv))。');
+  L.push('');
+  L.push('    val_split = 0（默认）就不划：训练集是全部数据，行为跟以前的骨架一模一样。');
+  L.push('    连续轨迹（state="keep"）按**尾部连续切**——打乱会把时间顺序毁掉。');
+  L.push('    切分用 cfg["seed"]（或 val_seed）固定住，两次跑得到同一份切分。');
+  L.push('    """');
+  L.push('    frac = float(cfg.get("val_split") or 0.0)');
+  L.push('    n = int(X.shape[0])');
+  L.push('    if frac <= 0.0:');
+  L.push('        return (X, Y), (None, None)');
+  L.push('    if frac >= 1.0:');
+  L.push('        raise ValueError("val_split 必须小于 1，现在是 %r" % frac)');
+  L.push('    nv = int(round(n * frac))');
+  L.push('    if nv < 1:');
+  L.push('        raise ValueError("val_split=%r 在 %d 个样本上分不出验证集（至少要留 1 个）" % (frac, n))');
+  L.push('    if n - nv < 1:');
+  L.push('        raise ValueError("val_split=%r 太大：训练集只剩 %d 个样本" % (frac, n - nv))');
+  L.push('    if str(cfg.get("state", "reset")).lower() == "keep":');
+  L.push('        return (X[:n - nv], Y[:n - nv]), (X[n - nv:], Y[n - nv:])');
+  L.push('    g = torch.Generator().manual_seed(int(cfg.get("val_seed", cfg["seed"])))');
+  L.push('    perm = torch.randperm(n, generator=g)');
+  L.push('    vi, ti = perm[:nv], perm[nv:]');
+  L.push('    return (X[ti], Y[ti]), (X[vi], Y[vi])');
+  L.push('');
+  L.push('');
+  L.push('def _metric_kind(cfg):');
+  L.push('    """报表里的那个指标：分类看准确率，回归看 MAE。metrics 显式写了就听它的。"""');
+  L.push('    kind = str(cfg.get("metrics", "auto")).lower()');
+  L.push('    if kind not in ("", "auto"):');
+  L.push('        return kind');
+  L.push('    return "acc" if str(cfg["loss"]).lower() == "ce" else "mae"');
+  L.push('');
+  L.push('');
+  L.push('def evaluate(net, X, Y, cfg, dev):');
+  L.push('    """在验证集上跑一遍，返回 {"val": 平均损失, "val_acc" / "val_mae": 指标}。');
+  L.push('');
+  L.push('    验证是**独立的一次遍历**：有状态神经元在验证前后各清一次膜电位，');
+  L.push('    免得验证那几拍的残值串进训练的连续轨迹；跑完把 net 切回 train 模式。');
+  L.push('    """');
+  L.push('    lossf = make_loss(cfg)');
+  L.push('    bs = max(1, int(cfg["batch_size"]))');
+  L.push('    kind = _metric_kind(cfg)');
+  L.push('    net.eval()');
+  L.push('    if hasattr(net, "reset_state"):');
+  L.push('        net.reset_state()');
+  L.push('    tot, nb, hit, seen, ae = 0.0, 0, 0, 0, 0.0');
+  L.push('    with torch.no_grad():');
+  L.push('        for i in range(0, int(X.shape[0]), bs):');
+  L.push('            xb, yb = X[i:i + bs].to(dev), Y[i:i + bs].to(dev)');
+  L.push('            lo, lt = prepare_batch(net(xb), yb, cfg)');
+  L.push('            tot += float(lossf(lo, lt))');
+  L.push('            nb += 1');
+  L.push('            if kind == "acc":');
+  L.push('                ok = (lo.argmax(dim=-1) == (lt.argmax(dim=-1) if lt.dim() == lo.dim() else lt))');
+  L.push('                hit += int(ok.sum())');
+  L.push('                seen += int(ok.numel())');
+  L.push('            elif kind == "mae":');
+  L.push('                ae += float((lo - lt).abs().sum())');
+  L.push('                seen += int(lt.numel())');
+  L.push('    if hasattr(net, "reset_state"):');
+  L.push('        net.reset_state()');
+  L.push('    net.train()');
+  L.push('    out = {"val": tot / max(1, nb)}');
+  L.push('    if kind == "acc":');
+  L.push('        out["val_acc"] = (hit / seen) if seen else 0.0');
+  L.push('    elif kind == "mae":');
+  L.push('        out["val_mae"] = (ae / seen) if seen else 0.0');
+  L.push('    return out');
+  L.push('');
+  L.push('');
+  L.push('def make_scheduler(opt, cfg):');
+  L.push('    """学习率调度器。scheduler = none（默认）/ cosine / step。"""');
+  L.push('    kind = str(cfg.get("scheduler", "none")).lower()');
+  L.push('    if kind in ("", "none", "off"):');
+  L.push('        return None');
+  L.push('    if kind == "cosine":');
+  L.push('        return torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, int(cfg["epochs"])))');
+  L.push('    if kind == "step":');
+  L.push('        return torch.optim.lr_scheduler.StepLR(');
+  L.push('            opt, step_size=max(1, int(cfg.get("scheduler_step", 10))),');
+  L.push('            gamma=float(cfg.get("scheduler_gamma", 0.1)))');
+  L.push('    raise ValueError("认不出的 scheduler：%r（可选 none / cosine / step）" % kind)');
+  L.push('');
+  L.push('');
+  L.push('def save_history(path, history, cfg=None):');
+  L.push('    """把每轮指标写成 JSON：配置和曲线放在一起，回头能对上「当时到底跑了什么」。"""');
+  L.push('    import json');
+  L.push('    rec = {"format": "neuroforge-train-history", "version": 1,');
+  L.push('           "cfg": dict(cfg or TRAIN_CFG), "epochs": len(history), "history": list(history)}');
+  L.push('    with open(path, "w", encoding="utf-8") as f:');
+  L.push('        json.dump(rec, f, ensure_ascii=False, indent=1)');
+  L.push('    print("已保存训练记录:", path)');
+  L.push('    return path');
+  L.push('');
+  L.push('');
+  L.push('def _rng_state():');
+  L.push('    """随机数状态（CPU + 各张显卡）。只记 torch 的：生成出来的训练循环只用 torch 的随机流。"""');
+  L.push('    return {"torch": torch.get_rng_state(),');
+  L.push('            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}');
+  L.push('');
+  L.push('');
+  L.push('def _restore_rng(st):');
+  L.push('    if not st:');
+  L.push('        return False');
+  L.push('    if st.get("torch") is not None:');
+  L.push('        torch.set_rng_state(st["torch"].cpu().to(torch.uint8))');
+  L.push('    if st.get("cuda") and torch.cuda.is_available():');
+  L.push('        torch.cuda.set_rng_state_all([t.cpu().to(torch.uint8) for t in st["cuda"]])');
+  L.push('    return True');
+  L.push('');
+  L.push('');
+  L.push('def _net_state_get(net):');
+  L.push('    """有状态神经元的膜电位。它不是参数也不是 buffer，state_dict 里没有，');
+  L.push('    连续轨迹要接着跑就只能单独存一份。"""');
+  L.push('    st = getattr(net, "st", None)');
+  L.push('    return None if st is None else st.detach().clone()');
+  L.push('');
+  L.push('');
+  L.push('def _checkpoint_cfg(path):');
+  L.push('    """只读检查点里那份配置（续训拿它当基准）；读不出来就当没有。"""');
+  L.push('    try:');
+  L.push('        ck = torch.load(path, map_location="cpu", weights_only=True)');
+  L.push('    except Exception:');
+  L.push('        return None');
+  L.push('    return dict(ck["cfg"]) if isinstance(ck, dict) and isinstance(ck.get("cfg"), dict) else None');
+  L.push('');
+  L.push('');
+  L.push('def save_checkpoint(net, path="trained.pt", cfg=None, opt=None, sched=None,');
+  L.push('                    epoch=0, history=None, best=None):');
+  L.push('    """完整检查点：权重 + 优化器 / 调度器状态 + 轮次 + 随机数状态 + 实际生效的配置。');
+  L.push('');
+  L.push('    只写 state_dict 是「存权重」，不是「续训」：优化器的动量、调度器的位置、随机流、');
+  L.push('    已经跑了几轮都不在里面，拿这种文件接着训练其实是另起一次实验。');
+  L.push('    """');
+  L.push('    ck = {"format": "neuroforge-train-checkpoint", "version": 2,');
+  L.push('          "state_dict": net.state_dict(),');
+  L.push('          "cfg": dict(cfg or TRAIN_CFG),');
+  L.push('          "epoch": int(epoch), "history": list(history or []), "best": best,');
+  L.push('          "rng": _rng_state(),');
+  L.push('          "net_state": _net_state_get(net)}');
+  /* 这两个键**始终**写出来（没有就是 None）：缺键和「没有状态」是两回事，
+     读的人能据此分辨这份文件是「能续训的检查点」还是「只存了权重」。 */
+  L.push('    ck["optimizer"] = opt.state_dict() if opt is not None else None');
+  L.push('    ck["scheduler"] = sched.state_dict() if sched is not None else None');
+  L.push('    torch.save(ck, path)');
+  L.push('    print("已保存检查点:", path)');
+  L.push('    return path');
+  L.push('');
+  L.push('');
+  L.push('def load_checkpoint(path, net, opt=None, sched=None, map_location=None):');
+  L.push('    """读回完整检查点，恢复到 net / opt / sched 上，返回检查点里的记录。');
+  L.push('');
+  L.push('    形状或键对不上会被 load_state_dict 拦住（strict=True），而且这里是**先恢复完再返回**：');
+  L.push('    失败就抛，不会留下一个半加载的模型。旧格式（只有 state_dict + cfg）也读得进来。');
+  L.push('    """');
+  L.push('    if not os.path.exists(path):');
+  L.push('        raise ValueError("检查点不存在：%s" % path)');
+  L.push('    loc = map_location if map_location is not None else "cpu"');
+  L.push('    try:');
+  L.push('        ck = torch.load(path, map_location=loc, weights_only=True)');
+  L.push('    except Exception as e:');
+  L.push('        raise ValueError("检查点读不出来：%s（确认它出自 save_checkpoint()）" % e)');
+  L.push('    if not isinstance(ck, dict) or "state_dict" not in ck:');
+  L.push('        raise ValueError("检查点里没有 state_dict：%s" % path)');
+  L.push('    fmt = ck.get("format")');
+  L.push('    if fmt is not None and fmt != "neuroforge-train-checkpoint":');
+  L.push('        raise ValueError("认不出的检查点格式：%r" % fmt)');
+  L.push('    try:');
+  L.push('        net.load_state_dict(ck["state_dict"], strict=True)');
+  L.push('    except RuntimeError as e:');
+  L.push('        raise ValueError("检查点和这个模型对不上（换了结构 / 改过图之后重编译过？）：%s" % e)');
+  L.push('    if opt is not None and ck.get("optimizer"):');
+  L.push('        opt.load_state_dict(ck["optimizer"])');
+  L.push('    if sched is not None and ck.get("scheduler"):');
+  L.push('        sched.load_state_dict(ck["scheduler"])');
+  L.push('    _restore_rng(ck.get("rng"))');
+  L.push('    st = ck.get("net_state")');
+  L.push('    if st is not None:');
+  L.push('        if not hasattr(net, "st"):');
+  L.push('            raise ValueError("检查点里带着内部状态，但这个模型没有状态型神经元")');
+  L.push('        net.st = st.to(net.bias)');
+  L.push('    return ck');
+  L.push('');
+  L.push('');
   L.push('def train(cfg=None):');
-  L.push('    cfg = dict(TRAIN_CFG, **(cfg or {}))');
+  L.push('    """按 cfg 训练，返回训练好的网络。');
+  L.push('');
+  L.push('    续训：cfg["resume"] 给一个检查点路径，就从那一轮接着往下跑——权重 / 优化器 /');
+  L.push('    调度器 / 随机流 / 轮次 / 内部状态一起恢复。收尾信息留在返回值的 net.nf_last 上，');
+  L.push('    命令行保存检查点时直接用它。');
+  L.push('    """');
+  L.push('    given = dict(cfg or {})');
+  L.push('    base = dict(TRAIN_CFG)');
+  L.push('    resume = str(given.get("resume") or TRAIN_CFG.get("resume") or "")');
+  L.push('    if resume:');
+  L.push('        # 续训以检查点里那份「当时实际生效的配置」为基准，调用方再给的键覆盖它');
+  L.push('        base = _checkpoint_cfg(resume) or base');
+  L.push('    cfg = dict(base, **given)');
+  if (hasState) {
+    /* 状态策略要按**合并后的 cfg** 现算：模块级 STATE_RESET 只是文件里的默认值，
+       照它写死的话 train({"state": "keep"}) 和命令行覆盖都会被静默忽略。 */
+    L.push('    # 状态策略按合并后的 cfg 现算：模块级 STATE_RESET 只是文件里的默认值');
+    L.push('    reset_each_batch = (str(cfg["state"]).lower() != "keep") if "state" in cfg else STATE_RESET');
+  }
   L.push('    torch.manual_seed(int(cfg["seed"]))');
   L.push('    use_cuda = cfg["device"] in ("auto", "cuda") and torch.cuda.is_available()');
   L.push('    dev = torch.device("cuda" if use_cuda else "cpu")');
   L.push('    net = HandBuiltNet().to(dev)');
-  L.push('    X, Y = load_dataset(cfg)');
-  L.push('    dl = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X, Y),');
-  L.push('                                     batch_size=int(cfg["batch_size"]), shuffle=True)');
   L.push('    opt = make_optimizer(net, cfg)');
+  L.push('    sched = make_scheduler(opt, cfg)');
   L.push('    lossf = make_loss(cfg)');
+  L.push('    X, Y = load_dataset(cfg)');
+  L.push('    (Xt, Yt), (Xv, Yv) = split_dataset(X, Y, cfg)');
+  L.push('    dl = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(Xt, Yt),');
+  if (hasState) L.push('                                     # 独立样本要打乱；连续轨迹必须按原顺序喂');
+  L.push('                                     batch_size=int(cfg["batch_size"]), shuffle=' +
+         (hasState ? 'reset_each_batch' : 'True') + ')');
   L.push('    epochs = int(cfg["epochs"])');
+  L.push('    val_every = max(1, int(cfg.get("val_every", 1)))');
+  L.push('    log_every = max(1, int(cfg.get("log_every", 1)))');
+  L.push('    history, best, start = [], None, 1');
+  L.push('    if resume:');
+  L.push('        ck = load_checkpoint(resume, net, opt, sched, map_location=dev)');
+  L.push('        start = int(ck.get("epoch", 0)) + 1');
+  L.push('        history = list(ck.get("history") or [])');
+  L.push('        best = ck.get("best")');
+  L.push('        print("从 %s 接着跑：已经完成 %d 轮，这次跑到第 %d 轮" % (resume, start - 1, epochs))');
+  L.push('    val_note = "" if Xv is None else " / 验证 %d" % int(Xv.shape[0])');
   L.push('    print("设备 %s / 样本 %d / 批 %d / 轮 %d / 优化器 %s / 损失 %s"');
-  L.push('          % (dev, len(X), int(cfg["batch_size"]), epochs, cfg["optimizer"], cfg["loss"]))');
+  if (hasState) {
+    L.push('          % (dev, len(Xt), int(cfg["batch_size"]), epochs, cfg["optimizer"], cfg["loss"])');
+    L.push('          + ("" if reset_each_batch else " / 状态跨批次保留（连续轨迹）") + val_note)');
+  } else {
+    L.push('          % (dev, len(Xt), int(cfg["batch_size"]), epochs, cfg["optimizer"], cfg["loss"]) + val_note)');
+  }
   L.push('    net.train()');
-  L.push('    for ep in range(1, epochs + 1):');
+  L.push('    for ep in range(start, epochs + 1):');
   L.push('        tot, nb = 0.0, 0');
   L.push('        for xb, yb in dl:');
   L.push('            xb, yb = xb.to(dev), yb.to(dev)');
+  if (hasState) {
+    L.push('            if reset_each_batch:');
+    L.push('                net.reset_state()   # 独立样本：每个批次都从「没有记忆」开始');
+  }
   L.push('            opt.zero_grad()');
-  L.push('            loss = lossf(net(xb), yb)');
+  L.push('            loss = lossf(*prepare_batch(net(xb), yb, cfg))');
   L.push('            loss.backward()');
+  L.push('            clip = float(cfg.get("grad_clip") or 0.0)');
+  L.push('            if clip > 0:');
+  L.push('                torch.nn.utils.clip_grad_norm_(net.parameters(), clip)');
   L.push('            opt.step()');
   L.push('            tot += float(loss.detach())');
   L.push('            nb += 1');
-  L.push('        if ep == 1 or ep % 10 == 0 or ep == epochs:');
-  L.push('            print("epoch %d/%d  loss=%.6f" % (ep, epochs, tot / max(1, nb)))');
+  L.push('        rec = {"epoch": ep, "loss": tot / max(1, nb),');
+  L.push('               "lr": float(opt.param_groups[0]["lr"])}');
+  L.push('        if Xv is not None and (ep % val_every == 0 or ep == epochs):');
+  L.push('            rec.update(evaluate(net, Xv, Yv, cfg, dev))');
+  L.push('            if best is None or rec["val"] < best["val"]:');
+  L.push('                best = {"epoch": ep, "val": rec["val"]}');
+  L.push('        history.append(rec)');
+  L.push('        if sched is not None:');
+  L.push('            sched.step()');
+  L.push('        if ep % log_every == 0 or ep == 1 or ep == epochs:');
+  L.push('            line = "epoch %d/%d  loss=%.6f" % (ep, epochs, rec["loss"])');
+  L.push('            if "val" in rec:');
+  L.push('                line += "  val=%.6f" % rec["val"]');
+  L.push('            if "val_acc" in rec:');
+  L.push('                line += "  acc=%.4f" % rec["val_acc"]');
+  L.push('            elif "val_mae" in rec:');
+  L.push('                line += "  mae=%.6f" % rec["val_mae"]');
+  L.push('            print(line)');
+  L.push('    hist = str(cfg.get("history") or "")');
+  L.push('    if hist:');
+  L.push('        save_history(hist, history, cfg)');
+  L.push('    net.nf_last = {"cfg": cfg, "opt": opt, "sched": sched, "history": history,');
+  L.push('                   "best": best, "resumed_from": resume or None,');
+  L.push('                   "epoch": (history[-1]["epoch"] if history else start - 1)}');
   L.push('    return net');
-  L.push('');
-  L.push('');
-  L.push('def save_checkpoint(net, path="trained.pt"):');
-  L.push('    torch.save({"state_dict": net.state_dict(), "cfg": TRAIN_CFG}, path)');
-  L.push('    print("已保存权重:", path)');
-  L.push('    return path');
   L.push('');
   L.push('');
 
@@ -9802,10 +10332,21 @@ function generatePyTorch(m, opts) {
     L.push('    ap.add_argument("--check-onnx", nargs="?", const="model.onnx", metavar="PATH",');
     L.push('                    help="把导出的 ONNX 跟 PyTorch 对拍")');
   }
+  if (hasState) {
+    L.push('    ap.add_argument("--state", choices=("reset", "keep"), default=None,');
+    L.push('                    help="内部状态策略：reset = 独立样本（每个批次前清空），keep = 连续轨迹（跨批次保留）")');
+  }
   L.push('    ap.add_argument("--train", action="store_true", help="按 TRAIN_CFG 跑一遍训练骨架")');
   L.push('    ap.add_argument("--data", default=None, help="训练数据 .npz（覆盖 TRAIN_CFG）")');
   L.push('    ap.add_argument("--epochs", type=int, default=None)');
   L.push('    ap.add_argument("--save", default="trained.pt", help="训练完把权重存到哪")');
+  L.push('    ap.add_argument("--resume", default=None,');
+  L.push('                    help="从检查点接着训练（权重 / 优化器 / 调度器 / 轮次 / 随机流一起恢复）")');
+  L.push('    ap.add_argument("--val-split", type=float, default=None,');
+  L.push('                    help="划出多少比例做验证集（0 = 不划，默认）")');
+  L.push('    ap.add_argument("--history", default=None, help="把每轮指标写成 JSON")');
+  L.push('    ap.add_argument("--log-every", type=int, default=None,');
+  L.push('                    help="每几轮往终端打一行进度（默认 1 = 每轮）")');
   if (opts && opts.quant) {
     L.push('    ap.add_argument("--quantize-int8", nargs="?", const="model_int8.npz", metavar="PATH",');
     L.push('                    help="导出 int8 权重包（.npz），并跟原模型对拍")');
@@ -9836,13 +10377,27 @@ function generatePyTorch(m, opts) {
   L.push('        cfg = {}');
   L.push('        if args.data:');
   L.push('            cfg["data"] = args.data');
+  L.push('        if args.state:');
+  L.push('            cfg["state"] = args.state');
   L.push('        if args.epochs:');
   L.push('            cfg["epochs"] = args.epochs');
-  L.push('        save_checkpoint(train(cfg), args.save)');
+  L.push('        if args.val_split is not None:');
+  L.push('            cfg["val_split"] = args.val_split');
+  L.push('        if args.history:');
+  L.push('            cfg["history"] = args.history');
+  L.push('        if args.log_every:');
+  L.push('            cfg["log_every"] = args.log_every');
+  L.push('        if args.resume:');
+  L.push('            cfg["resume"] = args.resume');
+  L.push('        net = train(cfg)');
+  L.push('        last = getattr(net, "nf_last", {})');
+  L.push('        save_checkpoint(net, args.save, cfg=last.get("cfg"), opt=last.get("opt"),');
+  L.push('                        sched=last.get("sched"), epoch=last.get("epoch", 0),');
+  L.push('                        history=last.get("history"), best=last.get("best"))');
   L.push('        done = True');
   L.push('    if not done:');
   L.push('        torch.manual_seed(0)');
-  L.push('        net = HandBuiltNet()');
+        L.push('        net = HandBuiltNet().eval()');
   L.push('        print("神经元:", net.num_neurons, " 连接:", net.num_edges, " 波次:", net.num_waves)');
   L.push('        print("参数量:", sum(p.numel() for p in net.parameters()))');
   L.push('        y = net(' + RANDX('4') + ')');
@@ -10290,8 +10845,8 @@ function buildArtifacts(target, opts) {
         '没有把强硬抑制编进去 —— 生成的 C 只做加权求和 + 激活。要它进模型就用 PyTorch 目标' +
         '（前馈网的 forward 里已经编进去了），或改成「负权重 + 高阈值」的等效写法。');
     } else if (pl.pairSrc.length && target === 'onnx') {
-      a.warnings.push('强硬抑制已经编进前馈计算的波次里（先摁住、再判激活），但 布尔 scatter 不一定被所有 ' +
-        'ONNX 运行时支持：导出失败或结果不对时改用 PyTorch 目标。');
+      a.warnings.push('强硬抑制已编进前馈波次，多个源的压制合并后再屏蔽输出。外界输入非零、其余源的输出大于 0 算亮，' +
+        '这是对编辑器阈值门控的近似；可用生成脚本的 --check-onnx 检查 ONNX 与 PyTorch 的输出是否一致。');
     }
   }
   const files = [];
@@ -10481,10 +11036,26 @@ function trainPanel() {
   h += '<label>批大小</label>' + num('batch_size', T.batch_size, '1', true);
   h += '<label>设备</label>' + sel('device', T.device, [['auto', '自动（有显卡就用）'], ['cpu', 'CPU'], ['cuda', 'CUDA']]);
   h += '<label>随机种子</label>' + num('seed', T.seed, '1', true);
+  h += '<label>验证集比例</label>' + num('val_split', T.val_split === undefined ? 0 : T.val_split, '0.05');
+  h += '<label>每几轮验证</label>' + num('val_every', T.val_every === undefined ? 1 : T.val_every, '1', true);
+  h += '<label>学习率调度</label>' + sel('scheduler', T.scheduler || 'none', [['none', '不调度'], ['cosine', '余弦退火 CosineAnnealingLR'], ['step', '阶梯 StepLR']]);
+  h += '<label>梯度裁剪</label>' + num('grad_clip', T.grad_clip === undefined ? 0 : T.grad_clip, '0.1');
+  h += '<label>每几轮打印</label>' + num('log_every', T.log_every === undefined ? 1 : T.log_every, '1', true);
+  if (graphHasState()) h += '<label>状态策略</label>' + sel('state', T.state || 'reset',
+    [['reset', '独立样本：每个批次前清空内部状态'], ['keep', '连续轨迹：跨批次保留（批次顺序 = 时间顺序）']]);
   h += '<label>数据文件</label><input type="text" data-t="data" value="' + escapeAttr(String(T.data)) + '" style="width:230px;font-family:var(--mono);background:var(--tc-0d141d);border:1px solid var(--tc-23303f);color:var(--tc-dbe7f5);padding:5px 7px;border-radius:4px">';
   h += '<div></div><div></div>';
   h += '</div>';
   h += '<div class="rline info" id="train-info">改任何一项，生成的文件会立刻跟着变。</div>';
+  h += '<div class="rline info"><b>验证集</b>（val_split）大于 0 时，生成的骨架每轮（或每 val_every 轮）在验证集上算一次损失：' +
+    '分类额外给准确率、回归额外给 MAE；划到哪份切分由随机种子定，两次跑一样。<b>学习率调度</b>和<b>梯度裁剪</b>也写进 TRAIN_CFG。' +
+    '每轮的完整指标都进训练记录（<b>--history</b>）；终端里几行由 <b>每几轮打印</b> 控制，默认 1 = 每轮一行。</div>';
+  h += '<div class="rline info"><b>断点续训</b>：生成的脚本存的是完整检查点（权重 + 优化器 / 调度器状态 + 轮次 + 随机数流 + 内部状态），' +
+    '命令行加 <b>--resume trained.pt</b> 就从那一轮接着跑；<b>--history hist.json</b> 把每轮指标写成 JSON。改结构之后旧的检查点会被明确拒绝，不会半加载。</div>';
+  if (graphHasState()) h += '<div class="rline warn">这张图里有<b>状态型神经元</b>（记忆 / 漏电积分 / 脉冲）：它们的膜电位默认<b>跨 forward 调用保留</b>。' +
+    '训练骨架按下面的「状态策略」自动处理——<b>独立样本</b>会在每个批次前调用 net.reset_state()；' +
+    '<b>连续轨迹</b>则跨批次保留，并把 DataLoader 改成 shuffle=False（批次顺序就是时间顺序）。' +
+    '生成的类里另有 reset_state() / detach_state() 两个公开接口，给手写训练循环用。</div>';
   /* 循环网（工程里有回边时才用得上）：生成出来的就是 NUM_STEPS 这个常量 */
   const recEdges = (DLG.model && DLG.model.recurrent) ? DLG.model.numRecEdges : 0;
   h += '<div class="rtitle">循环网：按时间展开多少步</div>';
@@ -10852,6 +11423,9 @@ $('#dl-report').addEventListener('click', () => {
 const AUTOSAVE = {
   on: true, delay: 8000, cooldown: 5000,
   timer: 0, busy: false, later: false, ts: 0, bytes: 0, err: '', rev: 0, savedRev: -1,
+  /* gen 是「自动保存的世代」：删除时 +1。在途那一轮保存提交前核对自己的世代，
+     对不上就放弃写入 —— 否则用户删掉之后，几百毫秒前启动的那一轮写完就把记录复活了。 */
+  gen: 0,
   db: null, avail: null,
 };
 try { const v = localStorage.getItem('nf.autosave'); if (v === '0') AUTOSAVE.on = false; } catch (e) {}
@@ -10959,9 +11533,13 @@ async function autosaveRun(force) {
   if (streamSaveBlocked()) return { ok: false, msg: '流式载入的工程还没全部载入（' + STREAM.done + ' / ' + STREAM.chunks.length + ' 块），本机自动保存先跳过' };
   AUTOSAVE.busy = true;
   const rev = AUTOSAVE.rev;
+  const gen = AUTOSAVE.gen;
   try {
     const buf = await nforge3Encode({});
     if (buf.length > 400 * 1048576) throw new Error('这一份超过 400 MB，本机自动保存先跳过，请用「保存工程」存文件');
+    /* 编码是异步的（大工程几秒），这中间用户可能已经点了「删掉自动保存」。
+       这一份是删除之前的编辑，写回去就等于把删掉的东西复活 —— 直接放弃。 */
+    if (gen !== AUTOSAVE.gen) return { ok: false, stale: true, msg: '这一轮编码期间自动保存被删掉了，已放弃写入' };
     await idbOp('readwrite', (st) => st.put({ ts: Date.now(), name: G.name, seed: G.seed, buf }, 'last'));
     AUTOSAVE.ts = Date.now(); AUTOSAVE.bytes = buf.length; AUTOSAVE.savedRev = rev; AUTOSAVE.err = '';
     const el = document.getElementById('autosave-state');
@@ -10972,7 +11550,9 @@ async function autosaveRun(force) {
     return { ok: false, msg: AUTOSAVE.err };
   } finally {
     AUTOSAVE.busy = false;
-    if (AUTOSAVE.later) { AUTOSAVE.later = false; setTimeout(() => autosaveRun(), 1500); }
+    /* 删除之后不许再自动续跑：不然「删掉」过几十秒又被自己排的这一轮写回来 */
+    if (AUTOSAVE.later && gen === AUTOSAVE.gen) { AUTOSAVE.later = false; setTimeout(() => autosaveRun(), 1500); }
+    else if (gen !== AUTOSAVE.gen) AUTOSAVE.later = false;
   }
 }
 async function autosaveProbe() {
@@ -11102,9 +11682,20 @@ function autosaveInfo() {
            haveSaved: AUTOSAVE.savedRev >= 0, delayMs: AUTOSAVE.delay,
            text: AUTOSAVE.ts ? '上次 ' + new Date(AUTOSAVE.ts).toLocaleString('zh-CN') + ' / ' + fmtBytes(AUTOSAVE.bytes) : '还没保存过' };
 }
+/* 删掉本机的自动保存。
+   光 delete 一条还不够：删除**之前**启动的那一轮保存可能正卡在编码 / 写库里，写完就把记录
+   复活了（实测：删除返回 true、记录也确实没了，几百毫秒后又冒出来）。所以这里先把世代 +1、
+   把已排队的定时器撤掉，在途那一轮提交前核对自己的世代，过期就直接放弃。
+   删完之后用户再编辑，会重新排队保存 —— 那是新的一份，不受影响。 */
 async function autosaveForget() {
-  try { await idbOp('readwrite', (st) => st.delete('last')); AUTOSAVE.ts = 0; AUTOSAVE.bytes = 0; AUTOSAVE.avail = null; return true; }
-  catch (e) { return false; }
+  AUTOSAVE.gen++;
+  if (AUTOSAVE.timer) { clearTimeout(AUTOSAVE.timer); AUTOSAVE.timer = 0; }
+  AUTOSAVE.later = false;
+  try {
+    await idbOp('readwrite', (st) => st.delete('last'));
+    AUTOSAVE.ts = 0; AUTOSAVE.bytes = 0; AUTOSAVE.avail = null; AUTOSAVE.savedRev = -1; AUTOSAVE.err = '';
+    return true;
+  } catch (e) { return false; }
 }
 
 /* ==========================================================================
@@ -11124,7 +11715,8 @@ function opsSerial() {
       land: o.land ? Array.from(o.land) : null,
       attrs: Object.assign({}, o.attrs), fold: o.fold.slice(),
       params: o.params.map((p) => ({ name: p.name, dtype: p.dtype, shape: p.shape.slice(),
-                                     data: Array.from(p.data) })),
+                                     data: Array.from(p.data),
+                                     role: p.role || 'weight', same: p.same || '' })),
       note: o.note, color: o.color | 0, colOn: o.colOn ? 1 : 0,
       pos: o.pos ? { x: o.pos.x, y: o.pos.y, z: o.pos.z } : null,
     });
@@ -11210,7 +11802,8 @@ function deserialize(o) {
         makeOp(r.op, r.name, {
           id: r.id, ins: r.ins, outShape: r.outShape, land: r.land,
           attrs: r.attrs, fold: r.fold, note: r.note, color: r.color, colOn: r.colOn, pos: r.pos,
-          params: (r.params || []).map((p) => ({ name: p.name, dtype: p.dtype, shape: p.shape, data: p.data })),
+          params: (r.params || []).map((p) => ({ name: p.name, dtype: p.dtype, shape: p.shape, data: p.data,
+                                                 role: p.role, same: p.same })),
         });
       } catch (err) { console.warn('算子节点读不进来，已跳过：' + err.message); }
     }
@@ -11259,7 +11852,7 @@ function deserialize(o) {
   nPlast.fill(0, 0, count); nHard.fill(0, 0, count);
   PLAST = { list: [Object.assign({}, PLAST_NONE)] };
   if (o.plast) {
-    if (Array.isArray(o.plast.list)) for (let i = 1; i < o.plast.list.length; i++) PLAST.list.push(plastNormProf(o.plast.list[i]));
+    if (Array.isArray(o.plast.list)) for (let i = 1; i < o.plast.list.length && PLAST.list.length < PLAST_MAX; i++) PLAST.list.push(plastNormProf(o.plast.list[i]));
     if (o.plast.of) for (const k in o.plast.of) {
       const i = parseInt(k, 10);
       if (!(i >= 0 && i < count)) continue;
@@ -11701,11 +12294,22 @@ function nf3OpDirEntry(o, rank) {
     out: o.outShape.slice(),
     land: opRangeEnc(o.land, rank),
     attrs: Object.assign({}, o.attrs), fold: o.fold.slice(),
-    params: o.params.map((p) => ({ name: p.name, dtype: p.dtype, shape: p.shape.slice() })),
+    params: opDirParams(o),
     note: o.note, color: o.color | 0, colOn: o.colOn ? 1 : 0,
   };
   if (o.pos) d.pos = { x: o.pos.x, y: o.pos.y, z: o.pos.z };
   return d;
+}
+/* 文件头目录里的参数表：角色和「跟谁共享」只在非默认时才写（老软件读到不认识的键会忽略）。
+   参数体（nf3OpBlobEncode）里只有名字 / 类型 / 形状 / 数值，角色不放那边 —— 改角色不用重写数值。 */
+function opDirParams(o) {
+  return o.params.map((p) => {
+    const d = { name: p.name, dtype: p.dtype, shape: p.shape.slice() };
+    const r = p.role || 'weight';
+    if (r !== 'weight') d.role = r;
+    if (p.same) d.same = String(p.same);
+    return d;
+  });
 }
 /* 编码算子参数区：返回 { dir, parts, blobs }（blobs 还没压缩，交给调用方分段压） */
 function nf3OpsPartsRaw(rank) {
@@ -11837,7 +12441,7 @@ function plastApplyDoc(pd, map, nn) {
   if (!pd) { PLAST = { list: [Object.assign({}, PLAST_NONE)] }; plastBump(); return; }
   if (pd.list && pd.list.length) {
     const nx = [Object.assign({}, PLAST_NONE)];
-    for (let i = 1; i < pd.list.length; i++) nx.push(plastNormProf(pd.list[i]));
+    for (let i = 1; i < pd.list.length && nx.length < PLAST_MAX; i++) nx.push(plastNormProf(pd.list[i]));
     PLAST = { list: nx };
   }
   for (let k = 0; k < pd.items.length; k++) {
@@ -12400,11 +13004,88 @@ async function nforge3DecodeChunk(ctx, meta) {
   if (raw.byteOffset % 4 !== 0) raw = raw.slice();
   return raw;
 }
+/* ==========================================================================
+   12.5.1 打开前的整体预检（审计 B20）
+   --------------------------------------------------------------------------
+   以前 nforge3Apply 是一边解压一边直接往 nPos / eSrc / blocks 里写：第二个块坏了的话，
+   第一个块已经落进去、名字和分组也已经清掉了 —— 用户没保存的旧工程就半残了。
+   现在把「会抛错的事」全提到**提交之前**，而且这一步是纯读、一个字节都不写全局：
+     ① 每个要载入的神经元块：范围在文件里 / 能解压 / 解出来的字节够放它声明的布局
+     ② 权重块区：整段在文件里 / 能解出来 / 每一块过一遍 blockCheck（用**新编号**判越界）
+     ③ 算子参数区：整段在文件里 / 能解出来
+     ④ 尾部三段（对话 / 可塑性 / 显示与分组）：见下面
+   验不过就抛，图上什么都没动。代价只有神经元块解两遍（第二遍才是写进全局那一遍）；
+   权重块 / 算子区的结果直接交给提交那一步用，不多解一次、也不多留一份拷贝。
+
+   尾部三段的规矩：这三段排在文件最后，所以「物理长度没盖住它」只可能是保存完又剪了尾巴，
+   不是数据写坏了 —— 这种情况按「没有这一段」处理，留一句提示，图照常开（老行为，不动）。
+   可字节确实**在**文件里、内容却是坏的（坏 codec / 坏 JSON / 长度对不上）就是真损坏，直接拒。
+   对话存档是例外：它纯粹是那次对话的记录，坏了也只提示，不拦着开图。
+   ========================================================================== */
+async function nforge3Preflight(ctx, H, pick, all, sN, nMap) {
+  const u8 = ctx.u8;
+  for (let ci = 0; ci < pick.length; ci++) {
+    const c = pick[ci];
+    const raw = await nforge3DecodeChunk(ctx, c);
+    const need = nf3Layout(c.n1 - c.n0, c.e1 - c.e0).total;
+    if (raw.length < need) {
+      throw new Error('第 ' + c.i + ' 块的数据不够：解出来 ' + raw.length + ' 字节，按它声明的 ' +
+        (c.n1 - c.n0) + ' 神经元 / ' + (c.e1 - c.e0) + ' 连接需要 ' + need + ' 字节。文件可能被截断或块头被改过。');
+    }
+  }
+  const nnTotal = all ? (pick[pick.length - 1].n1 | 0) : sN;
+  let blocks = null;
+  if (H.blocks && H.blocks.count) {
+    const B = H.blocks;
+    const rs = nf3BlockRegionBase(ctx.dataStart, H);
+    if (rs + (B.off || 0) + B.len > u8.length) throw new Error('权重块区超出文件末尾，文件可能被截断');
+    const want = all ? null : nf3PartsNear(B.parts, pick);
+    blocks = await nf3BlockRegionRead(B, want,
+      async (o, l) => u8.slice(rs + o, rs + o + l), all ? null : nMap, 0);
+    for (let i = 0; i < blocks.list.length; i++) {
+      const bp = blocks.list[i];
+      blockCheck(bp.src, bp.dst, bp.w, nnTotal);
+    }
+  }
+  let ops = null;
+  if (H.ops && H.ops.count) {
+    const O = H.ops;
+    const os0 = nf3OpsRegionBase(ctx.dataStart, H);
+    if (os0 + (O.off || 0) + O.len > u8.length) throw new Error('算子参数区超出文件末尾，文件可能被截断');
+    ops = await nf3OpsRegionRead(O, null, async (o, l) => u8.slice(os0 + o, os0 + o + l));
+  }
+  const sliceAt = (base, name) => async (o, l) => {
+    if (base + o + l > u8.length) throw new Error(name + '超出文件末尾，文件可能被截断');
+    return u8.slice(base + o, base + o + l);
+  };
+  const aiBase = nf3AiRegionBase(ctx.dataStart, H), aiLen = (H.ai && H.ai.len) || 0;
+  const pBase = nf3PlastRegionBase(ctx.dataStart, H), pLen = (H.plast && H.plast.len) || 0;
+  const xBase = nf3ExtRegionBase(ctx.dataStart, H), xLen = (H.ext && H.ext.len) || 0;
+  let aiDoc = null, aiNote = '';
+  if (aiLen) {
+    if (aiBase + aiLen > u8.length) aiNote = '文件尾部被截断了';
+    else {
+      try { aiDoc = await nf3AiDocRead(sliceAt(aiBase, '对话存档'), H); }
+      catch (e) { aiNote = (e && e.message) || String(e); }
+    }
+  }
+  let plastDoc = null, plastNote = '';
+  if (pLen) {
+    if (pBase + pLen > u8.length) plastNote = '文件尾部被截断了';
+    else plastDoc = await nf3PlastDocRead(sliceAt(pBase, '可塑性区'), H);
+  }
+  let extDoc = null, extNote = '';
+  if (xLen) {
+    if (xBase + xLen > u8.length) extNote = '文件尾部被截断了';
+    else extDoc = await nf3ExtDocRead(sliceAt(xBase, '显示与分组数据'), H);
+  }
+  return { blocks: blocks, ops: ops, aiDoc: aiDoc, aiNote: aiNote,
+           plastDoc: plastDoc, plastNote: plastNote, extDoc: extDoc, extNote: extNote };
+}
 /* 把块写回全局数组。ids 为空 = 全部载入。
    只载入部分块时神经元会重新编号成连续下标（中间那些块没载入），
    所以编号跟原文件不一定一样——面板里会写明这一点。 */
 async function nforge3Apply(ctx, ids) {
-  streamOff();   /* 整份载入和流式载入是两条路，别叠着 */
   const H = ctx.header, allChunks = H.chunks || [];
   const all = !ids || !ids.length;
   const pick = all ? allChunks : allChunks.filter((c) => ids.indexOf(c.i) >= 0);
@@ -12420,8 +13101,6 @@ async function nforge3Apply(ctx, ids) {
       fmt(CAP_HARD_N) + ' 神经元 / ' + fmt(CAP_HARD_E) + ' 连接）。这是内存物理上限，不是文件的问题。' +
       '办法：用「文件 → 分块载入」只挑需要的块（左上角那块面板按块选），或者打开流式载入只按视野加载。');
   }
-  ensureNeuronCapacity(sN + 8);
-  ensureEdgeCapacity(sE + 8);
   let nMap = null;
   if (!all) {
     nMap = new Int32Array(N).fill(-1);
@@ -12430,6 +13109,11 @@ async function nforge3Apply(ctx, ids) {
       for (let i = pick[ci].n0; i < pick[ci].n1; i++) nMap[i] = k++;
     }
   }
+  /* ---- 提交前把所有会抛错的事做完；验不过就抛，图上什么都没动（审计 B20）---- */
+  const plan = await nforge3Preflight(ctx, H, pick, all, sN, nMap);
+  streamOff();   /* 整份载入和流式载入是两条路，别叠着。放在预检之后：预检没过就别把流式那边掐了 */
+  ensureNeuronCapacity(sN + 8);
+  ensureEdgeCapacity(sE + 8);
   nName.clear();
   clearGroups();
   /* 隐藏的连接按文件里的边序号存。只载入一部分块时边会被丢、下标整体前移，
@@ -12523,14 +13207,8 @@ async function nforge3Apply(ctx, ids) {
      "一块一段"的块区还能再省一步：跟选中块的包围盒不相交的段，连读都不读 ---- */
   clearBlocks(); selBlocks.clear();
   let blkLoaded = 0, blkDropped = 0, blkSkipped = 0, blkBytes = 0;
-  if (H.blocks && H.blocks.count) {
-    const B = H.blocks;
-    const rs = nf3BlockRegionBase(ctx.dataStart, H);
-    const re = rs + (B.off || 0) + B.len;
-    if (re > ctx.u8.length) throw new Error('权重块区超出文件末尾，文件可能被截断');
-    const want = all ? null : nf3PartsNear(B.parts, pick);
-    const br = await nf3BlockRegionRead(B, want,
-      async (o, l) => ctx.u8.slice(rs + o, rs + o + l), all ? null : nMap);
+  if (plan.blocks) {
+    const br = plan.blocks;
     for (let i = 0; i < br.list.length; i++) {
       const bp = br.list[i];
       makeBlock(bp.src, bp.dst, bp.w, { lock: bp.lock, label: '块 ' + (i + 1), sg: bp.sg });
@@ -12541,13 +13219,8 @@ async function nforge3Apply(ctx, ids) {
   /* ---- 算子节点（算子级聚合块）：也走独立分区。参数跟神经元没关系，
      所以整段读；只有"按段挑着读"这一条优化，留给将来的近距载入 ---- */
   clearOps();
-  if (H.ops && H.ops.count) {
-    const O = H.ops;
-    const os0 = nf3OpsRegionBase(ctx.dataStart, H);
-    const oe = os0 + (O.off || 0) + O.len;
-    if (oe > ctx.u8.length) throw new Error('算子参数区超出文件末尾，文件可能被截断');
-    const or = await nf3OpsRegionRead(O, null,
-      async (o, l) => ctx.u8.slice(os0 + o, os0 + o + l));
+  if (plan.ops) {
+    const or = plan.ops;
     const rm = all ? null : nMap;
     for (let i = 0; i < or.list.length; i++) {
       try { makeOpFromDir(or.list[i].dir, or.list[i].params, rm); }
@@ -12560,40 +13233,21 @@ async function nforge3Apply(ctx, ids) {
   ifaceApply(H.iface);
   /* 工程文件里带着的对话（老文件没有这一段）：有就接着用，没有就照旧开一段新的。
      放在这儿是因为载入历史会话时要拿当前状态生成系统提示词，得等图和接口都就位。 */
-  try {
-    const aiBase = nf3AiRegionBase(ctx.dataStart, H);
-    const doc = await nf3AiDocRead(async (o, l) => {
-      if (aiBase + o + l > ctx.u8.length) throw new Error('对话存档超出文件末尾，文件可能被截断');
-      return ctx.u8.slice(aiBase + o, aiBase + o + l);
-    }, H);
-    if (doc) aiSessImport(doc, '打开工程');
-  } catch (e) {
-    aiPush({ role: 'note', text: '这份工程里的对话没读回来：' + ((e && e.message) || e) + '（图本身没事）' });
+  /* 三段都在预检里读过、验过了（见 nforge3Preflight）；这里只负责落到状态上，
+     不会再抛错 —— 抛错就等于「提交到一半失败」，那正是 B20 要消灭的东西。 */
+  if (plan.aiDoc) aiSessImport(plan.aiDoc, '打开工程');
+  else if (plan.aiNote) aiPush({ role: 'note', text: '这份工程里的对话没读回来：' + plan.aiNote + '（图本身没事）' });
+  /* 可塑性（档位表 + 谁用哪一档）：老工程没有这一段 -> 全部按「固定（不学习）」。
+     读不出来时也按「没有这一段」处理，不能把上一个工程带的档位留在数组里。 */
+  if (plan.plastNote) {
+    console.warn('可塑性数据没读回来：' + plan.plastNote);
+    aiPush({ role: 'note', text: '这份工程里的可塑性档位没读回来：' + plan.plastNote + '（图和权重没事）' });
   }
-  /* 可塑性（档位表 + 谁用哪一档）：老工程没有这一段 -> 全部按「固定（不学习）」。 */
-  try {
-    const pBase = nf3PlastRegionBase(ctx.dataStart, H);
-    const pd = await nf3PlastDocRead(async (o, l) => {
-      if (pBase + o + l > ctx.u8.length) throw new Error('可塑性区超出文件末尾，文件可能被截断');
-      return ctx.u8.slice(pBase + o, pBase + o + l);
-    }, H);
-    plastApplyDoc(pd, all ? null : nMap, nn);
-  } catch (e) {
-    console.warn('可塑性数据没读回来：' + ((e && e.message) || e));
-    aiPush({ role: 'note', text: '这份工程里的可塑性档位没读回来：' + ((e && e.message) || e) + '（图和权重没事）' });
-  }
+  plastApplyDoc(plan.plastNote ? null : plan.plastDoc, all ? null : nMap, nn);
   /* 手动隐藏 + 多归属分组（老文件没有这一段 -> 全当没有）。
      放在这里是因为它要用到已经定下来的编号映射和边表。 */
-  try {
-    const xBase = nf3ExtRegionBase(ctx.dataStart, H);
-    const ext = await nf3ExtDocRead(async (o, l) => {
-      if (xBase + o + l > ctx.u8.length) throw new Error('显示与分组数据超出文件末尾，文件可能被截断');
-      return ctx.u8.slice(xBase + o, xBase + o + l);
-    }, H);
-    extApplyDoc(ext, all, nMap, nn, eMap);
-  } catch (e) {
-    console.warn('显示与分组数据没读回来：' + ((e && e.message) || e));
-  }
+  if (plan.extNote) console.warn('显示与分组数据没读回来：' + plan.extNote);
+  else extApplyDoc(plan.extDoc, all, nMap, nn, eMap);
   seedRand(H.seed === undefined ? DEF_SEED : H.seed);
   rebuildAdjacency(); rebuildScene(); clearSelection();
   resetHistory(); refreshAll(); updateProjName();
@@ -12658,6 +13312,7 @@ const STREAM = {
   on: false, auto: true, busy: false,
   name: '', src: null, headLen: 0, header: null,
   chunks: [], resident: null, nBase: null, eBase: null, parked: null,
+  pending: new Map(),   /* 同一块只读一次；换图 / 重置时换 Map，旧读请求不能提交到新图。 */
   total: { n: 0, e: 0 }, done: 0, totalBytes: 0, readBytes: 0,
   minPx: 26, budgetMs: 6, maxN: 0, droppedEdges: 0, lastMs: 0, batches: 0,
   plastItems: null, plastRange: null,
@@ -12808,7 +13463,7 @@ function nf3CheckIndex(H) {
     if (pm.codec === 'raw' && pm.len !== (pm.count | 0) * 6) {
       bad.push('可塑性区长度跟条数对不上：' + pm.len + ' != ' + ((pm.count | 0) * 6));
     }
-    if (Array.isArray(pm.list) && pm.list.length > 255) bad.push('可塑性档位超过 255 档（编号是 1 字节装不下）');
+    if (Array.isArray(pm.list) && pm.list.length > PLAST_MAX) bad.push('可塑性档位超过 ' + PLAST_MAX + ' 档（编号是 1 字节装不下）');
     if ((pm.count | 0) > (H.counts && H.counts.neurons ? H.counts.neurons : 0)) {
       bad.push('可塑性区条数比神经元还多：' + pm.count);
     }
@@ -12950,9 +13605,11 @@ function streamLiveN(fid) {
 }
 async function streamChunkBytes(k) {
   const c = STREAM.chunks[k];
+  const pending = STREAM.pending;
   const base = NF3_HEAD_OFF + STREAM.headLen;
   const v = await STREAM.src.chunk(base + c.off, base + c.off + c.len);
-  STREAM.readBytes += v.length;
+  if (v.length !== c.len) throw new Error('流式块长度不完整，文件可能被截断');
+  if (STREAM.pending === pending) STREAM.readBytes += v.length;
   return v;
 }
 
@@ -12996,24 +13653,29 @@ function streamPlastApplyChunk(k, nBase) {
   return n;
 }
 async function streamMaterialize(k) {
+  if (!STREAM.on || !STREAM.chunks[k] || STREAM.resident[k]) return 0;
+  const pending = STREAM.pending;
+  if (pending.has(k)) return pending.get(k);
+  const task = streamMaterializeRead(k, pending);
+  pending.set(k, task);
+  try { return await task; }
+  catch (err) { if (!STREAM.on || STREAM.pending !== pending) return 0; throw err; }
+  finally { if (pending.get(k) === task) pending.delete(k); }
+}
+async function streamMaterializeRead(k, pending) {
   const c = STREAM.chunks[k];
-  if (!c || STREAM.resident[k]) return 0;
   const n = c.n1 - c.n0, e = c.e1 - c.e0;
-  if (!ensureNeuronCapacity(G.n + n + 8) || !ensureEdgeCapacity(G.e + e + 8)) {
-    throw new Error('已到编辑器绝对上限（' + fmt(CAP_HARD_N) + ' 神经元 / ' + fmt(CAP_HARD_E) + ' 连接），不能再载入更多块。' +
-      '这是内存物理上限——这台机器装不下了，不是文件的问题。');
-  }
-  const nBase = G.n;
-  STREAM.nBase[k] = nBase;
-  STREAM.eBase[k] = G.e;
-  STREAM.resident[k] = 1;
-  STREAM.done++;
-
   let raw = await streamChunkBytes(k);
   if (c.codec === 'deflate') raw = await nf3Inflate(raw);
   else if (c.codec !== 'raw') throw new Error('不认识的压缩方式：' + c.codec);
+  if (!STREAM.on || STREAM.pending !== pending) return 0;
   if (raw.byteOffset % 4 !== 0) raw = raw.slice();
   const L2 = nf3Layout(n, e);
+  /* 旧 Python 写入器曾在块尾留下零填充，合法旧文件可能长于当前布局。
+     布局给的是最小长度；有 raw 声明时另外校验实际解压长度，不能把兼容填充当损坏。 */
+  if (raw.byteLength < L2.total || (c.raw !== undefined && raw.byteLength !== c.raw)) {
+    throw new Error('流式块解压后的长度不符，文件可能损坏');
+  }
   const at4 = (o) => {
     const b = raw.byteOffset + o;
     if (b % 4 !== 0) throw new Error('块内偏移没有对齐，文件可能损坏');
@@ -13023,6 +13685,26 @@ async function streamMaterialize(k) {
   const thr = new Float32Array(raw.buffer, at4(L2.thr), n);
   const bias = new Float32Array(raw.buffer, at4(L2.bias), n);
   const col = new Float32Array(raw.buffer, at4(L2.col), n * 3);
+  const src = new Uint32Array(raw.buffer, at4(L2.src), e);
+  const dst = new Uint32Array(raw.buffer, at4(L2.dst), e);
+  const w = new Float32Array(raw.buffer, at4(L2.w), e);
+  for (let j = 0; j < e; j++) {
+    if (src[j] < c.n0 || src[j] >= c.n1 || streamChunkOf(dst[j]) < 0) {
+      throw new Error('流式块连接端点越界，文件可能损坏');
+    }
+  }
+  if (!ensureNeuronCapacity(G.n + n + 8) || !ensureEdgeCapacity(G.e + e + STREAM.parked[k].length + 8)) {
+    throw new Error('已到编辑器绝对上限（' + fmt(CAP_HARD_N) + ' 神经元 / ' + fmt(CAP_HARD_E) + ' 连接），不能再载入更多块。' +
+      '这是内存物理上限——这台机器装不下了，不是文件的问题。');
+  }
+  /* 所有会失败的读取、解压、长度和容量检查先做完。下面没有 await，
+     并行读取的不同块按完成顺序追加，不会预占同一个尾部区间。 */
+  const nBase = G.n;
+  STREAM.nBase[k] = nBase;
+  STREAM.eBase[k] = G.e;
+  nHid.fill(0, nBase, nBase + n);
+  nPlast.fill(0, nBase, nBase + n);
+  nHard.fill(0, nBase, nBase + n);
   for (let i = 0; i < n; i++) {
     const t = nBase + i, s3 = i * 3, t3 = t * 3;
     nPos[t3] = pos[s3]; nPos[t3 + 1] = pos[s3 + 1]; nPos[t3 + 2] = pos[s3 + 2];
@@ -13036,9 +13718,6 @@ async function streamMaterialize(k) {
   streamPlastApplyChunk(k, nBase);
   G.n = nBase + n;
 
-  const src = new Uint32Array(raw.buffer, at4(L2.src), e);
-  const dst = new Uint32Array(raw.buffer, at4(L2.dst), e);
-  const w = new Float32Array(raw.buffer, at4(L2.w), e);
   let ee = G.e;
   histLockDirty = 1; histHidDirty = 1; histWDirty = 1; histTopoDirty = 1;
   for (let j = 0; j < e; j++) {
@@ -13074,6 +13753,8 @@ async function streamMaterialize(k) {
     }
   }
   G.e = ee;
+  STREAM.resident[k] = 1;
+  STREAM.done++;
   return n;
 }
 
@@ -13442,6 +14123,7 @@ let streamQuiet = false;
 let streamHoldOn = false;   /* 上限撞死的提示只弹一次 */
 async function streamTick() {
   if (!STREAM.on || STREAM.busy || !STREAM.auto || streamQuiet) return;
+  const session = STREAM.pending;
   let picks = streamPickChunks();
   if (!picks.length) return;
   STREAM.busy = true;
@@ -13461,15 +14143,22 @@ async function streamTick() {
       if (!picks.length) return;
     }
     const nOld = G.n, eOld = G.e;
-    for (let i = 0; i < picks.length; i++) {
-      const c = STREAM.chunks[picks[i]], cn = c.n1 - c.n0;
-      if (G.n + cn > hard) break;
-      /* 软预算：一块就超预算时（G.n 还是 0，没东西可丢）也得放它进来，
-         否则一块都载不进，界面看着像卡死 */
-      if (G.n > 0 && G.n + cn > soft) { held = true; break; }
-      await streamMaterialize(picks[i]);
-      loaded++;
-      if (performance.now() - t0 >= STREAM.budgetMs) break;
+    try {
+      for (let i = 0; i < picks.length; i++) {
+        const c = STREAM.chunks[picks[i]], cn = c.n1 - c.n0;
+        if (G.n + cn > hard) break;
+        /* 软预算：一块就超预算时（G.n 还是 0，没东西可丢）也得放它进来，
+           否则一块都载不进，界面看着像卡死 */
+        if (G.n > 0 && G.n + cn > soft) { held = true; break; }
+        await streamMaterialize(picks[i]);
+        if (STREAM.pending !== session || !STREAM.on) return;
+        loaded++;
+        if (performance.now() - t0 >= STREAM.budgetMs) break;
+      }
+    } finally {
+      if (STREAM.pending === session && STREAM.on && loaded) {
+        STREAM.batches++; streamCommit(nOld, eOld);
+      }
     }
     if (held) {
       if (!streamHoldOn) {
@@ -13478,7 +14167,6 @@ async function streamTick() {
       }
     } else streamHoldOn = false;
     if (loaded) {
-      STREAM.batches++; streamCommit(nOld, eOld);
       /* 自动模式：新块进来了，顺手把"跟已驻留块有关的"权重段补进来。
          已读过的段有账本，所以反复调用不会重复建块。 */
       if (STREAM.blkAuto && STREAM.header && STREAM.header.blocks && STREAM.header.blocks.count) {
@@ -13487,29 +14175,39 @@ async function streamTick() {
       }
     }
   } catch (err) {
+    if (STREAM.pending !== session || !STREAM.on) return;
     STREAM.auto = false;
     toast('流式载入停了：' + err.message, 'err');
     const cb = document.getElementById('stm-auto');
     if (cb) cb.checked = false;
   } finally {
-    STREAM.busy = false;
-    STREAM.lastMs = performance.now() - t0;
-    if (loaded) requestRender();
+    if (STREAM.pending === session) {
+      STREAM.busy = false;
+      STREAM.lastMs = performance.now() - t0;
+      if (loaded) requestRender();
+    }
   }
 }
 
 /* 手动载入指定的块（面板 / 脚本用）；自动载入走的是 streamTick */
 async function streamLoadChunks(ids) {
   if (!STREAM.on) return null;
+  const session = STREAM.pending;
   const list = (ids || []).slice();
   const nOld = G.n, eOld = G.e, t0 = performance.now();
-  for (let i = 0; i < list.length; i++) {
-    const k = list[i];
-    if (k < 0 || k >= STREAM.chunks.length || STREAM.resident[k]) continue;
-    await streamMaterialize(k);
+  try {
+    for (let i = 0; i < list.length; i++) {
+      const k = list[i];
+      if (k < 0 || k >= STREAM.chunks.length || STREAM.resident[k]) continue;
+      await streamMaterialize(k);
+      if (STREAM.pending !== session || !STREAM.on) return streamState();
+    }
+  } finally {
+    if (STREAM.pending === session && STREAM.on) {
+      streamCommit(nOld, eOld);
+      STREAM.lastMs = performance.now() - t0;
+    }
   }
-  streamCommit(nOld, eOld);
-  STREAM.lastMs = performance.now() - t0;
   return streamState();
 }
 
@@ -13527,6 +14225,8 @@ async function streamOpenFromSource(src) {
   if (bad.length) throw new Error('文件头索引表不自洽：' + bad[0]);
 
   const chunks = header.chunks || [];
+  STREAM.pending = new Map();
+  streamQuiet = false;
   STREAM.on = true; STREAM.busy = false;
   STREAM.src = src; STREAM.name = src.name; STREAM.headLen = headLen; STREAM.header = header;
   STREAM.chunks = chunks;
@@ -13600,7 +14300,7 @@ async function streamOpenFromSource(src) {
       return src.head(pBase + o, pBase + o + l);
     }, header);
     PLAST = { list: [Object.assign({}, PLAST_NONE)] };
-    if (pd && pd.list) for (let i = 1; i < pd.list.length; i++) PLAST.list.push(plastNormProf(pd.list[i]));
+    if (pd && pd.list) for (let i = 1; i < pd.list.length && PLAST.list.length < PLAST_MAX; i++) PLAST.list.push(plastNormProf(pd.list[i]));
     if (pd && pd.items.length) {
       pd.items.sort((a, b) => a[0] - b[0]);
       STREAM.plastItems = pd.items;
@@ -13665,26 +14365,32 @@ function frameAllBoxes() {
 /* 一次性把所有块都读进来（然后是权重块区） */
 async function streamLoadAll() {
   if (!STREAM.on) return null;
+  const session = STREAM.pending;
   STREAM.auto = false; streamQuiet = true;
   const cb = document.getElementById('stm-auto');
   if (cb) cb.checked = false;
   const t0 = performance.now();
   try {
-    let left = 0;
-    for (let k = 0; k < STREAM.chunks.length; k++) if (!STREAM.resident[k]) left++;
-    while (left > 0) {
+    /* 自动读取可能已经在路上：每批重新看驻留表，不能用入口时的剩余数递减。 */
+    while (STREAM.resident.some((v) => !v)) {
       const nOld = G.n, eOld = G.e;
       let batch = 0;
-      for (let k = 0; k < STREAM.chunks.length && batch < 8; k++) {
-        if (STREAM.resident[k]) continue;
-        await streamMaterialize(k);
-        batch++; left--;
+      try {
+        for (let k = 0; k < STREAM.chunks.length && batch < 8; k++) {
+          if (STREAM.resident[k]) continue;
+          await streamMaterialize(k);
+          if (STREAM.pending !== session || !STREAM.on) return streamState();
+          batch++;
+        }
+      } finally {
+        if (STREAM.pending === session && STREAM.on) streamCommit(nOld, eOld);
       }
-      streamCommit(nOld, eOld);
       setStatus('正在载入 ' + STREAM.done + ' / ' + STREAM.chunks.length + ' 块 …');
       await new Promise((r) => setTimeout(r, 0));
+      if (STREAM.pending !== session || !STREAM.on) return streamState();
     }
     const br = await streamLoadBlocks();
+    if (STREAM.pending !== session || !STREAM.on) return streamState();
     const ms = performance.now() - t0;
     toast('已全部载入：' + fmt(G.n) + ' 神经元 / ' + fmt(G.e) + ' 连接' +
       (br && br.loaded ? ' / ' + fmt(br.loaded) + ' 个权重块' +
@@ -13693,10 +14399,12 @@ async function streamLoadAll() {
   } catch (err) {
     toast('载入失败：' + err.message, 'err');
   } finally {
-    streamQuiet = false;
-    setStatus('就绪');
-    updateStreamHint();
-    requestRender();
+    if (STREAM.pending === session) {
+      streamQuiet = false;
+      setStatus('就绪');
+      updateStreamHint();
+      requestRender();
+    }
   }
   return streamState();
 }
@@ -13780,6 +14488,8 @@ async function streamLoadBlocks(ids) {
 /* 释放全部已载入的块，回到摘要视图（不做驱逐，这里是整体重来一次） */
 function streamResetToSummary() {
   if (!STREAM.on) return null;
+  STREAM.pending = new Map();
+  streamQuiet = false;
   for (let k = 0; k < STREAM.chunks.length; k++) {
     STREAM.resident[k] = 0; STREAM.nBase[k] = -1; STREAM.eBase[k] = -1; STREAM.parked[k] = [];
   }
@@ -13820,6 +14530,8 @@ function openProjectStream() {
 
 function streamOff() {
   if (!STREAM.on) return;
+  STREAM.pending = new Map();
+  streamQuiet = false;
   STREAM.on = false; STREAM.busy = false; STREAM.auto = false;
   STREAM.src = null; STREAM.header = null; STREAM.chunks = [];
   STREAM.resident = null; STREAM.nBase = null; STREAM.eBase = null; STREAM.parked = null;
@@ -14620,7 +15332,11 @@ function computeSimulation(seeds, opts) {
   const prev = stepped ? new Float32Array(N) : null;      /* 上一拍的值：回边读它 */
   const act = stepped ? new Uint8Array(N) : null;         /* 这一拍活过的神经元 */
   const actPrev = stepped ? new Uint8Array(N) : null;     /* 上一拍活过的神经元 */
-  const st = hasState ? new Float64Array(N) : null;       /* 状态型神经元的膜电位：跨拍保留、不清零 */
+  /* 状态型神经元的膜电位：跨**拍**保留、不清零。外面（接口运行时）也可以把上一帧留下来的
+     传进来（opts.stIn），那就接着跨**帧**算——导出模型的连续 forward 就是这个语义。
+     长度对不上（图改了、工程换了）就重新从零开始，绝不拿旧图的膜电位往新图上套。 */
+  const stCarried = !!(hasState && opts.stIn && opts.stIn.length === N);
+  const st = hasState ? (stCarried ? opts.stIn : new Float64Array(N)) : null;
   const waveOf = new Int32Array(N).fill(-1);          /* 第一次点亮它的「全局波次」 */
   /* 本拍内的波次：前向边看这个。单拍（前馈网）时它和 waveOf 是同一个数组，
      所以老路的行为一个字都没变。 */
@@ -14821,6 +15537,8 @@ function computeSimulation(seeds, opts) {
            /* 耗时拆开报，好在界面上说清楚"卡在哪一段"：计划 / 传播 */
            planMs: Math.round(planMs * 10) / 10, propMs: Math.round((performance.now() - propT0) * 10) / 10,
            learned: learned,
+           /* 这一帧跑完的膜电位（接口运行时按模式决定留不留）；stCarried 说明用的是不是外面传进来的 */
+           stOut: st, stCarried: stCarried,
            push: !!pushOK };
 }
 
@@ -15078,6 +15796,18 @@ function ifaceRuntimeHTML() {
     '<div class="stat"><span>状态</span><b id="rt-live">—</b></div>' +
     '<label class="f">按键值保持多久（ms）<input type="number" data-rt="hold" min="30" step="20" value="' + (IFACE.holdMs | 0) + '"></label>' +
     '<label class="f">运行时播报速度（ms/波）<input type="number" data-rt="speed" min="40" step="10" value="' + (IFACE.speed | 0) + '"></label>' +
+    (graphHasState()
+      ? '<label class="f">状态型神经元的膜电位<select data-rt="stmode">' +
+        '<option value="reset"' + (IFACE.stMode !== 'keep' ? ' selected' : '') + '>每帧从零开始（单帧预览）</option>' +
+        '<option value="keep"' + (IFACE.stMode === 'keep' ? ' selected' : '') + '>跨帧保留（和导出模型一致）</option>' +
+        '</select></label>' +
+        '<div class="stat"><span>内部状态</span><b id="rt-st">' + (IFACE.st ? '已保留一帧' : '—') + '</b></div>' +
+        '<div class="row"><button data-rt="streset">清空内部状态</button></div>' +
+        '<div class="hint">这张图里有<b>状态型神经元</b>：它们的膜电位在<b>导出的模型里跨调用保留</b>。' +
+        '选「跨帧保留」，界面上的连续运行就和导出模型是同一个状态机；选「每帧从零开始」时每一帧都是一次独立的单帧预览，' +
+        '两者结果本来就该不一样。没有信号的帧不推进状态（接口运行时只在有信号时前向）。' +
+        '编译出来的 <b>hand_built_net.py</b> 里对应的是 net.reset_state() / TRAIN_CFG["state"]。</div>'
+      : '') +
     '<div class="hint" data-i18n="h-ifacerthold">键盘输入只在<b>软件窗口是前台</b>时收得到——这是操作系统定的，任何软件都改不了。' +
     '想让别的程序把信号送进来，用下面的「信号通道」（桌面版）；也可以直接调脚本接口 NF.ifaceFeed(编号, 值)。</div>' +
     '</div></div>';
@@ -15221,6 +15951,10 @@ function ifaceChanCardHTML(c) {
   h += '<label class="f">周期 ms<input type="number" data-rt="chan-period" data-id="' + c.id + '" min="0" step="10" value="' + (c.period | 0) + '"></label>';
   h += '</div>';
   h += '<label class="f rwide">信号位<input type="text" data-rt="chan-slots" data-id="' + c.id + '" value="' + escapeAttr(c.slots) + '" placeholder="12, 13*2, 20*0.5+0.1"></label>';
+  if ((c.xp === 'tcp' || c.xp === 'tcpc' || c.xp === 'serial') && (c.codec === 'f32' || c.codec === 'i16')) {
+    h += '<div class="wk">' + TL('二进制每帧按信号位顺序各传一个值（小端），不加换行。收发两端的信号位数量必须相同；改编码或信号位后请重新打开通道。',
+      'Binary frames contain one little-endian value per slot, without a newline. Both ends must use the same slot count. Reopen the channel after changing the codec or slots.') + '</div>';
+  }
   if (c.codec === 'script') {
     h += '<label class="f rwide">脚本<input type="text" data-rt="chan-script" data-id="' + c.id + '" value="' + escapeAttr(c.script) + '" placeholder="' +
       (c.dir === 'in' ? '收到 text / bytes，返回数组或 {编号:值}' : '收到 vals / pairs，返回字符串或 Uint8Array') + '"></label>';
@@ -15342,6 +16076,8 @@ function renderIfaceLive() {
       outs[k].style.color = (v || 0) > 0 ? '#a3e635' : '#6b7b8f';
     }
   }
+  const stEl = document.getElementById('rt-st');
+  if (stEl) stEl.textContent = IFACE.st ? (IFACE.stMode === 'keep' ? '已保留一帧' : '—') : '—';
   const live = document.getElementById('rt-live');
   if (live) {
     live.textContent = IFACE.on
@@ -15462,9 +16198,12 @@ function ifaceForward(opts) {
     return { ok: true, seeds: 0, activated: 0, fired: [] };
   }
   const t0 = performance.now();
+  /* keep 模式下把上一帧的膜电位带上；图换了（stKey 对不上）就当没有 */
+  const stKey = ifaceStateKey();
+  const carry = (IFACE.stMode === 'keep' && IFACE.st && IFACE.stKey === stKey) ? IFACE.st : null;
   const r = runSimulation(Array.from(seedVals.keys()), {
     seedVals: seedVals, waveLimit: SIM.waveLimit, speed: IFACE.speed,
-    quiet: true, paint: !!IFACE.visual,
+    quiet: true, paint: !!IFACE.visual, stIn: carry,
   });
   if (!r || r.error) {
     ifaceLogPush('!', '前向没跑起来：' + ((r && r.error) || '未知原因'));
@@ -15475,6 +16214,10 @@ function ifaceForward(opts) {
   IFACE.feeds++;
   IFACE.lastSeen = { seeds: seedVals.size, activated: r.activated, ms: IFACE.lastMs, at: performance.now() };
   IFACE.lastVal = r.val;   /* 输出通道从这份结果里按信号位取值 */
+  /* 状态型神经元的膜电位：keep 模式下留给下一帧（和导出模型的连续 forward 一致），
+     reset 模式下每一帧都从零开始，绝不跨帧留。 */
+  if (IFACE.stMode === 'keep' && r.stOut) { IFACE.st = r.stOut; IFACE.stKey = stKey; }
+  else if (IFACE.st) { IFACE.st = null; IFACE.stKey = ''; }
   const fired = [];
   const outs = ifaceOuts();
   for (let k = 0; k < outs.length; k++) {
@@ -15651,6 +16394,8 @@ function ifaceB64(u8) {
 function ifaceDecode(c, u8) {
   const codec = c.codec;
   if (codec === 'f32' || codec === 'i16') {
+    const width = codec === 'f32' ? 4 : 2;
+    if (u8.length % width !== 0) return { error: '二进制信号帧不完整：' + u8.length + ' 字节不是 ' + width + ' 的倍数' };
     const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
     const vals = [];
     if (codec === 'f32') { for (let o = 0; o + 4 <= u8.length; o += 4) vals.push(dv.getFloat32(o, true)); }
@@ -15727,9 +16472,34 @@ function ifaceEncode(c, pairs) {
   }
   return { text: vals.join(' ') + '\n' };
 }
+/* TCP 和串口没有消息边界。二进制按信号位数确定整帧，不能按换行或单次 read 切。 */
+function ifaceNativeFrameBytes(c) {
+  if ((c.xp !== 'tcp' && c.xp !== 'tcpc' && c.xp !== 'serial') || (c.codec !== 'f32' && c.codec !== 'i16')) return 0;
+  const bytes = ifaceParseSlots(c.slots).length * (c.codec === 'f32' ? 4 : 2);
+  if (!bytes) throw new Error('二进制 TCP / 串口通道需要先填写信号位，才能确定每帧长度');
+  if (bytes > 16 * 1024 * 1024) throw new Error('二进制信号帧不能超过 16 MiB，请减少信号位数量');
+  return bytes;
+}
+/* 改帧格式后关掉旧连接，避免新解码器接收到旧格式的缓冲数据；由用户明确重新打开。 */
+function ifaceChanSetFormat(c, key, value) {
+  if (c[key] === value) return;
+  if ((c.open || c.opening) && (c.xp === 'tcp' || c.xp === 'tcpc' || c.xp === 'serial')) ifaceChanClose(c, true);
+  c[key] = value;
+}
 /* ---- 打开 / 关闭一条通道 ---- */
+function ifaceChanConfigure(id, o) {
+  const c = ifaceChanById(id | 0);
+  if (!c) return null;
+  if (o) {
+    const connectionKeys = ['codec', 'slots', 'xp', 'dir', 'addr', 'port', 'url', 'com', 'baud'];
+    if ((c.open || c.opening) && connectionKeys.some((key) => o[key] !== undefined && o[key] !== c[key])) ifaceChanClose(c, true);
+    Object.assign(c, o);
+  }
+  ifaceRearm(); renderIfacePanel();
+  return true;
+}
 function ifaceChanOpen(c, quiet) {
-  if (c.open) return true;
+  if (c.open || c.opening) return true;
   c.err = '';
   if (c.xp === 'log' || c.xp === 'http') { c.open = true; if (!quiet) renderIfacePanel(); return true; }
   if (c.xp === 'ws') {
@@ -15748,34 +16518,53 @@ function ifaceChanOpen(c, quiet) {
   if (!SHELL_INVOKE) { c.err = '这条传输只有桌面版有（浏览器里开不了监听）'; if (!quiet) renderIfacePanel(); return false; }
   const kind = c.dir === 'in' ? c.xp : (c.xp === 'udp' ? 'udpout' : c.xp);
   const extra = c.xp === 'serial' ? (String(c.com || 'COM3') + ':' + (c.baud | 0)) : '';
-  const 试着开 = function (第几次) {
-    SHELL_INVOKE('nf_io_open', { id: c.id, kind: kind, addr: String(c.addr || ''), port: c.port | 0, extra: extra })
-      .then(function (msg) {
+  let frameBytes;
+  try { frameBytes = ifaceNativeFrameBytes(c); }
+  catch (e) { c.err = e.message; if (!quiet) renderIfacePanel(); return false; }
+  const epoch = c.openEpoch = (c.openEpoch || 0) + 1;
+  c.opening = true;
+  const args = { id: c.id, kind: kind, addr: String(c.addr || ''), port: c.port | 0, extra: extra, frameBytes: frameBytes };
+  const 试着开 = async function (第几次) {
+    if (c.openEpoch !== epoch) return;
+    try {
+        const msg = await SHELL_INVOKE('nf_io_open', args);
+        if (c.openEpoch !== epoch) {
+          // 配置在打开过程中变了。先关掉刚返回的旧连接，新连接会等本 promise 完成。
+          await SHELL_INVOKE('nf_io_close', { id: args.id }).catch(function () {});
+          return;
+        }
+        c.opening = false;
         c.open = true; c.err = '';
         ifaceLogPush('in', '通道「' + c.name + '」：' + msg + (第几次 ? '（重试 ' + 第几次 + ' 次才成）' : ''));
         renderIfacePanel(); renderIfaceLog();
-      })
-      .catch(function (e) {
+    } catch (e) {
+        if (c.openEpoch !== epoch) return;
         const why = String((e && e.message) || e);
         /* 端口还被上一次的 socket 占着：这是竞态，不是配置错，等一下再来。 */
         if (第几次 < 4 && /10048|只能使用一次|EADDRINUSE|Address already in use/i.test(why)) {
           c.err = '端口还在被上次的通道占着，正在重试…';
-          setTimeout(function () { 试着开(第几次 + 1); }, 150);
-          return;
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          return 试着开(第几次 + 1);
         }
+        c.opening = false;
         c.open = false;
         c.err = why;
         ifaceLogPush('!', '通道「' + c.name + '」打不开：' + c.err);
         renderIfacePanel(); renderIfaceLog();
-      });
+    }
   };
-  试着开(0);
+  // 同一通道的开/关串行化，旧请求的收尾不能误关已经换好格式的新连接。
+  c.nativePending = Promise.resolve(c.nativePending).catch(function () {}).then(() => 试着开(0));
   return true;
 }
 function ifaceChanClose(c, quiet) {
+  c.openEpoch = (c.openEpoch || 0) + 1;
+  c.opening = false;
   if (c.ws) { try { c.ws.close(); } catch (e) { /* 关不掉就算了 */ } c.ws = null; }
   if (c.open && SHELL_INVOKE && c.xp !== 'log' && c.xp !== 'http' && c.xp !== 'ws') {
-    SHELL_INVOKE('nf_io_close', { id: c.id }).catch(function () {});
+    const id = c.id;
+    c.nativePending = Promise.resolve(c.nativePending).catch(function () {})
+      .then(() => SHELL_INVOKE('nf_io_close', { id: id })).catch(function () {});
   }
   c.open = false;
   c.prev = null;
@@ -15959,6 +16748,7 @@ function ifaceBrief() {
       ms: Math.round(IFACE.lastSeen.ms * 10) / 10, agoMs: Math.round(performance.now() - IFACE.lastSeen.at) } : null,
     lastMs: Math.round(IFACE.lastMs * 10) / 10,
     minGapMs: IFACE.minGapMs,
+    stMode: IFACE.stMode, stHeld: !!IFACE.st,
     chan: chans,
     log: IFACE.log.slice(0, 8).map(function (e) { return e.dir + ' ' + e.text; }),
   };
@@ -15996,6 +16786,7 @@ function ifaceSetOn(v) {
   if (IFACE.timer) { clearInterval(IFACE.timer); IFACE.timer = 0; }
   if (IFACE.on) {
     IFACE.held.clear();
+    ifaceResetState(true);      /* 每次打开运行时都从零开始，不接上一次会话的膜电位 */
     IFACE.timer = setInterval(ifaceTick, ifaceTickInterval());
     ifaceLogPush('!', '接口运行时已打开。' + (inShell() ? '' : '（浏览器版：UDP / TCP / 串口开不了，HTTP 和 WebSocket 能用）'));
     for (let i = 0; i < IFACE.chan.length; i++) if (IFACE.chan[i].on) ifaceChanOpen(IFACE.chan[i], true);
@@ -16029,6 +16820,7 @@ function ifaceReset() {
   IFACE.on = false; IFACE.capture = 0; IFACE.capOn = false; IFACE.depth = 0;
   IFACE.inBind.clear(); IFACE.outBind.clear();
   IFACE.manual.clear(); IFACE.held.clear(); IFACE.outVal.clear();
+  IFACE.st = null; IFACE.stKey = '';
   IFACE.feeds = 0; IFACE.fires = 0; IFACE.lastMs = 0;
   IFACE.log = [];
   for (let i = 0; i < IFACE.chan.length; i++) ifaceChanClose(IFACE.chan[i], true);
@@ -16068,8 +16860,11 @@ function ifaceApply(d) {
   IFACE.visual = d.visual !== false;
   IFACE.holdMs = Math.max(30, d.hold || 220);
   IFACE.speed = Math.max(40, d.speed || 70);
+  /* 数组元素可能是个 null / 非对象（文件里那一段被人改过）：跳过，别把整个载入掀翻。
+     这里是 B20「提交阶段不许抛」的一部分——ifaceApply 在建完图之后才跑。 */
   for (let k = 0; k < (d.chan || []).length; k++) {
     const r = d.chan[k];
+    if (!r || typeof r !== 'object') continue;
     IFACE.chan.push({ id: r.id | 0, name: r.name || ('通道 ' + r.id), dir: r.dir === 'out' ? 'out' : 'in',
       xp: r.xp || 'udp', codec: r.codec || 'text', addr: r.addr || '127.0.0.1', port: r.port | 0 || 9000,
       url: r.url || '', com: r.com || 'COM3', baud: r.baud | 0 || 115200, slots: r.slots || '',
@@ -16080,10 +16875,12 @@ function ifaceApply(d) {
   for (let k = 0; k < IFACE.chan.length; k++) if (IFACE.chan[k].id >= IFACE.chanSeq) IFACE.chanSeq = IFACE.chan[k].id + 1;
   for (let k = 0; k < (d.in || []).length; k++) {
     const r = d.in[k];
+    if (!r || typeof r !== 'object' || typeof r.length !== 'number') continue;
     IFACE.inBind.set(r[0] | 0, { kind: r[1], code: r[2] || '', value: r[3] === undefined ? 1 : +r[3], ms: r[4] || 700, lastAt: 0 });
   }
   for (let k = 0; k < (d.out || []).length; k++) {
     const r = d.out[k];
+    if (!r || typeof r !== 'object' || typeof r.length !== 'number') continue;
     IFACE.outBind.set(r[0] | 0, { kind: r[1], code: r[2] || '', url: r[3] || '', src: r[4] || '' });
   }
   if (d.on) ifaceSetOn(true);
@@ -16130,9 +16927,10 @@ function ifacePanelClick(ev) {
   const act = el.dataset.rt;
   const id = el.dataset.id === undefined ? 0 : (parseInt(el.dataset.id, 10) || 0);
   if (act === 'quick') { ifaceQuickBind(); return; }
-  if (act === 'clearin') { IFACE.inBind.clear(); IFACE.held.clear(); IFACE.manual.clear(); renderIfacePanel(); renderIfaceLive(); toast('已清空输入接线'); return; }
+  if (act === 'clearin') { IFACE.inBind.clear(); IFACE.held.clear(); IFACE.manual.clear(); ifaceResetState(true); renderIfacePanel(); renderIfaceLive(); toast('已清空输入接线'); return; }
   if (act === 'clearout') { IFACE.outBind.clear(); renderIfacePanel(); toast('已清空输出接线'); return; }
   if (act === 'clearlog') { IFACE.log = []; renderIfaceLog(); return; }
+  if (act === 'streset') { ifaceResetState(); renderIfacePanel(); renderIfaceLive(); return; }
   if (act === 'grab') {
     if (IFACE.capOn && IFACE.capture === id) { IFACE.capture = 0; IFACE.capOn = false; }
     else { IFACE.capture = id; IFACE.capOn = true; }
@@ -16185,6 +16983,12 @@ function ifacePanelChange(ev) {
   if (act === 'visual') { IFACE.visual = el.checked; return; }
   if (act === 'hold') { IFACE.holdMs = Math.max(30, parseInt(el.value, 10) || 220); return; }
   if (act === 'speed') { IFACE.speed = Math.max(40, parseInt(el.value, 10) || 70); return; }
+  if (act === 'stmode') {
+    IFACE.stMode = el.value === 'keep' ? 'keep' : 'reset';
+    ifaceResetState(true);   /* 换模式就从零开始：免得「每帧从零」还接着上一帧的膜电位 */
+    renderIfacePanel();
+    return;
+  }
   if (act.indexOf('chan-') === 0) {
     const c = ifaceChanById(id);
     if (!c) return;
@@ -16198,14 +17002,14 @@ function ifacePanelChange(ev) {
       renderIfacePanel();
       return;
     }
-    if (act === 'chan-codec') { c.codec = el.value; renderIfacePanel(); return; }
+    if (act === 'chan-codec') { ifaceChanSetFormat(c, 'codec', el.value); renderIfacePanel(); return; }
     if (act === 'chan-addr') { c.addr = el.value.trim(); return; }
     if (act === 'chan-port') { c.port = Math.max(1, parseInt(el.value, 10) || 9000); return; }
     if (act === 'chan-url') { c.url = el.value.trim(); return; }
     if (act === 'chan-com') { c.com = el.value.trim() || 'COM3'; return; }
     if (act === 'chan-baud') { c.baud = Math.max(300, parseInt(el.value, 10) || 115200); return; }
     if (act === 'chan-period') { c.period = Math.max(0, parseInt(el.value, 10) || 0); return; }
-    if (act === 'chan-slots') { c.slots = el.value; return; }
+    if (act === 'chan-slots') { ifaceChanSetFormat(c, 'slots', el.value); renderIfacePanel(); return; }
     if (act === 'chan-script') { c.script = el.value; return; }
     return;
   }
@@ -16537,7 +17341,7 @@ case 'dist': openDistPanel(); break;
   }
 }
 /* 历史与内存面板：把“可逆压缩”真实占了多少内存摆出来。 */
-const HIST_COL_NAME = ['位置', '接口', '激活函数', '偏置', '冻结', '颜色', '自定义色开关', '阈值', '主分组', '手动隐藏', '连接起点', '连接终点', '权重', '连接冻结', '连接 ID', '连接隐藏', '选中神经元', '选中连接'];
+const HIST_COL_NAME = ['位置', '接口', '激活函数', '偏置', '冻结', '颜色', '自定义色开关', '阈值', '主分组', '手动隐藏', '学习档位', '强硬抑制', '连接起点', '连接终点', '权重', '连接冻结', '连接 ID', '连接隐藏', '选中神经元', '选中连接'];
 function openHistPanel() {
   setDlgChrome('plain');
   document.querySelectorAll('#dlghead .tab').forEach((t) => t.classList.remove('on'));
@@ -16698,6 +17502,7 @@ function openPlastPanel() {
         const g = (f) => { const el = document.getElementById('pl-' + i + '-' + f); return el ? el.value : null; };
         const blob = { name: g('name'), rule: g('rule'), lr: parseFloat(g('lr')), tau: parseFloat(g('tau')),
                        wmin: parseFloat(g('wmin')), wmax: parseFloat(g('wmax')), decay: parseFloat(g('decay')) };
+        snapshot();
         PLAST.list[i] = plastNormProf(Object.assign({}, PLAST.list[i], blob));
         if (!(PLAST.list[i].wmax > 0)) PLAST.list[i].wmax = 4;
         if (!(PLAST.list[i].wmin < 0)) PLAST.list[i].wmin = -4;
@@ -16719,8 +17524,12 @@ function openPlastPanel() {
     }));
     const add = document.getElementById('pl-add');
     if (add) add.addEventListener('click', () => {
+      if (PLAST.list.length >= PLAST_MAX) {
+        toast('学习档位已满：最多 ' + PLAST_MAX + ' 档（含「固定」）。要加新的，先删掉一档。', 'err'); return;
+      }
       const r = document.getElementById('pl-new-rule').value;
       const nm = ({ none: '固定', hebb: '同现增强', stdp: '时序 STDP', anti: '反赫布', decay: '只衰减', stdpd: 'STDP+衰减' })[r] || r;
+      snapshot();
       PLAST.list.push(plastNormProf({ name: nm + ' ' + PLAST.list.length, rule: r, lr: 0.05, tau: 5, wmin: -4, wmax: 4, decay: 0.001 }));
       plastBump(); markDirty(); draw();
       toast('已新增档位 #' + (PLAST.list.length - 1) + '：先设参数，再选中神经元应用它');
@@ -17970,10 +18779,26 @@ const FIND = { mode: 'all', q: '', last: [] };
 /* ---- 视角书签：只记相机，不动工程 ---- */
 const VIEW_LS = 'nf.views';
 const VIEWS = { list: [] };
+/* 一个书签必须是「6 个合法有限数 + 名字」。以前只查了 px / tx 两个字段：缺了 py/pz
+   会让相机算出 NaN（审计 B15），字符串还会被原样拼进 innerHTML（审计 B17）。
+   校验和规范化收到这一处：导入、本机加载、公开跳转全走它。数字只认 number ——
+   不认 "1"、"1px"、null、数组这些；宁可少一个书签，也不要一个能算出 NaN 的相机。 */
+function viewNum(v) { return (typeof v === 'number' && isFinite(v)) ? v : NaN; }
+function viewNorm(v, fallbackName) {
+  if (!v || typeof v !== 'object') return null;
+  const px = viewNum(v.px), py = viewNum(v.py), pz = viewNum(v.pz);
+  const tx = viewNum(v.tx), ty = viewNum(v.ty), tz = viewNum(v.tz);
+  if (!isFinite(px) || !isFinite(py) || !isFinite(pz)) return null;
+  if (!isFinite(tx) || !isFinite(ty) || !isFinite(tz)) return null;
+  return { name: String(v.name == null ? '' : v.name).slice(0, 120) || fallbackName,
+           px: px, py: py, pz: pz, tx: tx, ty: ty, tz: tz,
+           ts: Number(v.ts) || Date.now() };
+}
 function viewsLoad() {
   try {
     const a = JSON.parse(localStorage.getItem(VIEW_LS) || '[]');
-    VIEWS.list = Array.isArray(a) ? a.filter((v) => v && isFinite(v.px) && isFinite(v.tx)) : [];
+    /* 老存储里可能就躺着坏条目，所以加载这一侧也要过一遍 viewNorm，不能信磁盘 */
+    VIEWS.list = Array.isArray(a) ? a.map((v, i) => viewNorm(v, '视角 ' + (i + 1))).filter(Boolean) : [];
   } catch (e) { VIEWS.list = []; }
 }
 function viewsPersist() {
@@ -17992,10 +18817,13 @@ function viewSave(name) {
   return t;
 }
 function viewGoto(v) {
-  camera.position.set(v.px, v.py, v.pz);
-  controls.target.set(v.tx, v.ty, v.tz);
+  const w = viewNorm(v, '视角');
+  if (!w) { toast('这个书签的坐标不完整（要 6 个有限数），没有跳过去', 'warn'); return false; }
+  camera.position.set(w.px, w.py, w.pz);
+  controls.target.set(w.tx, w.ty, w.tz);
   controls.update();
   requestRender();
+  return true;
 }
 function openViewPanel() {
   setDlgChrome('plain');
@@ -18026,8 +18854,8 @@ function openViewPanel() {
         const v = VIEWS.list[k];
         const td = 'padding:4px 8px;border-bottom:1px solid #161f2a;color:#9db0c6';
         h += '<tr><td style="' + td + ';color:var(--tc-dbe7f5)">' + esc(v.name) + '</td>' +
-             '<td style="' + td + '">' + v.px + ' , ' + v.py + ' , ' + v.pz + '</td>' +
-             '<td style="' + td + '">' + v.tx + ' , ' + v.ty + ' , ' + v.tz + '</td>' +
+             '<td style="' + td + '">' + esc(String(v.px) + ' , ' + String(v.py) + ' , ' + String(v.pz)) + '</td>' +
+             '<td style="' + td + '">' + esc(String(v.tx) + ' , ' + String(v.ty) + ' , ' + String(v.tz)) + '</td>' +
              '<td style="' + td + '"><button data-vgo="' + k + '" style="padding:2px 8px;font-size:11px">去</button> ' +
              '<button data-vup="' + k + '" style="padding:2px 8px;font-size:11px">用当前视角覆盖</button> ' +
              '<button data-vdel="' + k + '" style="padding:2px 8px;font-size:11px">删</button></td></tr>';
@@ -18062,8 +18890,9 @@ function openViewPanel() {
             const arr = Array.isArray(j) ? j : (j && Array.isArray(j.views) ? j.views : []);
             let n = 0;
             for (const v of arr) {
-              if (!v || !isFinite(v.px) || !isFinite(v.tx)) continue;
-              VIEWS.list.push({ name: String(v.name || ('导入的视角 ' + (n + 1))), px: v.px, py: v.py, pz: v.pz, tx: v.tx, ty: v.ty, tz: v.tz, ts: Date.now() });
+              const nv = viewNorm(v, '导入的视角 ' + (n + 1));
+              if (!nv) continue;
+              VIEWS.list.push(nv);
               n++;
             }
             viewsPersist(); draw();
@@ -18147,8 +18976,10 @@ function moduleFromSelection(name, keepIO) {
     nodes.push({
       x: nPos[i * 3], y: nPos[i * 3 + 1], z: nPos[i * 3 + 2],
       act: nAct[i], bias: nBias[i], thr: nThr[i], lock: nLock[i] ? 1 : 0,
+      prof: nPlast[i] | 0, hard: nHard[i] ? 1 : 0,
       colOn: nColOn[i] ? 1 : 0, r: nCol[i * 3], g: nCol[i * 3 + 1], b: nCol[i * 3 + 2],
       io: keepIO ? nIO[i] : IO_NONE, name: nName.get(i) || '', grp: groupName(nGroup[i]), inFrom: 0, outTo: 0,
+      groups: groupsOfNode(i).map((g) => groupName(g)),
     });
   }
   const edges = [];
@@ -18164,6 +18995,7 @@ function moduleFromSelection(name, keepIO) {
     if (nodes[k].outTo || (nodes[k].io & IO_OUT)) exits.push(k);
   }
   return { id: modNextId(), name: String(name || '模块'), created: new Date().toISOString(),
+           plast: { list: PLAST.list.map((p) => Object.assign({}, p)) },
            nodes: nodes, edges: edges, entries: entries, exits: exits };
 }
 /* 在放置光标处实例化一份。不传坐标就用当前放置坐标，并把光标顺移出这块的包围盒，
@@ -18178,8 +19010,26 @@ function instantiateModule(mi, opts) {
     toast('会超过神经元数量绝对上限 ' + fmt(CAP_HARD_N) + '（受内存物理限制）', 'err');
     return null;
   }
+  /* 模块跨工程使用：档位号只在原工程里有效，按完整档位定义复用或新增，
+     不能把原编号直接写到目标图。老模块没有 plast / prof，保持固定不学习。 */
+  const profiles = PLAST.list.slice(), profMap = new Map([[0, 0]]);
+  for (const nd of mod.nodes) {
+    const p = nd.prof | 0;
+    if (profMap.has(p)) continue;
+    const raw = mod.plast && Array.isArray(mod.plast.list) && p > 0 ? mod.plast.list[p] : null;
+    if (!raw) { profMap.set(p, 0); continue; }
+    const profile = plastNormProf(raw), key = JSON.stringify(profile);
+    let id = profiles.findIndex((q, i) => i > 0 && i < 255 && JSON.stringify(plastNormProf(q)) === key);
+    if (id < 0) {
+      if (profiles.length >= 255) { toast('学习档位已满，无法完整放置这个模块', 'err'); return null; }
+      id = profiles.length; profiles.push(profile);
+    }
+    profMap.set(p, id);
+  }
   snapshot();
+  PLAST = { list: profiles };
   const map = new Array(mod.nodes.length);
+  const grouped = new Map();
   for (let k = 0; k < mod.nodes.length; k++) {
     const nd = mod.nodes[k];
     const i = addNeuron(bx + nd.x, by + nd.y, bz + nd.z,
@@ -18189,17 +19039,27 @@ function instantiateModule(mi, opts) {
     nAct[i] = nd.act | 0; nBias[i] = nd.bias;
     nThr[i] = nd.thr === undefined ? DEF_THR : nd.thr;
     nLock[i] = nd.lock ? 1 : 0; nIO[i] = nd.io | 0;
+    nPlast[i] = profMap.get(nd.prof | 0) || 0; nHard[i] = nd.hard ? 1 : 0;
     if (nd.name) nName.set(i, nd.name);
-    if (nd.grp) nGroup[i] = groupEnsure(nd.grp);
+    const names = Array.isArray(nd.groups) ? nd.groups : (nd.grp ? [nd.grp] : []);
+    for (const name of names) {
+      const g = groupEnsure(name);
+      if (!g) continue;
+      if (!grouped.has(g)) grouped.set(g, []);
+      grouped.get(g).push(i);
+    }
     writeNeuron(i, true);
   }
+  grouped.forEach((nodes, g) => groupSetMany(g, nodes, true));
+  gsyncPrimary();
+  plastBump();
   /* 边一次性写进去再重建邻接表：一条条走 addEdge 的话，每条边都要重建一次
      O(E) 的邻接表还顺带查重，几千条边就是几十万次无谓的重排。 */
   ensureEdgeCapacity(G.e + mod.edges.length + 8);
   let made = 0;
   for (const ed of mod.edges) {
     const s = map[ed.s], d = map[ed.d];
-    if (s === undefined || d === undefined || s === d) continue;
+    if (s === undefined || d === undefined) continue;
     if (!ensureEdgeCapacity(G.e + 1)) break;
     const e = G.e++;
     histLockDirty = 1; histHidDirty = 1; histWDirty = 1; histTopoDirty = 1;
@@ -18758,6 +19618,7 @@ function sourceSummary() {
            blocks: c.blocks || 0, blockWeights: c.blockWeights || 0,
            shared: sourceShared().length,
            exact: S.exact !== false, layout: (S.auto && S.auto.layout) || '',
+           report: sourceReport(), exactAll: !!(S.report && S.report.exactAll),
            notes: (S.notes || []).length, spansCoarse: !!S.spansCoarse };
 }
 /* 权值共享：同一个常量被多个算子引用（tied weights）。导入器默认把它们建成共享参数组，
@@ -18766,6 +19627,53 @@ function sourceShared() {
   const S = G.source;
   return (S && Array.isArray(S.shared)) ? S.shared : [];
 }
+
+/* ---- 导入报告的分类（结构 / 数值 / 常量精度 / 权值共享）----
+   一个 exact 布尔量说不完"这跟原模型差在哪"：结构没跳节点，数值上仍可能有已知近似
+   （Gelu 的 tanh、Cast 降精度），共享也可能没保住。这四项分开显示，谁也盖不住谁。
+   老工程（导入器还没写 report 的时候）按 exact 反推一个，界面不至于空着。 */
+const RPT_LEVEL = {
+  exact: '没变', skipped: '跳过了算子', approximate: '有已知近似',
+  widened: '常量被改成 float32', none: '原模型里没有共享', kept: '已保住',
+  partial: '只保住一部分', lost: '没能保住', unknown: '老工程没记'
+};
+const RPT_ITEM = { cast: 'Cast 降精度', approx: '数值近似', dtype: '常量精度',
+                   share: '权值共享', skip: '跳过的算子' };
+function sourceReport() {
+  const S = G.source;
+  if (!S) return null;
+  const r = (S.report && typeof S.report === 'object') ? S.report : null;
+  if (r) return r;
+  return { structure: S.exact === false ? 'skipped' : 'exact', numeric: 'unknown',
+           dtype: 'unknown', shared: 'unknown', verified: 'none', items: [],
+           itemCount: 0, exactAll: false, legacy: true };
+}
+/* 一行式摘要（给 .it / .rline 用，内部不再套块级元素） */
+function reportSummaryHtml(r) {
+  if (!r) return '（这份工程没有分类报告）';
+  const chip = (label, v, okv) => '<b style="color:' +
+    (okv.indexOf(v) >= 0 ? 'var(--tc-8fd6a1)' : 'var(--tc-e3c06a)') + '">' +
+    esc(label + '：' + (RPT_LEVEL[v] || v || '未知')) + '</b>';
+  return chip('结构', r.structure, ['exact']) + ' · ' +
+         chip('数值', r.numeric, ['exact']) + ' · ' +
+         chip('常量精度', r.dtype, ['exact']) + ' · ' +
+         chip('权值共享', r.shared, ['none', 'kept']);
+}
+function reportItemsHtml(r) {
+  const items = (r && r.items) || [];
+  if (!items.length) return '';
+  let h = '<h4>与原模型的已知差别（' + items.length + ' 条' +
+    (r.itemCount > items.length ? ('，只列前 ' + items.length) : '') + '）</h4>';
+  for (const it of items) {
+    h += '<div class="it" style="color:' + (it.lv === 'bad' ? 'var(--tc-f85149)' : 'var(--tc-e3c06a)') + '">' +
+         '<b>' + esc(RPT_ITEM[it.k] || it.k || '差别') + '</b>' +
+         (it.n ? (' · ' + esc(it.n)) : '') + '：' + esc(it.d || '') + '</div>';
+  }
+  return h;
+}
+/* 这句必须一直在：没有跑过参考执行器就不能说"已验证等价" */
+const RPT_VERIFY_LINE = '数值是否逐位等价原模型：<b>没有验证</b>（导入器不跑参考执行器）' +
+  '——上面报的是"已知的差别"，不是"已经验证过等价"。';
 
 /* ---- 结构数据：有来源表就用来源表，没有就按当前图现场聚合 ---- */
 function structBuild() {
@@ -18791,6 +19699,7 @@ function structBuildSource(S) {
   const edges = [];
   for (const o of nodes) for (const p of o.srcIds) if (idxOf.has(p)) edges.push([idxOf.get(p), o.idx, 1]);
   return { mode: 'source', model: S.model || '', exact: S.exact !== false,
+           report: sourceReport(),
            nodes: nodes, edges: edges, notes: S.notes || [], skipped: S.skipped || [],
            casts: S.casts || [], precision: S.precision || {},
            layout: (S.auto && S.auto.layout) || 'ring',
@@ -19027,7 +19936,8 @@ function structDetail() {
     h += '<h4>规模</h4>';
     h += '<div class="it">节点 <b>' + fmt(d.nodes.length) + '</b> · 关系 <b>' + fmt(d.edges.length) + '</b></div>';
     h += '<div class="it">聚合块（3D 里只剩矩阵、没有算子边界的那种）：' + (d.blocks ? ('<b>' + fmt(d.blocks) + '</b> 个（' + fmt(d.blockWeights) + ' 个权重）') : '这个工程里没有') + '</div>';
-    h += '<div class="it">数值是否等价原模型：' + (d.exact ? '<b>是</b>' : '<b style="color:var(--tc-f85149)">否</b>（有被跳过的算子，见下）') + '</div>';
+    h += '<div class="it">与原模型的差别：' + reportSummaryHtml(sourceReport()) + '</div>';
+    h += '<div class="it" style="color:var(--tc-8fa0b5)">' + RPT_VERIFY_LINE + '</div>';
     if (d.ms) h += '<div class="it">聚合耗时 <b>' + d.ms.toFixed(0) + ' ms</b></div>';
     h += '<h4>怎么用</h4>';
     h += '<div class="it">单击节点 → 在 3D 里选中它折出来的那批神经元（翻回去就看到了）。</div>';
@@ -19093,6 +20003,7 @@ function structNotesHtml(d) {
       '才建得成组（形状可以不同：3×2 和 2×3 是同一段数值互为转置）；逐条边的层也不建——两个大小不同的边集本来就不是同一个参数。' +
       '框选两个及以上元素总数一样的权重块，点右栏「设为共享参数」可以手工建组。</div>';
   }
+  h += reportItemsHtml(d.report || sourceReport());
   if (d.skipped && d.skipped.length) {
     h += '<h4 style="color:var(--tc-f85149)">跳过的算子（数值不再等价）</h4>';
     for (const s2 of d.skipped) h += '<div class="it">' + esc(s2.op) + ' @ ' + esc(s2.n) + '：' + esc(s2.why || '') + '</div>';
@@ -19363,7 +20274,10 @@ function openSourceReport() {
   const c = S.counts || {};
   h += '<div class="rtitle">来源</div>';
   h += '<div class="rline info">模型：<b>' + esc(S.model || '（没记名字）') + '</b> · 导入器 ' + esc(S.generator || 'import_model.py') + ' · 来源表版本 ' + (S.format || 1) + '</div>';
-  h += '<div class="rline ' + (S.exact === false ? 'warn' : 'ok') + '">数值是否等价原模型：<b>' + (S.exact === false ? '否（有被跳过的算子）' : '是') + '</b></div>';
+  const rp = sourceReport();
+  h += '<div class="rline ' + (rp && rp.exactAll ? 'ok' : 'warn') + '">与原模型的差别：' + reportSummaryHtml(rp) + '</div>';
+  h += '<div class="rline info">' + RPT_VERIFY_LINE + '</div>';
+  h += reportItemsHtml(rp);
   h += '<div class="rline info">算子节点 <b>' + fmt(c.ops || 0) + '</b> · 神经元区间 <b>' + fmt(c.spans || 0) + '</b> · 聚合块 <b>' + fmt(c.blocks || 0) + '</b>（' + fmt(c.blockWeights || 0) + ' 个权重）' + (c.skipped ? (' · 跳过 <b>' + c.skipped + '</b> 个算子') : '') + '</div>';
   h += '<div class="rline info">自动补上的：名字 ' + (S.auto && S.auto.names ? '是' : '否（--no-names）') + ' · 坐标 是（布局 ' + esc((S.auto && S.auto.layout) || 'ring') + '，间距 ' + ((S.auto && S.auto.spacing) || 26) + '）</div>';
   if (S.spansCoarse) h += '<div class="rline warn">这份工程按空间 Z 序切块保存过，神经元编号被重排：来源区间是近似范围。</div>';
@@ -19608,6 +20522,9 @@ function loop() {
    --------------------------------------------------------------------------
    公开少量只读查询与动作，供自动化测试、批量脚本、以及后续的插件扩展使用。
    ========================================================================== */
+/* 状态型神经元的膜电位通过 simCompute 进出的上限。大模型那一串几百万个数走接口必被截断，
+   宁可不给，也不给一半。要连续轨迹请用接口运行时的「跨帧保留」。 */
+const SIM_STATE_EXPORT_MAX = 65536;
 window.NF = {
   version: '0.1',
   /* 给「自定义工具」作者（AI 或者你自己）用的桥：工具文件里能碰到的就是这些，
@@ -19690,6 +20607,9 @@ window.NF = {
   },
   mortonCodes: () => Array.from(nf3MortonCodes()),
   round3: (v) => nf3R3(v),
+  /* 文件头一致性检查：返回一串「哪里不对」的中文说明，空数组 = 过。
+     给自测、脚本和 AI 用：拿到一份 .nforge 先问它合不合规，比一个个解块便宜得多。 */
+  checkIndex: (header) => nf3CheckIndex(header),
   /* 只解析文件头，一块都不解压，返回索引表 */
   inspectFile: (buf) => nforge3ReadHeader(buf).header,
   /* 只载入指定的块；ids 省略 = 全部。**返回 Promise**，载入是一帧一帧推的，必须 await。 */
@@ -19944,6 +20864,8 @@ window.NF = {
     inBind: Array.from(IFACE.inBind).filter((e) => e[1].kind !== 'none')
       .map((e) => ({ id: e[0], kind: e[1].kind, code: e[1].code, value: e[1].value, ms: e[1].ms })),
     outBind: Array.from(IFACE.outBind).map((e) => ({ id: e[0], kind: e[1].kind, code: e[1].code, url: e[1].url, src: e[1].src })),
+    /* 状态型神经元的膜电位模式 / 当前有没有留着一帧（B10：界面连续运行 vs 导出模型） */
+    stMode: IFACE.stMode, stHeld: !!IFACE.st,
     inVal: ifaceIns().map((id) => [id, ifaceSourceValue(id, performance.now())]),
     outVal: Array.from(IFACE.outVal),
     manual: Array.from(IFACE.manual),
@@ -19964,6 +20886,15 @@ window.NF = {
   },
   ifaceKey: (code) => ({ hits: ifaceFeedKey(String(code)) }),
   ifaceForward: (o) => ifaceForward(o),
+  /* 状态型神经元的膜电位：问模式 / 改模式 / 清空。改模式会顺手清空（从零开始）。 */
+  ifaceStateMode: (m) => {
+    if (m !== undefined) {
+      ifaceResetState(true);
+      IFACE.stMode = String(m).toLowerCase() === 'keep' ? 'keep' : 'reset';
+    }
+    return { mode: IFACE.stMode, held: !!IFACE.st };
+  },
+  ifaceResetState: () => ifaceResetState(false),
   /* 由通道收帧触发的前向，两次之间至少隔多少毫秒（0 = 不限，上限 1000）。
      接 50 Hz 仿真又想让界面保持顺滑，就设成 20~33。 */
   ifaceMinGap: (ms) => { if (ms !== undefined) IFACE.minGapMs = Math.max(0, Math.min(1000, ms | 0)); return IFACE.minGapMs; },
@@ -19996,7 +20927,7 @@ window.NF = {
     addr: c.addr, port: c.port, url: c.url, com: c.com, baud: c.baud, slots: c.slots, script: c.script,
     period: c.period, on: c.on, open: c.open, rx: c.rx, tx: c.tx, err: c.err })),
   ifaceChanAdd: (dir, o) => { const c = ifaceMakeChan(Object.assign({ dir: dir === 'out' ? 'out' : 'in' }, o || {})); IFACE.chan.push(c); if (IFACE.on && c.on) ifaceChanOpen(c, true); ifaceRearm(); renderIfacePanel(); return c.id; },
-  ifaceChanSet: (id, o) => { const c = ifaceChanById(id | 0); if (!c) return null; if (o) Object.assign(c, o); ifaceRearm(); renderIfacePanel(); return true; },
+  ifaceChanSet: (id, o) => ifaceChanConfigure(id, o),
   ifaceChanDel: (id) => { const c = ifaceChanById(id | 0); if (!c) return false; ifaceChanClose(c, true); IFACE.chan = IFACE.chan.filter((x) => x !== c); ifaceRearm(); renderIfacePanel(); return true; },
   ifaceChanOpen: (id) => { const c = ifaceChanById(id | 0); return c ? ifaceChanOpen(c, true) : false; },
   ifaceChanClose: (id) => { const c = ifaceChanById(id | 0); if (!c) return false; ifaceChanClose(c, true); return true; },
@@ -20029,13 +20960,19 @@ window.NF = {
   simCompute: (seeds, opts) => {
     const r = computeSimulation(seeds || [], opts || {});
     if (r.error) return { error: r.error };
-    return { activated: r.activated, blocked: r.blocked, maxWave: r.maxWave, seedCount: r.seedCount,
+    const out = { activated: r.activated, blocked: r.blocked, maxWave: r.maxWave, seedCount: r.seedCount,
              seedDistinct: r.seedDistinct, planMs: r.planMs, propMs: r.propMs, push: r.push,
              limitHit: !!r.limitHit, cyclicTime: !!r.cyclicTime, stateful: !!r.stateful, steps: r.steps || 1,
              span: r.span || 1, fired: r.fired || 0, activatedNodes: r.activatedNodes || 0,
              order: r.order, byWave: r.byWave.map((a) => a.slice()),
              opByWave: (r.opByWave || []).map((a) => a.slice()),
              waveOf: Array.from(r.waveOf.slice(0, G.n)), val: Array.from(r.val.slice(0, G.n)) };
+    /* 状态型神经元的膜电位（长度 = 神经元数）。想一帧一帧接着算连续轨迹，就把这一串原样
+       放进下一次调用的 opts.stIn；不带 stIn 时每次模拟都从零开始。
+       大模型不给：几百万个数走接口只会被截断，宁可不给也不给一半。 */
+    out.stCarried = !!r.stCarried;
+    if (r.stOut && r.stOut.length <= SIM_STATE_EXPORT_MAX) out.stOut = Array.from(r.stOut);
+    return out;
   },
   simRun: (seeds, opts) => {
     if (seeds && seeds.length) window.NF.select(seeds, []);
@@ -20084,7 +21021,7 @@ window.NF = {
   structModel: () => {
     const d = structBuild();
     structLayout(d);
-    return { mode: d.mode, model: d.model, exact: d.exact, layout: d.layout,
+    return { mode: d.mode, model: d.model, exact: d.exact, report: d.report || null, layout: d.layout,
              blocks: d.blocks, blockWeights: d.blockWeights, spansCoarse: !!d.spansCoarse,
              ms: Math.round(d.ms || 0), notes: d.notes.length, skipped: (d.skipped || []).length,
              nodes: d.nodes.map((nd) => ({ i: nd.idx, op: nd.op, name: nd.name, kind: nd.kind,
@@ -20308,7 +21245,11 @@ window.NF = {
   /* 把可塑性整个清回默认（换图时内部自己会调；脚本 / 测试也能手动调） */
   plastReset: () => { plastReset(); markDirty(); return true; },
   plastProfiles: () => PLAST.list.map((p, i) => Object.assign({ id: i }, p)),
-  plastAdd: (p) => { PLAST.list.push(plastNormProf(p)); plastBump(); return PLAST.list.length - 1; },
+  /* 满表就明确失败（回 -1），不回绕、不静默——超限的编号会写成别的档位，比失败坏得多 */
+  plastAdd: (p) => {
+    if (PLAST.list.length >= PLAST_MAX) return -1;
+    PLAST.list.push(plastNormProf(p)); plastBump(); return PLAST.list.length - 1;
+  },
   /* 读档位表。以前只能通过 plastOf(i) 一个个问神经元，脚本想核对"学了多少"就得自己重建一遍公式。 */
   plastList: () => PLAST.list.map((p) => ({ name: p.name, rule: p.rule, lr: p.lr, tau: p.tau,
     wmin: p.wmin, wmax: p.wmax, decay: p.decay })),
@@ -20329,6 +21270,7 @@ window.NF = {
   setPlast: (nodes, prof) => {
     const p = prof | 0;
     if (p < 0 || p >= PLAST.list.length) return false;
+    if (p > 255) return false;   /* 档位号最后写成一个字节：越界不回绕，直接拒 */
     for (const i of nodes || []) nPlast[i] = p;
     plastBump(); markDirty(); return true;
   },
@@ -20551,8 +21493,8 @@ window.NF = {
   /* groupOf = 主分组（组号最小的那个），兼容老脚本；groupsOfNode 才是"全部所属" */
   groupOf: (i) => groupName(nGroup[i]),
   groupsOfNode: (i) => groupsOfNode(i).map((g) => groupName(g)),
-  groupMembers: (id) => groupMembers(typeof id === 'string' ? groupEnsure(id) : (id | 0)),
-  groupCount: (id) => groupCount(typeof id === 'string' ? groupEnsure(id) : (id | 0)),
+  groupMembers: (id) => groupMembers(typeof id === 'string' ? groupLookup(id) : (id | 0)),
+  groupCount: (id) => groupCount(typeof id === 'string' ? groupLookup(id) : (id | 0)),
   setGroup: (ids, name) => { snapshot(); const g = groupEnsure(name); setGroupBatch(ids || selectedNodes(), g); return g; },
   groupAdd: (ids, name) => {
     const g = groupEnsure(name);
@@ -20721,11 +21663,31 @@ window.NF = {
       return { ok: false, msg: '参数 ' + name + ' 要 ' + p.data.length + ' 个数值，给了 ' + (data ? data.length : 0) + ' 个' };
     }
     snapshot();
-    const np = opMakeParam(p.name, p.dtype, p.shape, data);
+    const np = opMakeParam(p.name, p.dtype, p.shape, data, p.role, o.op, p.same);
     o.params = o.params.slice();
     o.params[k] = np;
     rebuildOpViews(); refreshAll();
     return { ok: true, values: Array.from(np.data) };
+  },
+  /* 改一个算子参数的角色。weight = 可训练；stat / const / int = 注册成 buffer，优化器碰不到。
+     导入器写不出正确角色的老文件、或者手工建的节点，可以在这里改。可撤销。 */
+  opSetParamRole: (id, name, role) => {
+    const o = opById(id);
+    if (!o) return { ok: false, msg: '没有 id 为 ' + id + ' 的算子节点' };
+    const k = opParamIndex(o, name);
+    if (k < 0) return { ok: false, msg: '算子 ' + o.name + ' 里没有参数 ' + name };
+    const r = String(role || '');
+    if (!opRoleKnown(OP_ROLES, r)) return { ok: false, msg: '认不出的角色：' + role + '（只能是 weight / stat / const / int）' };
+    if (r !== 'weight' && !opIsFloatDtype(o.params[k].dtype) && r !== 'int') {
+      return { ok: false, msg: '整型参数只能当 int，不能当 ' + r };
+    }
+    snapshot();
+    const np = Object.assign({}, o.params[k]);
+    np.role = r;
+    o.params = o.params.slice();
+    o.params[k] = np;
+    rebuildOpViews(); refreshAll();
+    return { ok: true, role: r };
   },
   opView: (id) => {
     const o = opById(id);
@@ -21010,7 +21972,12 @@ window.NF = {
     if (o.maxTok !== undefined) AI.maxTok = Math.max(0, Math.min(200000, o.maxTok | 0));
     if (o.visBase !== undefined) AI.visBase = String(o.visBase); if (o.visModel !== undefined) AI.visModel = String(o.visModel); if (o.visKey !== undefined) AI.visKey = String(o.visKey);
     /* 外部操作的两个开关不进 localStorage：这里只是本次运行有效，重启就没了 */
-    if (o.sysFs !== undefined) AI.sysFs = !!o.sysFs; if (o.sysRun !== undefined) AI.sysRun = !!o.sysRun; aiSysSync();
+    /* 外部操作的两个开关**不走这条路**：NF 上挂着的每个方法都会被 list_api 扫出来交给模型，
+       模型用 run_api 就能调到这一行，等于模型给自己发权限（审计 B01）。
+       现在唯一的开法是「用户亲手在设置里勾」——那条路在 aiUserSetSys 里，不是 NF 的方法，
+       模型够不到；Rust 侧还要求系统对话框点一次（见 sys_exec.rs 的 nf_sys_allow）。
+       这里明确报「要你自己去勾」，比静默忽略好——模型看得见，不会以为开成了。 */
+    if (o.sysFs !== undefined || o.sysRun !== undefined) sysAskUserOnly = true;
     /* 明确点名要改 Key（哪怕改成空的）就是「人来过这一下」：这时候才允许写成空 */
     aiSaveCfg(o.key !== undefined || o.visKey !== undefined); aiFillCfg(); aiKeyNote(); } return { base: AI.base, model: AI.model, autoRun: AI.autoRun, hasKey: !!AI.key, keyLen: AI.keyLen, sysFs: !!AI.sysFs, sysRun: !!AI.sysRun,
     slim: AI.slim, slimOn: aiSlimOn(), toolMode: AI.toolMode, temp: AI.temp, maxTok: AI.maxTok, local: aiLocalNow() }; },
@@ -21133,6 +22100,8 @@ const AI = {
 /* 注意：这里没有 open / hidden 那种"整块消失"的状态。AI 框只允许折成一条，
    因为一旦能整个关掉，用户就可能在别处找不到它。 */
 const AIUI = { folded: false, set: false, sess: false };
+/* 模型候选只留在内存；接口或凭证变化后立即失效，不跨服务复用。 */
+const AI_MODELS = { scope: null, list: [], seq: 0, loading: false, loaded: false, note: '' };
 const AI_STEPS = 10;       /* 一次提问里最多来回几轮工具调用。
                               放 10 而不是更少，是因为"外部操作"那种活一轮问不出来：
                               探环境 → 装东西 → 验证 → 下载 → 转换 → 打开，一串下来就六七轮了。 */
@@ -21183,6 +22152,25 @@ function aiCfgJson() {
     slim: AI.slim, toolMode: AI.toolMode, temp: AI.temp, maxTok: AI.maxTok,
     appear: { theme: APPEAR.theme, vbg: APPEAR.vbg, custom: APPEAR.custom } };
 }
+/* 接口地址规范化成「哪一家服务」：去空白、小写、削掉末尾斜杠和常见的端点尾巴。
+   为什么 Key 要绑地址比较：备份恢复以前只看「有没有 Key」，于是 A 家的 Key 会被填进 B 家，
+   下一次请求就把 A 的凭证发到 B 去了（审计 B02）。Key 只跟服务走，不跟模型名走 ——
+   同一家换个模型名照样能用，换一家就必须重新填。 */
+function aiSvcOf(base) {
+  let s = String(base || '').trim().toLowerCase();
+  if (!s) return '';
+  for (const tail of ['/chat/completions', '/responses', '/completions', '/models']) {
+    if (s.length > tail.length && s.slice(-tail.length) === tail) s = s.slice(0, s.length - tail.length);
+  }
+  while (s.slice(-1) === '/') s = s.slice(0, -1);
+  return s;
+}
+/* 两边都写了地址就必须对得上；都没写才当同一家（没地址就没法区分，只能信它） */
+function aiSvcSame(a, b) {
+  const x = aiSvcOf(a), y = aiSvcOf(b);
+  if (!x || !y) return !x && !y;
+  return x === y;
+}
 /* 兜底那份里的 Key（本机存储里那一格） */
 function aiBakKey() {
   try { const b = JSON.parse(localStorage.getItem(AI_BAK) || "null"); return (b && typeof b.key === "string") ? b.key : ""; } catch (e) { return ""; }
@@ -21198,12 +22186,13 @@ function aiSaveCfg(force) {
     let b = null;
     try { b = JSON.parse(localStorage.getItem(AI_BAK) || "null"); } catch (e) { b = null; }
     if (b && typeof b === "object") {
-      if (!AI.key && b.key) AI.key = String(b.key);
-      if (!AI.visKey && b.visKey) AI.visKey = String(b.visKey);
+      if (!AI.key && b.key && aiSvcSame(b.base, AI.base)) AI.key = String(b.key);
+      if (!AI.visKey && b.visKey && aiSvcSame(b.visBase || b.base, AI.visBase || AI.base)) AI.visKey = String(b.visKey);
     }
   }
-  AI.cfgAt = Date.now();
+  AI.cfgAt = Math.max(Date.now(), (AI.cfgAt || 0) + 1);
   AI.keyLen = AI.key ? AI.key.length : 0;
+  aiModelListRender();
   const text = JSON.stringify(aiCfgJson());
   try {
     localStorage.setItem(AI_STORE, text);
@@ -21228,6 +22217,8 @@ function aiAdoptCfg(r) {
   if (!o || typeof o.final !== "string" || !o.final) return false;
   let f = null;
   try { f = JSON.parse(o.final); } catch (e) { return false; }
+  /* 旧接口异步写入的迟到回包不能把旧 Key 带到刚切换的新服务商。 */
+  if (!f || Number(f.at) !== AI.cfgAt || f.base !== AI.base || f.model !== AI.model || (f.visBase || '') !== AI.visBase) return false;
   if (!f || typeof f.key !== "string" || f.key === AI.key) return false;
   AI.key = f.key; AI.keyLen = AI.key ? AI.key.length : 0;
   if (typeof f.visKey === "string" && f.visKey) AI.visKey = f.visKey;
@@ -21260,10 +22251,18 @@ async function aiCfgBoot() {
   let best = null;
   for (const c of srcs) if (!best || c.at >= best.at) best = c;
   if (best) aiCfgFromJson(best.j);
-  /* 再拿任何一份非空的 Key / 视觉 Key 把它补齐 */
+  /* 再拿任何一份非空的 Key / 视觉 Key 把它补齐 —— **但只认地址对得上的那一份**：
+     跨服务补 Key 等于把 A 家的凭证发给 B 家（审计 B02）。 */
   for (const f of ['key', 'visKey']) {
     if (String(AI[f] || "")) continue;
-    for (const c of srcs) { const v = String(c.j[f] || ""); if (v) { AI[f] = v; break; } }
+    const fBase = (f === 'visKey') ? (AI.visBase || AI.base) : AI.base;
+    for (const c of srcs) {
+      const v = String(c.j[f] || "");
+      if (!v) continue;
+      const sBase = (f === 'visKey') ? (c.j.visBase || c.j.base) : c.j.base;
+      if (!aiSvcSame(sBase, fBase)) continue;
+      AI[f] = v; break;
+    }
   }
   AI.key = String(AI.key || "").trim(); AI.visKey = String(AI.visKey || "").trim();
   AI.keyLen = AI.key ? AI.key.length : 0;
@@ -21295,6 +22294,7 @@ function aiFillCfg() {
   const tmd = document.getElementById('ai-toolmode'); if (tmd) tmd.value = AI.toolMode;
   aiLocalFill();
   aiLocalNote();
+  aiModelListRender();
 }
 /* 思考强度下拉框：选项就是 AI_THINK 那张表；说明里把接口的原话和「端点不认」的结论都摆出来 */
 function aiFillThink() {
@@ -21314,20 +22314,90 @@ function aiThinkNote() {
   const el = document.getElementById('ai-thinknote');
   if (!el) return;
   const k = aiThinkNorm(AI.think);
+  const gpt6 = aiIsGpt6Config();
+  const temp = document.getElementById('ai-temp');
+  if (temp) { temp.disabled = gpt6; temp.title = gpt6 ? 'GPT-6 使用思考强度控制，不发送温度参数' : ''; }
+  const tempNote = document.getElementById('ai-tempnote');
+  if (tempNote) tempNote.textContent = gpt6
+    ? 'GPT-6 不适用温度设置；调整下方思考强度。原温度值保留供其他模型使用。'
+    : '0–2，越大越放飞。本地小模型老重复 / 老跑偏时动它';
   let s = '';
-  if (AI.thinkBad) {
+  if (gpt6) {
+    s = k === 'off' ? 'GPT-6 不提供关闭思考模式；选“关”时按 low 发送。'
+      : k === 'default' ? 'GPT-6：跟随接口默认思考强度。'
+      : 'GPT-6 思考强度：' + aiEsc(k) + '。';
+    s += '<br>GPT-6 使用 Responses 接口；支持 low / medium / high / xhigh / max。温度参数不发送。';
+  } else if (AI.thinkBad) {
     s = '这个端点不认思考强度参数（' + (AI.thinkNote || '').slice(0, 120) + '），已经不再发它。' +
-        '换个认它的端点（DeepSeek 官方地址就行），或者把这里改一下再试一次（改一下就会重新发）。';
+        '可更换支持它的端点，或者重新选择档位再试一次。';
   } else if (k === 'default') {
-    s = '不传参数，按接口自己的默认来（DeepSeek 官方默认：思考开着、档位 high）。';
+    s = '不传参数，按接口自己的默认来。';
   } else if (k === 'off') {
     s = '关掉思考：回答更快、更省 token，复杂任务的质量会降。';
   } else {
-    s = '按 ' + k + ' 发 reasoning_effort（DeepSeek 的映射表：low / medium / high / max 各按自己的表落地）。';
+    s = '按 ' + aiEsc(k) + ' 发 reasoning_effort；实际支持的档位和映射由端点决定。';
   }
-  s += '<br>思考模式下 temperature / top_p 那一套不起作用（接口不报错，只是忽略）；' +
-       '思维链从 reasoning_content 回来，带 tools 的多轮会把它一起回传（端点不认就自动摘掉）。';
+  if (!gpt6) s += '<br>兼容端点对温度和思考参数的支持各不相同；DeepSeek 思考模式会忽略温度参数。';
   el.innerHTML = s;
+}
+function aiIsGpt6Config(model) {
+  return isGPT6Model(model === undefined ? AI.model : model);
+}
+/* 预设只在用户提供新 Key 并明确应用时落盘。打开或取消弹窗不改现役配置。 */
+function aiApplyGpt6Preset(key) {
+  const value = String(key || '').trim();
+  if (!value || AI.busy) return false;
+  AI.base = 'https://api.openai.com/v1/responses'; AI.model = 'gpt-6-astra'; AI.key = value;
+  AI.visBase = ''; AI.visModel = ''; AI.visKey = '';
+  AI.thinkBad = false; AI.thinkNote = ''; AI.streamBad = false; AI.netVia = ''; AI.netNote = '';
+  aiSaveCfg(true);   /* 用户明确换凭证：同时更新备份，不能捡回旧服务商的 Key。 */
+  aiFillCfg(); aiInfo();
+  toast('已应用 OpenAI GPT-6。视觉跟随主接口；发送消息或测试连接时才会发起请求。', 'ok');
+  return true;
+}
+function aiOpenGpt6Preset() {
+  if (AI.busy) { toast('AI 正在回复，请停止或等回复结束后再切换接口。', 'warn'); return Promise.resolve(false); }
+  let savedOpenAIKey = false;
+  try { savedOpenAIKey = new URL(AI.base).origin === 'https://api.openai.com' && !!String(AI.key || '').trim(); } catch (e) {}
+  const keyHelp = savedOpenAIKey
+    ? '<b>已保存 OpenAI API Key。</b>此输入框仅用于更换 Key，所以保持空白，无需重复填写。点“取消”继续使用原 Key。原有 Key 不会跨服务商复用。'
+    : '原有 Key 不会跨服务商复用，请填写 <b>OpenAI API Key</b>。';
+  return new Promise((resolve) => {
+    const el = nfAskBox('<div role="dialog" aria-modal="true" aria-labelledby="ai-gpt6-title" style="' + NF_CARD + '">' +
+      '<div id="ai-gpt6-title" style="padding:12px 16px;border-bottom:1px solid #2a3546;font-weight:600">OpenAI GPT-6</div>' +
+      '<div style="padding:14px 16px;line-height:1.75">应用后主接口切换为 <b>gpt-6-astra</b>，地址为 https://api.openai.com/v1/responses，视觉也跟随主接口。' +
+      '<br>' + keyHelp + '取消会保留当前所有配置；应用仅保存设置，不会立即发送请求。</div>' +
+      '<div style="padding:0 16px"><label for="ai-gpt6-key">OpenAI API Key</label>' +
+      '<input id="ai-gpt6-key" type="password" autocomplete="off" spellcheck="false" placeholder="' + (savedOpenAIKey ? '仅更换 Key 时填写；取消继续使用已保存的 Key' : '填写 OpenAI API Key') + '" style="width:100%;box-sizing:border-box;margin-top:6px;padding:8px;border-radius:6px;border:1px solid #2a3546;background:#0a0f17;color:#dbe6f3;font:inherit">' +
+      '<div id="ai-gpt6-error" role="status" style="min-height:24px;color:#e0a24a;padding-top:4px"></div></div>' +
+      '<div style="display:flex;gap:10px;justify-content:flex-end;padding:0 16px 14px">' +
+      '<button id="ai-gpt6-cancel" style="' + NF_BTN + '">取消</button>' +
+      '<button id="ai-gpt6-apply" style="' + NF_BTN_PRI + '">应用</button></div></div>');
+    const input = el.querySelector('#ai-gpt6-key'), error = el.querySelector('#ai-gpt6-error');
+    let done = false;
+    const finish = (applied) => {
+      if (done) return;
+      done = true; input.value = ''; document.removeEventListener('keydown', onKey, true);
+      el.removeEventListener('mousedown', onOutside); nfAskClose(); resolve(applied);
+    };
+    const apply = () => {
+      if (!input.value.trim()) {
+        error.textContent = savedOpenAIKey ? '已保存 Key；无需更换时请点“取消”继续使用。更换时请填写新的 OpenAI API Key。' : '请填写 OpenAI API Key；当前配置尚未改变。';
+        input.focus(); return;
+      }
+      if (!aiApplyGpt6Preset(input.value)) { error.textContent = 'AI 正在回复，请停止或等回复结束后再应用。'; return; }
+      finish(true);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(false); }
+      else if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); e.stopPropagation(); apply(); }
+    };
+    const onOutside = (e) => { if (e.target === el) finish(false); };
+    document.addEventListener('keydown', onKey, true); el.addEventListener('mousedown', onOutside);
+    el.querySelector('#ai-gpt6-cancel').addEventListener('click', () => finish(false));
+    el.querySelector('#ai-gpt6-apply').addEventListener('click', apply);
+    input.focus();
+  });
 }
 
 /* ---- 16.2c 外部操作：桌面版才有的那条通道 ----
@@ -21336,8 +22406,42 @@ function aiThinkNote() {
    Rust 侧（desktop/src-tauri/src/sys_exec.rs）默认也是关的，页面每次开对话都会同步一次。 */
 function aiSysReady() { return !!SHELL_INVOKE; }
 function aiSysState() { return { ready: aiSysReady(), fs: !!AI.sysFs, run: !!AI.sysRun }; }
+/* 唯一能开这两道门的入口。故意**不挂到 NF 上**：挂上去就会被 list_api 扫给模型，
+   模型一条 run_api 就把权限开了。这个函数是闭包里的，模型够不到。
+   页面上的勾选框处理器调它；除此之外没有第二条路。 */
+function aiUserSetSys(kind, on) {
+  if (kind === 'fs') AI.sysFs = !!on;
+  else if (kind === 'run') AI.sysRun = !!on;
+  else return null;
+  /* 勾掉了就立刻同步（降权）；勾上了先不写本地标志，等 Rust 那边对话框点了「允许」再认账 */
+  if (!on) {
+    return aiSysSync().then(function () { aiSysNote(); aiInfo(); return aiSysState(); });
+  }
+  const wantFs = AI.sysFs, wantRun = AI.sysRun;
+  AI.sysFs = false; AI.sysRun = false;
+  return aiSysSync().then(function () {
+    if (!SHELL_INVOKE) return null;
+    return SHELL_INVOKE('nf_sys_ask_allow', { fs: wantFs, run: wantRun }).catch(function () { return null; });
+  }).then(function (r) {
+    const got = (r && r.length === 2) ? { fs: !!r[0], run: !!r[1] } : { fs: false, run: false };
+    AI.sysFs = got.fs; AI.sysRun = got.run;
+    return aiSysSync().then(function () { aiSysNote(); aiInfo(); aiFillCfg(); return aiSysState(); });
+  });
+}
+/* 模型不许调的脚本接口。判据是「它能改宿主的授权状态或直接落外部副作用」，不是名字像不像 set，
+   否则 NF 上两百多个方法会被粗暴规则误伤。表里的名字现在都不存在于 NF 上——留着是防以后有人加。 */
+const AI_API_BLOCK = {
+  aiSysGrant: '能开本机权限',
+  aiSysAllow: '能直接改本机的权限门',
+  aiSysSync: '能直接改本机的权限门',
+  aiUserSetSys: '能开本机权限',
+  nfSysAllow: '能直接改本机的权限门',
+};
+/* aiConfig 的 sysFs / sysRun 两个字段：不是禁止调 aiConfig（模型确实需要它配本机大模型），
+   是禁止它带上这两个字段。传了就把整次调用顶回去，参数一个都不落。 */
+let sysAskUserOnly = false;
 function aiSysSync() {
-  if (!SHELL_INVOKE) return null;
+  if (!SHELL_INVOKE) return Promise.resolve(null);
   return Promise.resolve(SHELL_INVOKE('nf_sys_allow', { fs: !!AI.sysFs, run: !!AI.sysRun }))
     .catch(function () { return null; });
 }
@@ -21640,14 +22744,24 @@ const AI_TOOLS = [
       if (!AI_BY_NAME[n]) throw new Error('没有这个工具：' + n + '（用 list_tools 看全部）');
       return aiExec(n, (a && a.args) || {});
     } },
-  { name: 'list_api', desc: '列出编辑器挂着的全部脚本接口（名字/参数个数）。工具不够用时先看这里，再用 run_api 调。',
-    args: {}, api: null, run: () => nfKeys().map((k) => k + '/' + kfArity(window.NF[k])) },
+  { name: 'list_api', desc: '列出编辑器挂着的全部脚本接口（名字/参数个数）。工具不够用时先看这里，再用 run_api 调。名字后面：* = 会改工程（改完能撤销）；~ = 会改工程但撤销撤不回这一项；! = 会碰文件/网络/进程，快照撤不了；没标记 = 只读。',
+    args: {}, api: null, run: () => nfKeys().filter((k) => !AI_API_BLOCK[k]).map((k) => k + '/' + kfArity(window.NF[k]) + aiRoleMark(k)) },
   { name: 'run_api', desc: '直接调用脚本接口。name 取自 list_api，args 是按顺序的参数数组，例如 {"name":"setThr","args":[[0,1,2],0.6]}。',
     args: { name: ['str', '接口名'], args: ['json?', '参数数组（可省略）'] }, api: null,
     run: (a) => {
+      if (AI_API_BLOCK[a.name]) throw new Error('这个接口不给模型调：' + a.name + '（' + AI_API_BLOCK[a.name] + '）。要改本机权限请在 AI 面板「设置」里自己勾。');
+      /* aiConfig 里那两个开关字段：整次调用拒掉，别让它以为开成了 */
+      if (a.name === 'aiConfig') {
+        sysAskUserOnly = false;
+        const r0 = window.NF.aiConfig.apply(window.NF, a.args || []);
+        if (sysAskUserOnly) throw new Error('本机操作权限不能由模型改：sysFs / sysRun 已经不从 aiConfig 走了，要开请用户自己在 AI 面板「设置」里勾。当前 fs=' + !!r0.sysFs + ' run=' + !!r0.sysRun + '。');
+        return r0;
+      }
       const f = window.NF[a.name];
       if (typeof f !== 'function') throw new Error('没有这个接口：' + a.name);
-      return f.apply(window.NF, a.args || []);
+      /* 角色表说了算：改工程的先拍一格（成功留着当撤销点，抛错回滚），
+         只读的不进撤销栈，碰外部世界的不拍（拍了也回不去）。见 aiApiTx。 */
+      return aiApiTx(aiApiRole(a.name), () => f.apply(window.NF, a.args || []));
     } },
   { name: 'iface_state', desc: '看接口运行时的状态（紧凑版，不会因为 480 个信号位太长被截断）：总开关、收发帧数、每条通用通道的方向/端口/周期/收了发了多少帧；出通道还会给「最后发出去那串数」的个数、非零个数、最大最小值和头 12 个值——排查闭环到底通没通就看它。要看完整信号位用 iface_full。',
     args: {}, api: 'ifaceBrief', run: () => window.NF.ifaceBrief() },
@@ -21972,6 +23086,8 @@ const AI_TOOLS = [
     run: (a) => window.NF.opParamValues(a.id | 0) },
   { name: 'op_set_param', desc: '改一个算子节点的参数张量（按名字定位）。data 是铺平的数值数组，长度必须跟张量一致。可撤销。', args: { id: ['int', '算子 id'], name: ['str', '参数名（见 ops_info）'], data: ['num[]', '铺平的数值'] }, api: 'opSetParam', mut: true,
     run: (a) => { const r = window.NF.opSetParam(a.id | 0, a.name, a.data || []); if (r && r.ok === false) throw new Error(r.msg || '改参数失败'); return r; } },
+  { name: 'op_param_role', desc: '改一个算子参数的角色（决定编译出来的模型里它是不是可训练）：weight = 可训练权重；stat = 运行统计量（BN 的 mean/var，当 buffer）；const = 字面常量（优化器不该动它）；int = 整型/索引。可撤销。', args: { id: ['int', '算子 id'], name: ['str', '参数名（见 ops_info）'], role: ['str', 'weight / stat / const / int'] }, api: 'opSetParamRole', mut: true,
+    run: (a) => { const r = window.NF.opSetParamRole(a.id | 0, a.name, a.role); if (r && r.ok === false) throw new Error(r.msg || '改角色失败'); return r; } },
   { name: 'ops_of_neuron', desc: '查一个神经元被哪些算子节点引用（落点或输入）。', args: { id: ['int', '神经元 id'] }, api: 'opRefs',
     run: (a) => window.NF.opRefs(a.id | 0) },
   { name: 'select_ops', desc: '选中这些算子节点（板子边框亮起，右栏换到它的小节）。传空数组 = 取消算子节点的选中。', args: { ids: ['int[]', '算子 id'] }, api: 'selectOps',
@@ -22050,6 +23166,7 @@ const AI_TOOLS = [
       const m = window.NF.structModel();
       return { hasSource: true, model: s.model, ops: s.ops, skipped: s.skipped,
                blocks: s.blocks, blockWeights: s.blockWeights, exact: s.exact,
+               exactAll: s.exactAll, report: s.report,
                layout: s.layout, spansCoarse: s.spansCoarse,
                structMode: m.mode, structNodes: m.nodes.length };
     } },
@@ -22378,6 +23495,84 @@ async function aiUserToolDelete(a) {
 }
 
 /* ---- 16.4 系统提示词 ---- */
+/* ---- 脚本接口的角色表（审计 B03）-----------------------------------------------
+   AI 的 run_api 能调到 window.NF 上的任何东西。哪些调用会改工程、哪些只是读，
+   决定了「要不要为它开一次撤销事务」：
+     mut  = 改到快照抓得住的东西（神经元 / 连接 / 权重 / 名字 / 分组 / 块 / 算子 / 选中 / 可塑档位）。
+            通用调用会先拍一格，成功留着（一次撤销回到原样），抛错回滚到拍之前。
+     flat = 确实改了会存进工程的东西，但撤销快照抓不住（接口接线 / 随机种子 / 记录步数）。
+            拍了也回不去，所以不拍；list_api 里标出来，让模型知道这一步撤不回来。
+     ext  = 会碰外面的世界（文件 / 网络 / 进程 / 串口）。工程快照撤不了它，失败也回滚不了。
+     read = 纯读，或者只动相机 / 显示设置 / 界面 / AI 自己的会话。
+   没列进表的按 mut 处理：宁可多拍一格，也不能让模型的修改撤不回来。
+   名单由 prototype/check_b03_roles.mjs 把着：列进 read / flat 的接口，源码里一旦出现
+   写工程数据的动作就会当场报错（名单漏了比多拍一格坏得多）。 */
+const AI_API_ROLE_MUT = ("loadBuffer loadV2 streamOpen streamOpenPath streamLoad streamLoadAll streamBlocks streamReset select marquee setColor rainbow setIO setThr setBias setAct setLock setEdgeLock setPos setName setW addEdge addNode delNodes clear tuneWeights pruneByWeight pruneRandom pruneUnused pruneOrphans distPick selectIds groupCompact setGroup groupAdd groupRemove setHidden showAllHidden saveView setPlast setHard plastReset plastAdd plastSet plastDel plastApply simCompute simRun place bulkPlace batchConnect relayout addBlock delBlocks blockShare blockUnshare packSelected expandBlockById selectBlocks addOp delOps opSetParam opSetParamRole opSetPos selectOps instantiate moduleImport autosaveRestore distPrune snapshot").split(' ');
+const AI_API_ROLE_FLAT = ("seed ifaceOn ifaceBind ifaceBindOut ifaceFeedMany ifaceFeed ifaceKey ifaceForward ifaceMinGap ifaceStateMode ifaceResetState ifaceManual ifaceClear ifaceLogClear ifaceQuickBind ifaceChanAdd ifaceChanSet ifaceChanDel ifaceChanEmit ifaceChanFeed ifaceApply recSetSteps wrapSelection moduleDrop moduleClear").split(' ');
+const AI_API_ROLE_EXT = ("exportFiles saveTo exportArtifacts autosaveOn autorestore autosaveNow autosaveProbe autosaveForget wireMujoco aiSend aiShot aiEndpoint aiLocalProbe aiLocalModels aiLocalTest aiLocalUse aiCfgBoot aiSaveCfg aiDefineTool defineTool aiUserToolsReload aiNewSession aiSessionNew aiSessionLoad aiSessionRename aiSessionDel aiSessionReset aiArchivePut aiArchiveLoad aiArchiveDel aiReloadCfg ifaceChanOpen ifaceChanClose").split(' ');
+const AI_API_ROLE_READ = ("version ext histStats adjAudit selListAudit adjSkipStats histVerify restoreFastStats bigBufHash histMarks nameStats autosaveInfo histLimit encodeV3 spatialPlan mortonCodes round3 checkIndex inspectFile serializeV2 detectFile inShell showChunks chunkPanel chunkIds canZip blockPartCount streamState streamAuto streamMinPx streamMaxN streamBlocksAuto streamPick streamTickNow streamLiveN streamMemMax streamEvictOn streamPlan streamBoxes streamOff graph analyze node edge renderColor instPos instScale bigTexPos renderEdgeColor debugScene screenOf highlight stats placement setPlacement pickEdgeAt pickBench selectedNodes selectedEdges ioLists ifaceState ifaceBrief ifaceLog ifaceChanList ifaceCodecProbe ifaceSlots ifacePanel ifaceSerialize simState simLimit simClear simPush recSteps sourceOf sourceLabel sourceSummary sourceShared structModel structView structTab openSourceReport viewScale radiusOf edgeWidthOf strengthOf setLod setLang lang capState bigProbe bigState lodState edgeWMinBudget edgeWMin setEdgeWMin orphans cull renderProbe camState camFocus camCenter camFollow camPan camPanHold camPanFrame panAuto panState camBounds fog plateFade plastRules plastOf plastProfiles plastList plastStats plastLearn plastLearned themes appear setTheme setViewportBg setViewportBgHex neuronPalette fogState camFar frameGraph resetView graphBounds viewFill langDetect starter starterForce voidHint setCam chunkCoverage cullSafety chunkState grabFrame renderOnly glInfo pixelDiff live edgesOf weightStats insight dist openDist distSummary findNodes groupOf groupsOfNode groupMembers groupCount hiddenCount hiddenNodes hiddenEdges neuronHidden edgeHidden openNodeList views view2 view2State orbit gotoView acts ir compile artifacts modules moduleExport focusOp opsInfo opsStats opRefs opParamValues opView opViewStats opColorOf pickOpAt opTexel opSimWaves blocksInfo blockTotal blockTotalAll blockWeights blockArrId blockIds blockStatsOf blockView blockViewStats blockTexel pickBlockAt blockGroups panels setPanels aiState aiPrompt aiPromptSlim aiPromptFull aiLocalPresets aiLocalNote aiStateLine aiManualOutline aiManualSection aiManual aiCommands aiTools aiAudit aiLog shot aiVis aiTool aiUserTools aiBakKey aiTrim aiMsgsFix aiTrimList aiSetUI aiThinkLevel aiSessions aiSessionRead aiSessionDoc aiLogCleanTest aiArchive aiConfig nameOf forceRebuild rebuild bigSet flushPos setHoverOp setHoverNode setHoverBlock streamEvictKeep regionMap regionCells groups nodeListScan setCamera screenOfPoint aiEnv undo redo").split(' ');
+const AI_API_ROLE = (function () {
+  const m = Object.create(null);
+  const put = (list, role) => { for (const n of list) m[n] = role; };
+  put(AI_API_ROLE_READ, 'read'); put(AI_API_ROLE_FLAT, 'flat');
+  put(AI_API_ROLE_EXT, 'ext'); put(AI_API_ROLE_MUT, 'mut');
+  return m;
+})();
+function aiApiRole(name) { return AI_API_ROLE[name] || 'mut'; }
+function aiRoleMark(name) {
+  const r = aiApiRole(name);
+  return r === 'read' ? '' : (r === 'mut' ? ' *' : (r === 'flat' ? ' ~' : ' !'));
+}
+/* 通用调用的事务外壳。为什么不能只在工具表的 mut 上拍快照：run_api 能调到整个
+   NF 表面，偏置 / 阈值 / 连接 / 分组 / 名字这些常见修改都没有单独立成工具，
+   改完撤不回来，抛错时前面写进去的半截还留在图上（审计 B03）。
+   回滚按「撤到我们自己那一格为止」走：被调的接口内部可能又拍了几格。 */
+/* 把一次通用调用留下的痕迹收干净（审计 B03）。
+   pull = true：连数据一起还原 —— 调用抛错了，抛错前写进去的那半截也必须没。
+   pull = false：只把栈里我们自己那一格抽掉 —— 被调的接口自己又拍了一格（分组 / 算子 /
+   块这些内部本来就先拍一格），两格内容一模一样，留着用户要按两次撤销才动一下。
+   为什么不能像以前那样只 unSnapshot()：那只是「认下这一格」、并不把数据写回去，
+   遇到写了一半才抛错的接口，半截改动就留在图上了。 */
+function aiTxUndoSt(st, pull, tail) {
+  const i = st ? history.stack.indexOf(st) : -1;
+  if (i < 0) return false;
+  history.stack.splice(i, 1);
+  history.head = history.stack.length - 1;
+  histOnCp = false;
+  if (pull) {
+    /* 还原之前必须先把 c.prev 刷成「现在这一份」：restore 只抄「prev 跟快照不一样」的那些块，
+       而快照拍完之后 prev 还指着快照那一份（内容 == 快照）—— 不刷就等于 diff 判成「没动」，
+       半路写坏的半截还原不回来。半路退出的写入不一定打过登记，所以强制整列比一遍。 */
+    histForceAll = 1;
+    captureState();
+    restore(st);
+  }
+  /* 拍快照会把「重做」尾巴截掉（snapshot 里那句 stack.length = head + 1）。
+     这一次调用撤销了（抛错回滚），就等于什么都没发生，尾巴得原样接回去 ——
+     不然模型一次失败的操作会把用户的重做记录吃掉。 */
+  if (tail && tail.length) for (let k = 0; k < tail.length; k++) history.stack.push(tail[k]);
+  updateUndoButtons();
+  return true;
+}
+/* 通用接口调用的事务外壳。为什么不能只在工具表的 mut 上拍快照：run_api 能调到整个
+   NF 表面，偏置 / 阈值 / 连接 / 分组 / 名字这些常见修改都没有单独立成工具，
+   改完撤不回来，抛错时前面写进去的半截还留在图上（审计 B03）。 */
+function aiApiTx(role, fn) {
+  if (role !== 'mut') return fn();
+  const tail = history.stack.slice(history.head + 1);   /* 被快照顶掉的「重做」尾巴 */
+  let st = null;
+  try { st = snapshot(); } catch (e) { st = null; }
+  let r;
+  try { r = fn(); } catch (e) { aiTxUndoSt(st, true, tail); throw e; }
+  const settle = (v) => {
+    if (st && history.stack[history.stack.length - 1] !== st) aiTxUndoSt(st, false);
+    return v;
+  };
+  /* 有几个接口是异步的（存盘 / 发请求）：失败也要回滚，不然半截改动留在图上 */
+  if (r && typeof r.then === 'function') return r.then(settle, (e) => { aiTxUndoSt(st, true, tail); throw e; });
+  return settle(r);
+}
+
 function nfKeys() { return Object.keys(window.NF || {}); }
 function kfArity(f) { try { return f.length; } catch (e) { return 0; } }
 function r3(v) { return Math.round((v || 0) * 1000) / 1000; }
@@ -22609,7 +23804,7 @@ function aiLocalNote(msg) {
   el.innerHTML = loc
     ? ('<b style="color:#5ac8a0">本机/内网端点</b>（' + aiEsc(h) + '）：<b>不用填 Key</b>，请求不出公网；' +
        '提示词现在是' + (aiSlimOn() ? '<b>瘦身版</b>（' + Math.round(aiManualOutline().length / 100) / 10 + ' 千字）' : '完整版（约 6.4 万字符）')) +
-      '。不知道模型名就按「拉模型列表」。'
+      '。不知道模型名就按「刷新模型列表」，再从「选择模型」里挑选。'
     : ('云端端点（' + aiEsc(h) + '，' + keyN + '）：提示词和对话会发到这台机器外面。' +
        '想换成自己机器上的大模型，按「探测本机」，或者从左边那一栏挑一个——那种不用 Key、也不出网。') +
       (aiSlimOn() ? ' 现在发的是瘦身提示词。' : '');
@@ -22621,9 +23816,16 @@ function aiBaseNormalize(v) {
   let b = String(v || '').trim();
   if (!b) return '';
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(b)) b = 'http://' + b;
-  b = b.replace(/\/+$/, '').replace(/\/chat\/completions$/i, '').replace(/\/models$/i, '').replace(/\/+$/, '');
-  if (!/\/v\d+$/i.test(b)) b += '/v1';
-  return b + '/chat/completions';
+  try {
+    const u = new URL(b);
+    let path = u.pathname.replace(/\/+$/, '');
+    if (!path) path = '/v1/chat/completions';
+    else if (/\/models$/i.test(path)) path = path.replace(/\/models$/i, '') + '/chat/completions';
+    else if (/\/v\d+[a-z0-9.-]*$/i.test(path)) path += '/chat/completions';
+    /* 显式 /responses、/chat/completions 和自定义端点原样保留，不再插入第二个 /v1。 */
+    u.pathname = path;
+    return u.href;
+  } catch (e) { return b; }
 }
 /* AI 自己的接口开关：用户说「用我本机的模型」就调它。只改接口和模型名，
    不碰对话历史，也不碰工程。还回一份现场状态，省得 AI 改完不知道自己现在在哪儿说话。 */
@@ -22657,6 +23859,7 @@ async function aiEndpointTool(a) {
 /* 测试连接：真的发一句话过去。除了「通不通」，还顺手试一下它认不认 tools 参数——
    这是本地小模型最常踩的坑（认了但不调、或者干脆回 400）。 */
 async function aiLocalTest() {
+  if (usesResponses(AI.base, AI.model)) return aiResponsesConnectionTest();
   const el = document.getElementById('ai-localnote');
   const say = (h) => { if (el) el.innerHTML = h; };
   const url = AI.base;
@@ -22707,6 +23910,43 @@ async function aiLocalTest() {
     (via === '直连' ? '' : '<br>注意：走内部通道时发不出流式，回答会一次性出来。'));
   return true;
 }
+/* GPT-6 的连接测试也走同一协议：只请求一个无副作用的 ping，不执行工程工具。 */
+async function aiResponsesConnectionTest() {
+  const el = document.getElementById('ai-localnote');
+  const say = (s) => { if (el) el.innerHTML = s; };
+  const url = responsesURL(AI.base), model = AI.model, key = String(AI.key || '').trim();
+  if (!key && !aiIsLocal(url)) { say('请先填写这个接口的 API Key。'); return false; }
+  const ac = new AbortController(), timer = setTimeout(() => ac.abort(), 60000);
+  const started = Date.now();
+  say('正在测试 GPT / Responses 连接和工具调用……（最多 60 秒）');
+  try {
+    const body = buildResponsesRequest({ model, messages: [{ role: 'user', content: '调用 nf_ping，text 填收到。' }],
+      tools: [{ type: 'function', function: { name: 'nf_ping', description: '无副作用的连接测试',
+        parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } } }],
+      stream: false, maxOutputTokens: 4096, reasoningEffort: isGPT6Model(model) ? 'low' : 'default' });
+    body.tool_choice = { type: 'function', name: 'nf_ping' };
+    const headers = { 'Content-Type': 'application/json' };
+    if (key) headers.Authorization = 'Bearer ' + key;
+    let res;
+    try { res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: ac.signal }); }
+    catch (e) {
+      if (ac.signal.aborted) throw e;
+      res = await aiShellPost(url, body, headers, ac.signal);
+      if (!res) throw e;
+    }
+    if (ac.signal.aborted) throw new DOMException('连接测试超时', 'AbortError');
+    const raw = await res.text();
+    if (!res.ok) throw new Error('HTTP ' + res.status + '：' + raw.slice(0, 300));
+    const result = decodeResponses(JSON.parse(raw));
+    const called = (result.message.tool_calls || []).some((t) => t.function && t.function.name === 'nf_ping');
+    if (!called) throw new Error('接口返回成功，但没有返回要求的 nf_ping 工具调用。');
+    say('<b style="color:#5ac8a0">连接和工具调用通过</b>：' + (Date.now() - started) + 'ms，模型 ' + aiEsc(model) + '。已收到有效工具调用，测试未修改工程。');
+    return true;
+  } catch (e) {
+    say('<b style="color:#e0704a">测试失败</b>：' + aiEsc(ac.signal.aborted ? '超过 60 秒，请检查网络后重试。' : String((e && e.message) || e)));
+    return false;
+  } finally { clearTimeout(timer); }
+}
 /* 预设下拉：只在空的时候建一次，之后别把用户选中的那一条冲掉 */
 function aiLocalFill() {
   const sel = document.getElementById('ai-local-preset');
@@ -22726,16 +23966,75 @@ function aiLocalFill() {
     }
   }
 }
-function aiLocalFillList(list) {
+function aiModelsScope() {
+  return { base: String(AI.base || '').trim(), key: String(AI.key || '').trim() };
+}
+function aiModelsScopeSame(a, b) {
+  return !!a && !!b && a.base === b.base && a.key === b.key;
+}
+function aiModelsSyncScope() {
+  const scope = aiModelsScope();
+  if (!aiModelsScopeSame(AI_MODELS.scope, scope)) {
+    AI_MODELS.scope = scope; AI_MODELS.list = []; AI_MODELS.seq++;
+    AI_MODELS.loading = false; AI_MODELS.loaded = false; AI_MODELS.note = '';
+  }
+  return scope;
+}
+function aiModelListRender() {
+  aiModelsSyncScope();
   const sel = document.getElementById('ai-local-mlist');
-  if (!sel) return;
-  const keep = sel.value;
-  sel.innerHTML = '';
-  const o0 = document.createElement('option');
-  o0.value = ''; o0.textContent = (list && list.length) ? '（下面挑一个，或者手填）' : '（还没拉到列表）';
-  sel.appendChild(o0);
-  for (const m of (list || [])) { const o = document.createElement('option'); o.value = m; o.textContent = m; sel.appendChild(o); }
-  if (keep && (list || []).indexOf(keep) >= 0) sel.value = keep;
+  const current = String(AI.model || '').trim();
+  if (sel) {
+    sel.innerHTML = '';
+    const add = (value, label) => { const o = document.createElement('option'); o.value = value; o.textContent = label; sel.appendChild(o); };
+    add(current, current ? current + '（当前）' : '（请选择或手填模型 ID）');
+    for (const model of AI_MODELS.list) if (model !== current) add(model, model);
+    sel.value = current;
+  }
+  const button = document.getElementById('ai-local-models');
+  if (button) { button.disabled = AI_MODELS.loading; button.textContent = AI_MODELS.loading ? '正在刷新…' : '刷新模型列表'; }
+  const note = document.getElementById('ai-modelnote');
+  if (note) note.textContent = AI_MODELS.note || (AI_MODELS.loaded
+    ? '列表已更新，共 ' + AI_MODELS.list.length + ' 个候选模型。当前模型保持不变，请自行选择。'
+    : '当前模型已显示。刷新可获取这个接口的其他模型，也可直接手填模型 ID。');
+}
+/* 只更新候选项；当前模型即使未出现在服务端清单中也始终保留。 */
+function aiLocalFillList(list, scope) {
+  const current = aiModelsSyncScope();
+  if (scope && !aiModelsScopeSame(scope, current)) return false;
+  AI_MODELS.list = Array.from(new Set((list || []).map((m) => String(m || '').trim()).filter(Boolean)));
+  AI_MODELS.loaded = true; AI_MODELS.note = '';
+  aiModelListRender();
+  return true;
+}
+async function aiRefreshModels() {
+  const scope = aiModelsSyncScope(), seq = ++AI_MODELS.seq;
+  AI_MODELS.loading = true; AI_MODELS.note = '正在获取当前接口的模型列表……'; aiModelListRender();
+  const stale = () => seq !== AI_MODELS.seq || !aiModelsScopeSame(scope, aiModelsScope());
+  try {
+    const list = await aiLocalModels(scope.base, scope);
+    if (stale()) return { ok: false, stale: true };
+    aiLocalFillList(list, scope);
+    if (!AI_MODELS.list.length) AI_MODELS.note = '这个接口返回了空列表。当前模型保持不变，仍可手填模型 ID。';
+    return { ok: true, list: AI_MODELS.list.slice() };
+  } catch (e) {
+    if (stale()) return { ok: false, stale: true };
+    const err = String((e && e.message) || e);
+    AI_MODELS.note = '刷新失败：' + err + '。当前模型保持不变，仍可手填模型 ID。';
+    return { ok: false, err: err };
+  } finally {
+    if (!stale()) { AI_MODELS.loading = false; aiModelListRender(); }
+  }
+}
+function aiSelectModel(value) {
+  const model = String(value || '').trim();
+  if (!model) { aiModelListRender(); return false; }
+  if (model !== AI.model) { AI.thinkBad = false; AI.thinkNote = ''; AI.streamBad = false; }
+  AI.model = model;
+  const field = document.getElementById('ai-model'); if (field) field.value = model;
+  aiSaveCfg(); aiFillCfg(); aiInfo();
+  toast('模型：' + model, 'ok');
+  return true;
 }
 /* 选中某一条预设 → 填地址。模型名只在当前还是云端默认名（deepseek*）时才顺手换掉，
    免得把用户自己填的模型名冲了。 */
@@ -22750,10 +24049,17 @@ function aiLocalUse(id) {
   return p;
 }
 function aiLocalBase(port) { return 'http://127.0.0.1:' + port + '/v1/chat/completions'; }
-/* 接口地址 → 根（去掉 /chat/completions）。拉模型列表、测试连接都从这儿接。 */
+/* 接口地址 → 根（去掉 /chat/completions、/responses 或 /models）。拉模型列表从这儿接。 */
 function aiBaseRoot(base) {
-  return String(base === undefined ? AI.base : base).trim()
-    .replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
+  const value = String(base === undefined ? AI.base : base).trim();
+  try {
+    const u = new URL(value);
+    u.pathname = u.pathname.replace(/\/+$/, '').replace(/\/(?:chat\/completions|responses|models)$/i, '');
+    u.search = ''; u.hash = '';
+    return u.href.replace(/\/+$/, '');
+  } catch (e) {
+    return value.replace(/[?#].*$/, '').replace(/\/+$/, '').replace(/\/(?:chat\/completions|responses|models)$/i, '');
+  }
 }
 /* 探测本机在开哪些推理服务：并发打一圈 /v1/models，谁答话算谁。
    这是「配置本地大模型」最省事的一步——用户不用知道自己的端口是多少。900ms 没回就当没开。 */
@@ -22779,15 +24085,27 @@ async function aiLocalProbe() {
   return hits;
 }
 /* 拉一次 /models：先直连，被跨域挡住就走软件内部通道（GET）。 */
-async function aiModelsOnce(url) {
+async function aiModelsOnce(url, scope) {
+  scope = scope || aiModelsScope();
+  if (!aiModelsScopeSame(scope, aiModelsScope())) return { ok: false, stale: true, err: '接口或 Key 已变更，请重新刷新模型列表' };
   const ac = (typeof AbortController === 'function') ? new AbortController() : null;
   const tm = setTimeout(() => { try { ac.abort(); } catch (e) {} }, 4000);
+  const headers = {};
+  /* 拉列表只向当前主接口的同源地址提供凭证，探测别的服务不能借用这把 Key。 */
+  try {
+    const target = new URL(url), configured = new URL(scope.base), key = scope.key;
+    if (/^https?:$/.test(target.protocol) && target.origin === configured.origin && key) headers.Authorization = 'Bearer ' + key;
+  } catch (e) { /* 地址尚不完整时沿用无凭证请求，由原错误提示处理。 */ }
   try {
     let r = null;
-    try { r = await fetch(url, { signal: ac ? ac.signal : undefined }); } catch (e) { r = null; }
-    if (!r || !r.ok) r = await aiShellGet(url, 8000);
+    try { r = await fetch(url, { headers: headers, signal: ac ? ac.signal : undefined }); } catch (e) { r = null; }
+    if (!aiModelsScopeSame(scope, aiModelsScope())) return { ok: false, stale: true, err: '接口或 Key 已变更，请重新刷新模型列表' };
+    if (!r || !r.ok) {
+      const fallback = await aiShellGet(url, 8000, headers);
+      if (fallback && (!r || fallback.ok)) r = fallback;
+    }
     if (!r) return { ok: false, err: '连不上 ' + url };
-    if (!r.ok) return { ok: false, err: 'HTTP ' + r.status + '：' + String(await r.text()).slice(0, 200) };
+    if (!r.ok) return { ok: false, status: r.status, err: 'HTTP ' + r.status + '：' + String(await r.text()).slice(0, 200) };
     const j = await r.json();
     return { ok: true, list: ((j && j.data) || []).map((m) => String(m.id || '')).filter(Boolean) };
   } finally { clearTimeout(tm); }
@@ -22795,15 +24113,19 @@ async function aiModelsOnce(url) {
 /* 拉模型列表：根 + /models（OpenAI 兼容端点都有这一条）。
    为什么要试两个地址：「接口地址」里只填了 http://127.0.0.1:11434 这种根的人不少，
    这时候 /models 是 404、/v1/models 才对。不带 /v1 就多试一次，不用让用户去猜哪个对。 */
-async function aiLocalModels(base) {
+async function aiLocalModels(base, scope) {
+  scope = scope || aiModelsScope();
   const root = aiBaseRoot(base);
   const urls = [root + '/models'];
   if (!/\/v\d+$/i.test(root)) urls.push(root + '/v1/models');
   let last = '';
   for (const u of urls) {
-    const r = await aiModelsOnce(u);
+    if (!aiModelsScopeSame(scope, aiModelsScope())) throw new Error('接口或 Key 已变更，请重新刷新模型列表');
+    const r = await aiModelsOnce(u, scope);
+    if (r.stale || !aiModelsScopeSame(scope, aiModelsScope())) throw new Error('接口或 Key 已变更，请重新刷新模型列表');
     if (r.ok) return r.list;
     last = r.err || '';
+    if (r.status && r.status !== 404) break;
   }
   throw new Error(last || ('连不上 ' + urls[0]));
 }
@@ -22827,7 +24149,7 @@ async function aiShellHttp(cmd, url, body, headers, timeoutMs, method) {
   } catch (e) { return null; }
 }
 /* GET 也得带上方法名：拉模型列表是 GET，当成 POST 发出去服务那边只会回 404。 */
-async function aiShellGet(url, timeoutMs) { return aiShellHttp('nf_ai_http', url, '', {}, timeoutMs, 'GET'); }
+async function aiShellGet(url, timeoutMs, headers) { return aiShellHttp('nf_ai_http', url, '', headers || {}, timeoutMs, 'GET'); }
 async function aiShellPost(url, bodyObj, hdr, signal) {
   if (signal && signal.aborted) return null;
   const b = JSON.stringify(Object.assign({}, bodyObj, { stream: false }));
@@ -22967,8 +24289,9 @@ const AI_THINK = [
   { k: 'default', label: '跟随接口默认' },
   { k: 'off', label: '关（不思考）' },
   { k: 'low', label: '低（low）' },
-  { k: 'medium', label: '中（接口映射成 high）' },
+  { k: 'medium', label: '中（medium）' },
   { k: 'high', label: '高（high）' },
+  { k: 'xhigh', label: '更高（xhigh）' },
   { k: 'max', label: '最高（max）' },
 ];
 /* 服务端 429 / 5xx（限流、排队、太忙）：不把整轮对话当场掐死，等一会儿自己重发。 */
@@ -23004,14 +24327,36 @@ function aiMsgsSysSync(messages) {
   return true;
 }
 function aiMsgsWire(list, withThink) {
-  if (withThink) return list;
   const out = [];
   for (let i = 0; i < list.length; i++) {
     const m = list[i];
-    if (m && m.reasoning_content !== undefined) { const c = Object.assign({}, m); delete c.reasoning_content; out.push(c); continue; }
+    if (m && (m.responses_output !== undefined || m.responses_context !== undefined || (!withThink && m.reasoning_content !== undefined))) {
+      const c = Object.assign({}, m);
+      delete c.responses_output; delete c.responses_context;
+      if (!withThink) delete c.reasoning_content;
+      out.push(c); continue;
+    }
     out.push(m);
   }
   return out;
+}
+/* Responses 的加密推理项只回送原接口和原模型；切换服务后仍可使用普通对话历史。 */
+function aiResponsesMessages(list, context) {
+  return list.map((m) => {
+    if (!m || !m.responses_output) return m;
+    const c = m.responses_context;
+    if (c && c.base === context.base && c.model === context.model) return m;
+    const copy = Object.assign({}, m);
+    delete copy.responses_output; delete copy.responses_context;
+    return copy;
+  });
+}
+function aiResponsesResult(result, context) {
+  if (result.usage) AI.usage = result.usage;
+  AI.lastFinish = result.finishReason || '';
+  const msg = result.message;
+  if (msg.responses_output) msg.responses_context = context;
+  return msg;
 }
 /* 端点不认思考参数时的收尾：记住结论 + 在对话里说明白（不装作没发生） */
 function aiThinkReject(status, text) {
@@ -23036,23 +24381,31 @@ function aiAutoMaxTok(stream) {
 }
 
 async function aiChatFetch(stream, messages, useTools, V, signal, maxTokens) {
+  const base = V ? V.base : AI.base, model = V ? V.model : AI.model;
+  const responses = usesResponses(base, model);
+  const context = { base: responses ? responsesURL(base) : base, model: model };
   for (let attempt = 0; ; attempt++) {
-    const think = attempt === 0 ? (V ? null : aiThinkFields()) : null;
+    const think = !responses && attempt === 0 ? (V ? null : aiThinkFields()) : null;
     /* 默认档位下也把上一轮的思维链回传：DeepSeek 官方要求「请求里带 tools 时 reasoning_content 要带上」。
        万一端点不认这个字段，下面那条 4xx 分支会把两者一起摘掉重发。 */
-    const withRC = attempt === 0 && !V && !AI.thinkBad && (aiThinkNorm(AI.think) === 'default' || !!think);
+    const withRC = !responses && attempt === 0 && !V && !AI.thinkBad && (aiThinkNorm(AI.think) === 'default' || !!think);
     aiMsgsSysSync(messages);
     const wire = aiMsgsSanitize(messages);
     let sentRC = false;
     if (withRC) for (let i = 0; i < wire.length; i++) if (wire[i] && wire[i].reasoning_content !== undefined) { sentRC = true; break; }
-    const url = V ? V.base : AI.base;
+    const url = context.base;
     const key = String((V ? V.key : AI.key) || '').trim();
     /* 最大输出：本地模型显存小，在设置里压一个上限（0 = 用内置默认：非流式 3000 / 流式 4000） */
     const maxTok = (AI.maxTok | 0) > 0 ? (AI.maxTok | 0) : maxTokens;
-    const body = { model: V ? V.model : AI.model, messages: aiMsgsWire(wire, withRC),
-      temperature: aiTempNorm(), max_tokens: maxTok, stream: !!stream };
-    if (think) Object.assign(body, think);
-    if (useTools) { body.tools = aiToolSchema(); body.tool_choice = 'auto'; }
+    const body = responses
+      ? buildResponsesRequest({ model, messages: aiResponsesMessages(wire, context),
+          tools: useTools ? aiToolSchema() : [], stream: !!stream,
+          maxOutputTokens: maxTok, reasoningEffort: AI.think })
+      : { model, messages: aiMsgsWire(wire, withRC), temperature: aiTempNorm(), max_tokens: maxTok, stream: !!stream };
+    if (!responses) {
+      if (think) Object.assign(body, think);
+      if (useTools) { body.tools = aiToolSchema(); body.tool_choice = 'auto'; }
+    }
     const hdr = { 'Content-Type': 'application/json' };
     /* 本机端点（Ollama / LM Studio / llama.cpp）不校验 Key：空着就别发一个空的 Authorization，
        有的服务会把它当成「给了把错钥匙」直接 401。 */
@@ -23095,12 +24448,14 @@ async function aiChatFetch(stream, messages, useTools, V, signal, maxTokens) {
       aiThinkReject(res.status, t);
       continue;
     }
-    return { res: res, think: think };
+    if (signal && signal.aborted) throw new DOMException('已取消', 'AbortError');
+    return { res: res, think: think, responses: responses, context: context };
   }
 }
 async function aiFetchChat(messages, useTools, vis, signal) {
   const V = vis || null;
-  const res = (await aiChatFetch(false, messages, useTools, V, signal, aiAutoMaxTok(false))).res;
+  const request = await aiChatFetch(false, messages, useTools, V, signal, aiAutoMaxTok(false));
+  const res = request.res;
   const text = await res.text();
   if (!res.ok) {
     const err = new Error('接口返回 HTTP ' + res.status + '：' + text.slice(0, 400));
@@ -23109,6 +24464,8 @@ async function aiFetchChat(messages, useTools, vis, signal) {
   }
   let data;
   try { data = JSON.parse(text); } catch (e) { throw new Error('返回的不是 JSON：' + text.slice(0, 200)); }
+  if (signal && signal.aborted) throw new DOMException('已取消', 'AbortError');
+  if (request.responses) return aiResponsesResult(decodeResponses(data), request.context);
   if (data && data.error) throw new Error('接口报错：' + aiJson(data.error, 300));
   const ch = data && data.choices && data.choices[0];
   if (!ch || !ch.message) throw new Error('返回里没有 choices[0].message');
@@ -23123,7 +24480,8 @@ async function aiFetchChat(messages, useTools, vis, signal) {
    tool_calls 在流里是一段一段挤出来的：按 index 攒，name 和 arguments 都是拼接。 */
 async function aiFetchChatStream(messages, useTools, vis, onDelta, signal) {
   const V = vis || null;
-  const res = (await aiChatFetch(true, messages, useTools, V, signal, aiAutoMaxTok(true))).res;
+  const request = await aiChatFetch(true, messages, useTools, V, signal, aiAutoMaxTok(true));
+  const res = request.res;
   if (!res.ok) {
     let t = '';
     try { t = await res.text(); } catch (e) {}
@@ -23131,6 +24489,7 @@ async function aiFetchChatStream(messages, useTools, vis, onDelta, signal) {
     err.status = res.status;
     throw err;
   }
+  if (request.responses) return aiResponsesResult(await readResponsesStream(res, onDelta, signal), request.context);
   if (res.__nfNoStream || !res.body || typeof res.body.getReader !== 'function') {
     /* 壳子不给流：退回一次性解析（跟非流式一样） */
     const text = await res.text();
@@ -23247,10 +24606,11 @@ async function aiExec(name, args) {
       if (!yes) return { ok: false, error: '用户拒绝了这次操作。' };
     }
   }
+  let txState = null, txTail = null;
   const done = (r) => { AI.runs++; return { ok: true, result: r === undefined ? 'ok' : r }; };
-  const fail = (e) => { if (t.mut) unSnapshot(); return { ok: false, error: aiErrText(e) }; };
+  const fail = (e) => { if (t.mut) aiTxUndoSt(txState, true, txTail); return { ok: false, error: aiErrText(e) }; };
   try {
-    if (t.mut) snapshot();
+    if (t.mut) { txTail = history.stack.slice(history.head + 1); txState = snapshot(); }
     const r = t.run(args);
     /* 外部操作那几个工具要过 Rust 那道门，是异步的；别的还是同步的。
        异步的返回 Promise，调用方（aiAsk / NF.aiTool）都 await 一下就行。 */
@@ -23346,6 +24706,8 @@ async function aiAsk(text, image) {
           aiPush({ role: 'note', text: '你按停了：正在写的那条回答已经掐断。' });
           break;
         }
+        /* Responses 错误有明确语义，不能把鉴权/限额/截断等错误误判为不支持工具或看图。 */
+        if ((e && e.noToolFallback) || usesResponses(visForCall ? visForCall.base : AI.base, visForCall ? visForCall.model : AI.model)) throw e;
         const four = !!(e && e.status >= 400 && e.status < 500);
         const why = aiErrText(e);
         /* 端点不认流式：关掉流式，这一步原样重来——是端点的事，不该算用户一次失败 */
@@ -23391,7 +24753,9 @@ async function aiAsk(text, image) {
           : '(这条没有文字回复)');
         AI.live = ''; AI.liveThink = '';
         aiPush({ role: 'assistant', text: say, think: msg.reasoning_content || '' });
-        AI.msgs.push({ role: 'assistant', content: say });
+        const answer = { role: 'assistant', content: say };
+        if (msg.responses_output) { answer.responses_output = msg.responses_output; answer.responses_context = msg.responses_context; }
+        AI.msgs.push(answer);
         break;
       }
       AI.live = ''; AI.liveThink = '';
@@ -23401,9 +24765,14 @@ async function aiAsk(text, image) {
         /* 带 tools 的多轮里，上一轮的 reasoning_content 要跟着回传（DeepSeek 官方要求）。
            端点不认这个字段的话，aiMsgsWire 会在退回那一次里把它摘掉。 */
         if (msg.reasoning_content) am.reasoning_content = msg.reasoning_content;
+        if (msg.responses_output) { am.responses_output = msg.responses_output; am.responses_context = msg.responses_context; }
         AI.msgs.push(am);
       }
-      else AI.msgs.push({ role: 'assistant', content: String(msg.content || '') });
+      else {
+        const am = { role: 'assistant', content: String(msg.content || '') };
+        if (msg.responses_output) { am.responses_output = msg.responses_output; am.responses_context = msg.responses_context; }
+        AI.msgs.push(am);
+      }
       const turnNames = [];
       let turnFails = 0;
       AI.inTurn = true;
@@ -23439,6 +24808,7 @@ async function aiAsk(text, image) {
     }
   } catch (e) {
     AI.lastErr = String((e && e.message) || e);
+    if (e && e.partialContent) aiPush({ role: 'assistant', text: String(e.partialContent) });
     aiPush({ role: 'error', text: AI.lastErr });
   } finally {
     AI.abort = null;
@@ -23513,6 +24883,10 @@ function aiMsgStore(m) {
   if (m.tool_calls) o.tool_calls = m.tool_calls;
   if (m.tool_call_id !== undefined) o.tool_call_id = m.tool_call_id;
   if (m.name) o.name = m.name;
+  if (Array.isArray(m.responses_output)) {
+    o.responses_output = m.responses_output;
+    o.responses_context = m.responses_context;
+  }
   return o;
 }
 function aiMsgLoad(m) {
@@ -23521,6 +24895,10 @@ function aiMsgLoad(m) {
   if (m.tool_calls) o.tool_calls = m.tool_calls;
   if (m.tool_call_id !== undefined) o.tool_call_id = m.tool_call_id;
   if (m.name) o.name = m.name;
+  if (Array.isArray(m.responses_output)) {
+    o.responses_output = m.responses_output;
+    o.responses_context = m.responses_context;
+  }
   return o;
 }
 /* 上下文太长要从前面切掉时，**必须切在「一轮的开头」上**：切在
@@ -23571,6 +24949,17 @@ function aiSessLabel(s) {
     new Date(s.at || s.created || Date.now()).toLocaleString('zh-CN') + '，' +
     fmt((s.msgs || []).length) + ' 条上下文）';
 }
+/* 快照指纹：内容没变就**不**刷新 s.at。
+   serialize / aiSessionDoc 是只读接口，同一份状态调两次必须给同样的字节；
+   以前每次快照都盖一个 Date.now()，于是两次序列化会差一个字（自测 B20 就是这么抓到的），
+   「最后活动时间」也会被读一次就往前推一次，跟事实不符。 */
+const AI_SNAP = { sig: '' };
+function aiSessSig(id, msgs, log, did, turns) {
+  const last = msgs.length ? msgs[msgs.length - 1] : null;
+  let tail = 0;
+  try { tail = last ? JSON.stringify(last).length : 0; } catch (e) { tail = -1; }
+  return id + '|' + msgs.length + '|' + tail + '|' + log.length + '|' + did + '|' + turns + '|' + AI_MANUAL_VERSION;
+}
 /* 把现在内存里这一段写回它那条记录 */
 function aiSessSnap() {
   const s = AI.sid ? aiSessById(AI.sid) : null;
@@ -23579,7 +24968,8 @@ function aiSessSnap() {
   s.log = aiLogClean(AI.log).slice(0, AI_LOG_MAX);
   s.did = AI.did.slice(0, 60);
   s.turns = AI.turns | 0;
-  s.at = Date.now();
+  const sig = aiSessSig(s.id, s.msgs, s.log, s.did, s.turns);
+  if (sig !== AI_SNAP.sig) { AI_SNAP.sig = sig; s.at = Date.now(); }
   s.mv = AI_MANUAL_VERSION;
   s.title = s.title || aiSessTitle(s.msgs);
   return s;
@@ -23609,7 +24999,11 @@ function aiSessTrim() {
 function aiSessDoc() {
   aiSessSnap();
   const bytes = aiSessTrim();
-  return { v: 1, sid: AI.sid, seq: AI.seq, at: Date.now(), bytes: bytes,
+  /* at 取「最近一段对话的活动时间」，不是「此刻」：这两者对同一份状态要给同一个值，
+     否则这个只读接口每次调用都换一个字节，谁也没法拿它做前后对照。 */
+  let at = 0;
+  for (let i = 0; i < AI.sessions.length; i++) at = Math.max(at, aiSessMs(AI.sessions[i].at) || 0);
+  return { v: 1, sid: AI.sid, seq: AI.seq, at: at || Date.now(), bytes: bytes,
     sessions: AI.sessions.map((s) => ({ id: s.id, n: s.n, title: s.title, at: s.at,
       created: s.created, mv: s.mv, turns: s.turns, msgs: s.msgs, log: aiLogClean(s.log), did: s.did })) };
 }
@@ -24181,6 +25575,11 @@ function aiSetUI(o) {
   const el = document.getElementById('ai');
   if (!el) return;
   el.classList.toggle('folded', AIUI.folded);
+  const settingsOpen = AIUI.set && !AIUI.folded;
+  if (settingsOpen) aiModelListRender();
+  el.classList.toggle('settings-open', settingsOpen);
+  const wrap = document.getElementById('aiwrap');
+  if (wrap) wrap.classList.toggle('settings-open', settingsOpen);
   const set = document.getElementById('aiset');
   /* 折叠时设置面板也要让位：内联 display 会压过 CSS 的 #ai.folded 规则，所以在这里判 */
   if (set) set.style.display = (AIUI.set && !AIUI.folded) ? 'flex' : 'none';
@@ -24262,6 +25661,7 @@ function aiBind() {
     if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); fire(); }
   });
   const bind = (id, ev2, fn) => { const el = document.getElementById(id); if (el) el.addEventListener(ev2, fn); };
+  bind('ai-openai-gpt6', 'click', () => { aiOpenGpt6Preset(); });
   /* Key 这类东西**边打边存**：以前只在失焦（change）时才写，用户打完直接关窗口就白输一遍。
      现在停下来 400ms 就写一次，关窗口前还会再冲一次（见这个函数末尾的 pagehide）。 */
   const liveSave = (id, apply) => {
@@ -24276,7 +25676,7 @@ function aiBind() {
     });
     el.addEventListener('change', (e) => { stop(); apply(e.target); aiSaveCfg(); aiFillCfg(); aiKeyNote(); aiInfo(); });
   };
-  liveSave('ai-key', (el) => { AI.key = String(el.value || "").trim(); });
+  liveSave('ai-key', (el) => { AI.key = String(el.value || "").trim(); aiModelListRender(); });
   liveSave('ai-vkey', (el) => { AI.visKey = String(el.value || "").trim(); });
   bind('ai-base', 'change', (e) => {
     let v = e.target.value.trim();
@@ -24290,7 +25690,7 @@ function aiBind() {
     if (v) e.target.value = v;
     AI.base = v || AI.base;
     AI.netVia = '';              /* 换了地址，重新判断走直连还是内部通道 */
-    aiSaveCfg(); aiLocalFill(); aiLocalNote(); aiInfo();
+    aiSaveCfg(); aiLocalFill(); aiLocalNote(); aiFillThink(); aiInfo();
   });
   bind('ai-temp', 'change', (e) => {
     const v = Number(e.target.value);
@@ -24313,12 +25713,7 @@ function aiBind() {
     aiSaveCfg(); aiInfo();
     toast('工具调用：' + (AI.toolMode === 'text' ? '只用文字命令' : (AI.toolMode === 'native' ? '只用原生 tools' : '自动')), 'ok');
   });
-  bind('ai-local-mlist', 'change', (e) => {
-    const v = String(e.target.value || '');
-    if (!v) return;
-    AI.model = v; aiFillCfg(); aiSaveCfg(); aiInfo();
-    toast('模型：' + v, 'ok');
-  });
+  bind('ai-local-mlist', 'change', (e) => { aiSelectModel(e.target.value); });
   const locEl = (id) => document.getElementById(id);
   if (locEl('ai-local-use')) locEl('ai-local-use').addEventListener('click', () => {
     const sel = locEl('ai-local-preset');
@@ -24328,9 +25723,11 @@ function aiBind() {
     toast('已填 ' + p.name + ' 的地址（' + aiBaseHost(AI.base) + '）', 'ok');
   });
   if (locEl('ai-local-probe')) locEl('ai-local-probe').addEventListener('click', async () => {
+    const scope = aiModelsSyncScope(), seq = AI_MODELS.seq;
     aiLocalNote('正在扫本机常见端口（' + AI_LOCAL_PRESETS.map((p) => p.port).join(' / ') + '）……');
     let hits = [];
     try { hits = await aiLocalProbe(); } catch (e) { hits = []; }
+    if (seq !== AI_MODELS.seq || !aiModelsScopeSame(scope, aiModelsScope())) return;
     if (!hits.length) {
       aiLocalNote('<b style="color:#e0a24a">本机上没探到推理服务。</b>常见端口都试过了。先确认服务起没起来：' +
         AI_LOCAL_PRESETS.map((p) => p.name + ' → ' + p.how).join('；') +
@@ -24340,36 +25737,17 @@ function aiBind() {
     const h = hits[0];
     aiLocalUse(h.id);
     aiLocalFillList(h.models);
-    if (h.models.length && h.models.indexOf(AI.model) < 0) { AI.model = h.models[0]; aiFillCfg(); aiSaveCfg(); aiInfo(); }
     aiLocalFill();
     aiLocalNote('<b style="color:#5ac8a0">探到了：' + aiEsc(hits.map((x) => x.name + '（' + x.port + '）').join('、')) + '</b>' +
       '，已经填上 ' + aiEsc(h.name) + '。' + (h.models.length
         ? '它挂着的模型：' + aiEsc(h.models.slice(0, 12).join('、')) + (h.models.length > 12 ? ' …' : '')
         : '（没报出模型清单，模型名手填一个）') +
       (hits.length > 1 ? '<br>另外还开着：' + aiEsc(hits.slice(1).map((x) => x.name + '（' + x.port + '）').join('、')) : '') +
-      '<br>接着按「测试连接」看看能不能真的说话。');
+      '<br>请在「选择模型」里选一个支持对话的模型，再按「测试连接」。');
   });
-  if (locEl('ai-local-models')) locEl('ai-local-models').addEventListener('click', async () => {
-    aiLocalNote('在拉模型列表……');
-    try {
-      const list = await aiLocalModels(AI.base);
-      aiLocalFillList(list);
-      if (!list.length) {
-        aiLocalNote('<b style="color:#e0a24a">这个地址报了 0 个模型。</b>服务在跑但可能没加载模型' +
-          '（LM Studio 里要先把模型 Load 上；Ollama 要先 ollama pull），也可能模型名得手填。');
-        return;
-      }
-      /* 换模型名的条件：手里这个名字不在服务端报出来的清单里（多半是默认名或预设里那个示例名），
-         就换成列表第一个；已经在清单里就尊重用户自己的选择，不冲掉。 */
-      if (list.indexOf(AI.model) < 0) { AI.model = list[0]; aiFillCfg(); aiSaveCfg(); aiInfo(); }
-      aiLocalNote('拉到 ' + list.length + ' 个模型，已经放进上面的「模型列表」下拉框：' +
-        aiEsc(list.slice(0, 12).join('、')) + (list.length > 12 ? ' …' : '') + '<br>挑一个就换上了，也可以直接在「模型」那一栏手填。');
-    } catch (e) {
-      aiLocalNote('<b style="color:#e0704a">拉不到：</b>' + aiEsc(String((e && e.message) || e)) + aiEsc(aiNetHint(AI.base)));
-    }
-  });
+  bind('ai-local-models', 'click', () => { aiRefreshModels(); });
   if (locEl('ai-local-test')) locEl('ai-local-test').addEventListener('click', () => { aiLocalTest(); });
-  bind('ai-model', 'change', (e) => { AI.model = e.target.value.trim() || AI.model; aiSaveCfg(); aiInfo(); });
+  bind('ai-model', 'change', (e) => { aiSelectModel(e.target.value); e.target.value = AI.model; });
   const onThinkPick = (e) => {
     AI.think = aiThinkNorm(e.target.value);
     /* 用户改了档位就再试一次：上一轮「这个端点不认」的结论先清掉 */
@@ -24395,9 +25773,13 @@ function aiBind() {
   bind('ai-vbase', 'change', (e) => { AI.visBase = e.target.value.trim(); aiSaveCfg(); });
   bind('ai-vmodel', 'change', (e) => { AI.visModel = e.target.value.trim(); aiSaveCfg(); });
   /* 外部操作的两个开关：不进 localStorage（重启要重勾），改了立刻同步给 Rust 那道门 */
-  bind('ai-sysfs', 'change', (e) => { AI.sysFs = !!e.target.checked; aiSysSync(); aiSysNote(); aiInfo(); });
-  bind('ai-sysrun', 'change', (e) => { AI.sysRun = !!e.target.checked; aiSysSync(); aiSysNote(); aiInfo();
-    if (AI.sysRun) toast('已允许 AI 在本机运行命令：这等于把这台机器交给对面的模型，用完记得关', 'warn'); });
+  bind('ai-sysfs', 'change', (e) => { const on = !!e.target.checked; aiUserSetSys('fs', on).then(function (s) {
+    if (on && !s.fs) { e.target.checked = false; toast('没有打开「读写文件 / 下载」：权限要用户在系统对话框里点「允许」才生效', 'warn'); }
+  }); });
+  bind('ai-sysrun', 'change', (e) => { const on = !!e.target.checked; aiUserSetSys('run', on).then(function (s) {
+    if (on && !s.run) { e.target.checked = false; toast('没有打开「运行命令」：权限要用户在系统对话框里点「允许」才生效', 'warn'); }
+    else if (s.run) toast('已允许 AI 在本机运行命令：这等于把这台机器交给对面的模型，用完记得关', 'warn');
+  }); });
   bind('ai-tools-reload', 'click', () => {
     aiUserToolsReload().then(function (r) {
       if (r.errors.length) toast('工具重新加载：成功 ' + r.loaded.length + ' 个，' + r.errors.length + ' 个有问题（看设置里那行说明）', 'warn');
@@ -24505,13 +25887,5 @@ setStatus('就绪 — 右键旋转 / 中键平移 / 滚轮缩放；按 F7 编译
 setTimeout(() => { autosaveProbe(); }, 1500);
 setTimeout(() => toast('原型已就绪：试试 S/W/A/D 切换工具，或按 F7 编译生成 PyTorch 模型', 'ok'), 500);
 console.log('%cNeuroForge v0.1', 'color:#2f81f7;font-weight:bold', '数据模型: SoA typed array / 渲染: InstancedMesh / 拾取: 网格+DDA');
-
-
-
-
-
-
-
-
 
 

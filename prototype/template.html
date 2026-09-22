@@ -611,6 +611,13 @@ input[type=color]{padding:1px;height:24px;cursor:pointer}
   max-height:68%;display:flex;flex-direction:column;z-index:30}
 #ai{width:100%;min-height:0;display:flex;flex-direction:column;background:rgba(var(--ovl-080c13),.97);
   border:1px solid var(--border2);box-shadow:0 12px 34px rgba(0,0,0,.6)}
+/* 设置独占内容区：长聊天和长草稿不能把它压成细缝；高度随视口收缩，内容在内部滚动。 */
+#aiwrap.settings-open{height:min(720px,calc(100% - 20px));max-height:calc(100% - 20px)}
+#aiwrap.settings-open #ai{flex:1;overflow:hidden}
+#ai.settings-open #aihead{flex-wrap:wrap}
+#ai.settings-open #aiset{flex:1;min-height:0;max-height:none}
+#ai.settings-open #aiset>*{flex-shrink:0}
+#ai.settings-open #ailog,#ai.settings-open #aibar{display:none}
 #aihead{display:flex;align-items:center;gap:7px;padding:7px 11px;flex:none;
   background:linear-gradient(var(--tc-1b2433),var(--tc-141b26));border-bottom:1px solid var(--border2);font-size:12.5px}
 #aihead b{color:var(--tc-dbe7f5);letter-spacing:.4px;white-space:nowrap}
@@ -1037,21 +1044,26 @@ input[type=color]{padding:1px;height:24px;cursor:pointer}
         <span class="aib" data-aicmd="set">设置</span>
       </div>
       <div id="aiset">
+        <label><span>选择模型</span><select id="ai-local-mlist" style="flex:1" aria-label="选择模型"><option value="">（当前模型）</option></select><button id="ai-local-models" type="button" style="flex:none" title="获取当前接口的模型列表；刷新只更新候选项，不会切换正在使用的模型">刷新模型列表</button></label>
+        <label><span>模型 ID</span><input id="ai-model" type="text" placeholder="也可直接输入当前接口支持的模型 ID" title="可直接手填模型 ID，完成后自动保存"></label>
+        <div class="hint" style="margin:0">选择后自动保存，也可手填模型 ID。列表由当前接口提供，可能包含非对话模型，请选择支持对话的模型。</div>
+        <div class="hint" id="ai-modelnote" role="status" style="margin:0 0 4px"></div>
         <div class="hint" id="ai-locnote" style="margin:0 0 4px"></div>
+        <div class="row" style="flex-wrap:wrap;gap:6px;margin-bottom:5px">
+          <button id="ai-openai-gpt6" type="button" title="填写 OpenAI API Key 后应用 GPT-6 预设；取消保持当前配置，不会自动发送请求">OpenAI GPT-6</button>
+          <span class="hint">填写 OpenAI Key 后切换；原有 Key 不会跨服务商复用。</span>
+        </div>
         <div class="row" style="flex-wrap:wrap;gap:4px">
           <select id="ai-local-preset" style="flex:1 1 150px" title="常见本地推理服务：选中后按「填地址」就填好了，不用自己记端口"></select>
           <button id="ai-local-use" title="把左边选中的那一条的地址填进下面的「接口地址」">填地址</button>
           <button id="ai-local-probe" title="扫一圈本机常见端口（11434 Ollama / 1234 LM Studio / 8080 llama.cpp / 8000 vLLM / 9997 Xinference / 5001 KoboldCpp / 5000 text-generation-webui），哪个在开就用哪个">探测本机</button>
-          <button id="ai-local-models" title="把这个地址上的模型列出来（OpenAI 兼容端点的 GET /v1/models）">拉模型列表</button>
           <button id="ai-local-test" title="真的发一句话过去：量多久回来、模型回没回话、认不认 tools 参数（小模型很多不认，那就把「工具调用」改成「文字命令」）">测试连接</button>
         </div>
         <div class="hint" id="ai-localnote" style="margin:2px 0 4px"></div>
-        <label><span>模型列表</span><select id="ai-local-mlist" style="flex:1"><option value="">（按「拉模型列表」，或者直接在下面「模型」那一栏手填）</option></select></label>
         <label><span>API Key</span><input id="ai-key" type="password" placeholder="sk-...（存在本机，不上传别处；打完自动保存）"></label>
         <div class="hint" id="ai-keynote" style="margin:0 0 2px"></div>
         <label><span>接口地址</span><input id="ai-base" type="text" placeholder="https://api.deepseek.com/v1/chat/completions"></label>
-        <label><span>模型</span><input id="ai-model" type="text" placeholder="deepseek-flash（能看图的就是它）"></label>
-        <label><span>温度</span><input id="ai-temp" type="text" style="flex:none;width:62px" placeholder="0.2"><span style="text-align:left;width:auto;color:#93a5b9">0–2，越大越放飞。本地小模型老重复 / 老跑偏时动它</span></label>
+        <label><span>温度</span><input id="ai-temp" type="text" style="flex:none;width:62px" placeholder="0.2"><span id="ai-tempnote" style="text-align:left;width:auto;color:#93a5b9">0–2，越大越放飞。本地小模型老重复 / 老跑偏时动它</span></label>
         <label><span>最大输出</span><input id="ai-maxtok" type="text" style="flex:none;width:72px" placeholder="0"><span style="text-align:left;width:auto;color:#93a5b9">一次最多吐多少 token，0 = 用默认（3000 / 流式 4000）。本地模型显存小就压到 512–2048</span></label>
         <label><span>思考强度</span><select id="ai-think"></select></label>
         <label><span>手册与工具</span><select id="ai-slim" style="flex:none;width:150px">

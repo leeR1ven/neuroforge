@@ -24,10 +24,13 @@
     独立分区。算子的输出可以落到一段神经元上，好跟逐神经元的 Gemm / 权重块接起来。
 其余一律报错（除非用 --allow-skip 明确点名要跳过；只放行不改元素个数的算子，跳过的会记进来源表）。
 
-**导入不做任何静默改写**：数值类型对不上、Cast 到非 float、训练模式的 Dropout、
-Conv 这类在空间上复用参数的算子——一律报错说清是哪一条，而不是"折进去看起来差不多"。
-唯一允许的近似是精度（float64/float16 常量按 float32 存），这件事会逐条写进
-来源表（header.source）并打印出来。
+**导入不做任何静默改写**：数值类型对不上、Cast 到非 float、训练模式的 Dropout
+（属性或 opset 12+ 的第 3 个输入，含动态开关与掩码输出）、Conv 这类在空间上复用参数的
+算子——一律报错说清是哪一条，而不是"折进去看起来差不多"。
+允许的近似只有两处，都会逐条写进来源表（header.source）并打印出来：
+① 精度：float64 / float16 常量一律按 float32 存；
+② Gelu：编辑器里的 gelu 是 **tanh 近似**，原模型写精确版（erf，也是 ONNX 默认）时
+两者最大差约 5e-4——照导不误，但来源表里记成"数值近似"，不会假装逐位一致。
 
 **来源表**（header["source"]）：导入是一次单向折叠——折完之后编辑器里就只剩一张标量图，
 原来的算子边界没了。所以导入时把"哪个神经元区间来自哪个算子"记下来一起存进工程，
@@ -299,7 +302,21 @@ OP_NAMED_IN = {
 }
 
 
-def op_refs_for(b, ins, label, params, named=None):
+def param_role_for(op, name, named):
+    """算子参数的角色，跟编辑器里的 opParamRole 同一套规则。
+
+    named=True 表示这个输入位是**具名参数**（Conv 的 W / B、归一化的 scale / bias 这些
+    真正的可训练权重）；其余输入位上的常量都是字面常量（ONNX Constant 折进来的、
+    固定缩放系数），编译成 buffer，优化器碰不到它们。
+    """
+    if not named:
+        return "const"
+    if op in ("BatchNormalization", "LayerNormalization") and name in ("mean", "var"):
+        return "stat"
+    return "weight"
+
+
+def op_refs_for(b, ins, label, params, named=None, op=None):
     """把 ONNX 节点的输入列表转成算子节点的输入引用。
 
     常量会变成这个节点自己的参数（k:'c'）——这样广播（比如给 (1,C,H,W) 加一个
@@ -325,9 +342,12 @@ def op_refs_for(b, ins, label, params, named=None):
                 arr = arr.reshape(1)
             a32 = np.ascontiguousarray(arr, dtype=np.float32)
             name = named.get(k)
+            role = param_role_for(op, name, name is not None)
             if name is None:
                 name = "c%d" % len(params)
-            params.append(nforge.OpParam(name, "f32", [int(x) for x in a32.shape], a32.reshape(-1)))
+            # 同一个常量被两个以上算子引用 -> 带上共享键，编译端只建一份参数
+            params.append(nforge.OpParam(name, "f32", [int(x) for x in a32.shape], a32.reshape(-1),
+                                         role=role, same=b.share_key(nm, a32, label)))
             refs.append({"k": "c", "p": name, "shape": [int(x) for x in a32.shape]})
         else:
             raise Unsupported(f"{label}：输入 {nm} 既不是激活张量也不是常量")
@@ -346,7 +366,7 @@ def build_op_node(b, node, label, ins, outs, layer_index):
     if len(outs) != 1:
         raise Unsupported(f"{label}：{op} 有 {len(outs)} 个输出，本版的算子节点只支持单输出")
     out_shape = tensor_shape(b, outs[0], label)
-    refs = op_refs_for(b, ins, label, params, OP_NAMED_IN.get(op))
+    refs = op_refs_for(b, ins, label, params, OP_NAMED_IN.get(op), op)
     attrs = {}
     note = ""
 
@@ -379,7 +399,7 @@ def build_op_node(b, node, label, ins, outs, layer_index):
         ks = [int(v) for v in A.get("kernel_shape", [])]
         if not ks:
             raise Unsupported(f"{label}：池化没写 kernel_shape，这里不猜")
-        strides = [int(v) for v in A.get("strides", ks)]
+        strides = [int(v) for v in A.get("strides", [1] * len(ks))]
         pads = [int(v) for v in A.get("pads", [0] * (2 * len(ks)))]
         auto = str(A.get("auto_pad", "NOTSET"))
         if auto in ("SAME_UPPER", "SAME_LOWER"):
@@ -409,8 +429,12 @@ def build_op_node(b, node, label, ins, outs, layer_index):
         if len(node.output) > 1 and any(b.userCount.get(o2, 0) for o2 in node.output[1:]):
             raise Unsupported(f"{label}：BatchNormalization 有额外的输出被用到了（训练模式），"
                               f"这里只支持推理图")
-        attrs = {"epsilon": float(A.get("epsilon", 1e-5))}
-        note = f"批归一化（推理）：输入 {refs[0]['shape']}，eps {attrs['epsilon']}"
+        # ONNX 的 momentum 是**旧值**的权重（running = running*momentum + batch*(1-momentum)），
+        # PyTorch 的 momentum 是**新值**的权重，所以这里要取 1 - momentum。
+        attrs = {"epsilon": float(A.get("epsilon", 1e-5)),
+                 "momentum": 1.0 - float(A.get("momentum", 0.9))}
+        note = (f"批归一化：输入 {refs[0]['shape']}，eps {attrs['epsilon']}；"
+                f"mean/var 记成不可训练的运行统计量（stat），scale/B 才是可训练权重")
 
     elif op == "LayerNormalization":
         x = refs[0]["shape"]
@@ -475,8 +499,8 @@ def build_op_node(b, node, label, ins, outs, layer_index):
             a = float(A.get("alpha", 1.0))
             if abs(a - 1.0) > 1e-9:
                 raise Unsupported(f"{label}：Elu 的 alpha={a}，生成的代码固定 1.0")
-        if op == "Gelu" and str(A.get("approximate", "")) not in ("", "none"):
-            raise Unsupported(f"{label}：Gelu 的 approximate={A.get('approximate')}，生成的代码是 tanh 近似")
+        if op == "Gelu":
+            b.gelu_mode(label, A.get("approximate"))
         name = {"Swish": "Silu"}.get(op, op)
         attrs = {"alpha": float(A.get("alpha", 0.01))} if op == "LeakyRelu" else {}
         b.note(f"{label}：{op} 落在两个算子节点之间，所以单独记成一个算子节点"
@@ -521,6 +545,7 @@ class Builder:
         self.prec = {}              # 常量精度：类型 -> 数值个数
         self.precWhere = []         # 精度被截断的常量名字（最多留几个当例子）
         self.casts = []             # Cast 到别的 float 类型的节点
+        self.approx = []            # 已知的数值近似：[{n: 节点, why: 说明}]
         self.skipped = []           # --allow-skip 跳过的算子
         self.tensorOp = {}          # 张量名 -> 产出它的算子序号（-1 = 图输入）
         # 权值共享：同一个常量被好几个算子引用。逐条边 / 权重块的模型里没有"这两处是同一个
@@ -533,7 +558,7 @@ class Builder:
         # 真共享（共享参数组）：同一个常量被多处引用时，把这些引用折出来的**权重块**编成一组，
         # 组里的块在编辑器里就是同一个参数——改一处全组一起变、编译出去只存一份。
         # 只有走权重块那条路才建得成组：逐条边的层没有参数这个概念。
-        self.blockShare = {}        # 共享键（常量名, k, n）-> 组号（1 起）
+        self.blockShare = {}        # 共享键（常量名, k, n, 转置, 子块序号）-> 组号（1 起）
         self.shareGid = 0
         self.tiedBlocks = []        # 真建成的组：[(常量名, 组号, 块数, k, n, 每份权重数)]
         self.tiedCant = []          # 没建成的：[(常量名, 原因)]
@@ -545,6 +570,7 @@ class Builder:
         self.model = None           # 用来查别的张量的静态形状
         self.groups = {}            # 张量名 -> Group（神经元张量）
         self.consts = {}            # 张量名 -> 常量数组
+        self.paramSame = {}         # 常量名 -> (dtype, shape)：判断多处引用能不能共享同一份参数
 
     def note(self, msg):
         if msg not in self.notes:
@@ -615,16 +641,17 @@ class Builder:
                     e["at"].append(label)
                 break
 
-    def share_group(self, name, W):
+    def share_group(self, name, W, tile_index=0, transposed=False):
         """给这个常量的权重块发一个组号（第一次遇到就新建一组）。
 
-        键里带上逻辑形状：同一个常量在两个地方用了不同的转置，折出来的块形状就不一样。
-        这时两边**不能**自动编成一组——编辑器里"共享"共享的是同一段按行主序排的数值，
+        键里带上逻辑形状、转置方向与子块序号：只让同一个常量的同一片区域共享。
+        大矩阵里的不同子块不能互相共用；转置两用即使是方阵也必须区分。
+        编辑器里"共享"共享的是同一段按行主序排的数值，
         而 transB 反过来的那种用法，内存布局（列主序）跟行主序是两回事，硬编会算错。
         （界面里可以手工建组，条件是元素总数一致；手工建组的人得自己确认两边的读取顺序
         确实就是他要的那个——容器和编译端都支持形状不同、元素总数相同的共享。）
         """
-        key = (str(name), int(W.shape[0]), int(W.shape[1]))
+        key = (str(name), int(W.shape[0]), int(W.shape[1]), bool(transposed), int(tile_index))
         g = self.blockShare.get(key)
         if g is None:
             self.shareGid += 1
@@ -632,10 +659,49 @@ class Builder:
             self.blockShare[key] = g
         return g
 
+    def share_key(self, name, arr, label):
+        """同一个常量被两个以上算子引用时，返回一个共享键（= 常量名），让编译端只建一份参数。
+
+        形状 / 类型对不上的不能共享：编辑器共享的是同一段按行主序排的数值，两处形状不一样
+        就没法当成同一个张量（比如一处直接读、一处转了置）。这种情况如实记进来源表。
+        """
+        if int(self.userCount.get(name, 0)) < 2:
+            return ""
+        a = np.asarray(arr)
+        key = (str(a.dtype), tuple(int(x) for x in a.shape))
+        prev = self.paramSame.get(name)
+        if prev is None:
+            self.paramSame[name] = key
+            return str(name)
+        if prev == key:
+            return str(name)
+        self.cant_share(name, f"同一个常量在两处的形状 / 类型不同（{prev[1]} 与 {key[1]}），"
+                              f"没法当成同一份参数")
+        return ""
+
     def cant_share(self, name, why):
         """记一条"这次没能建成共享"：如实写清是哪种情况，别含糊过去。"""
         if (str(name), why) not in self.tiedCant:
             self.tiedCant.append((str(name), why))
+
+    def gelu_mode(self, label, approx):
+        """编辑器里的 gelu 是 F.gelu(approximate="tanh")，不是精确 erf。
+
+        ONNX 的 Gelu 默认（approximate 缺省或 "none"）是精确版，写 "tanh" 才是近似。
+        默认那种照导不误（差的量级很小），但必须记进「已知数值近似」；
+        真正的精确 erf 这一版的后端都表达不了，所以不去假装。
+        """
+        a = "" if approx in (None, "") else str(approx)
+        if a == "tanh":
+            return                              # 跟编辑器一致，没什么好说的
+        if a in ("", "none"):
+            self.approx.append({"n": str(label), "why":
+                "原模型用的是精确版 Gelu（erf，ONNX 默认）；编辑器里的 gelu 是 tanh 近似，"
+                "两者在 |x| 较大处最大差约 5e-4——不是逐位相同"})
+            self.note(f"{label}：原模型的 Gelu 是精确版（erf）；编辑器里的 gelu 固定是 tanh 近似，"
+                      f"最大差约 5e-4，来源表里记成了『数值近似』。")
+            return
+        raise Unsupported(f"{label}：Gelu 的 approximate={a} 认不出来（只认 none / tanh）")
 
     def finalize_sharing(self):
         """建组之后收尾：把不足两块 / 形状对不上的组退掉，再统计一遍真建成的组。
@@ -644,8 +710,8 @@ class Builder:
         也不能让文件里出现"同一段数组按两种形状读"这种自相矛盾的东西。
         """
         names = {g: k[0] for k, g in self.blockShare.items()}
-        # 同一个常量名下可能有不止一组：同一个张量在两处用了相反的转置时，折出来的块形状不同
-        # （2×3 与 3×2），元素总数一样 —— 这种**故意不自动建组**，理由要写给用户看。
+        # 同一个常量的不同切块位置、不同转置方向各占一组。
+        # 某一组只出现一次时没有可共享的对应子块，退回独立参数并说明原因。
         byname = {}
         for _g, _nm in names.items():
             byname.setdefault(_nm, []).append(_g)
@@ -664,7 +730,7 @@ class Builder:
                 others = [x for x in byname.get(nm, []) if x != g and cnt.get(x, 0) > 0]
                 if others:
                     self.cant_share(
-                        nm, "同一个张量在两处折成了形状不同的权重块（有一处转了置）：反过来的那种"
+                        nm, "同一个张量在两处的权重块读取方式不同（有一处转了置或子块布局不同）：反过来的那种"
                             "用法内存里是列主序，跟编辑器『行主序读同一段数值』不是一回事，自动建组"
                             "会算错，所以这里不建。要建得在界面里框选后手工建（手工建组允许形状不同、"
                             "元素总数一致）")
@@ -756,27 +822,36 @@ class Builder:
         self.n += count
         return ids
 
-    def add_dense(self, in_ids, W, bias, act, layer_index, label, as_block, const_key=None):
+    def add_dense(self, in_ids, W, bias, act, layer_index, label, as_block, const_key=None,
+                  const_transposed=False):
         """新建一层神经元，并把这一层的权重记成权重块或者逐条边的层。
 
         两条路只在"权重怎么存"上不同：偏置和激活都落在神经元自己的字段上，
         所以后面 Add / 激活算子照样能折进这一层。
 
         const_key 是这一层的权重来自哪个常量（只有常量权重才有）。给了它、又走了权重块那条路，
-        同一个常量折出来的块就会被编进同一个共享参数组——这就是原模型里的 tied weights。
+        同一个常量在不同使用点的对应子块会被编进同一共享参数组——不同子块各有自己的组。
         """
         n_out = int(W.shape[1])
+        if bias is None:
+            b = np.zeros(n_out, dtype=np.float32)
+        else:
+            flat_bias = np.asarray(bias, dtype=np.float32).reshape(-1)
+            try:
+                b = np.broadcast_to(flat_bias, (n_out,)).copy()
+            except ValueError as exc:
+                raise Unsupported(
+                    f"{label}：偏置有 {flat_bias.size} 个值，不能广播到 {n_out} 个输出") from exc
         out = self.new_neurons(n_out, layer_index, label)
-        b = np.zeros(n_out, dtype=np.float32) if bias is None else \
-            np.asarray(bias, dtype=np.float32).reshape(-1)
         self.bias[out[0]:out[-1] + 1] = b.tolist()
         self.act[out[0]:out[-1] + 1] = [act] * len(out)
         src = np.asarray(in_ids, dtype=np.int64).reshape(-1)
         if as_block:
             rec = Layer(src, out, None, b, act, kind="block")
             self.block_layers.append(rec)
-            gid = self.share_group(const_key, W) if const_key is not None else 0
-            for s, d, sub in tile_matrix(src, out, W, label):
+            for tile_index, (s, d, sub) in enumerate(tile_matrix(src, out, W, label)):
+                gid = self.share_group(const_key, W, tile_index, const_transposed) \
+                    if const_key is not None else 0
                 self.blocks.append({"src": s, "dst": d, "w": sub, "label": label, "sg": gid})
         else:
             if const_key is not None:
@@ -787,6 +862,57 @@ class Builder:
 
     def add_layer(self, in_ids, W, bias, act, layer_index, label):
         return self.add_dense(in_ids, W, bias, act, layer_index, label, False)[0]
+
+
+def build_report(b):
+    """把「这份图和原模型到底差在哪」分类写清楚——一个 exact 布尔量说不完这件事。
+
+    结构 / 数值 / 精度 / 共享四件事分开记，每一项都带证据条目。verified 恒为 none：
+    导入器不跑参考执行器，所以这里不声称"数值已经验证等价"。界面上的「导入报告」
+    和 AI 的 source_info 都按这个渲染。
+    """
+    items = []
+    for c in b.casts:
+        items.append({"lv": "warn", "k": "cast", "n": str(c["n"]),
+                      "d": f"原模型把数据转成 {c['to']} 再往后算；编辑器只有 float32 一种数值，"
+                           f"全程按 float32 计算——精度只会更高，但逐位结果和原模型有极小差异"})
+    for a in b.approx:
+        items.append({"lv": "warn", "k": "approx", "n": str(a["n"]), "d": str(a["why"])})
+    if b.prec:
+        parts = "、".join(f"{k} {v:,} 个" for k, v in sorted(b.prec.items()))
+        items.append({"lv": "warn", "k": "dtype", "n": "常量精度",
+                      "d": f"折进来的常量里有 {parts} 不是 float32，一律按 float32 存"})
+    for name, why in b.tiedCant:
+        items.append({"lv": "warn", "k": "share", "n": str(name), "d": str(why)})
+    for s in b.skipped:
+        items.append({"lv": "bad", "k": "skip", "n": str(s["n"]),
+                      "d": f"--allow-skip 跳过了 {s['op']}：这一段之后的数值不再等价于原模型"})
+    structure = "skipped" if b.skipped else "exact"
+    numeric = "approximate" if (b.casts or b.approx) else "exact"
+    dtype = "widened" if b.prec else "exact"
+    if not b.tied:
+        shared = "none"
+    elif b.tiedBlocks and not b.tiedCant:
+        shared = "kept"
+    elif b.tiedBlocks:
+        shared = "partial"
+    else:
+        shared = "lost"
+    return {
+        "format": 1,
+        "structure": structure,      # exact / skipped
+        "numeric": numeric,          # exact / approximate
+        "dtype": dtype,              # exact / widened
+        "shared": shared,            # none / kept / partial / lost
+        "verified": "none",          # 导入器不跑参考执行器，永远不声称"已验证"
+        "items": items[:40],
+        "itemCount": len(items),
+        "exactAll": (structure == "exact" and numeric == "exact"
+                     and dtype == "exact" and shared in ("none", "kept")),
+        "how": "structure=算子有没有被跳过；numeric=数值上有没有已知近似；"
+               "dtype=常量精度有没有被改；shared=权值共享有没有保住；"
+               "verified 恒为 none（导入器不跑参考执行器）",
+    }
 
 
 def value_shape(model, name):
@@ -964,7 +1090,8 @@ def import_onnx(path, opts):
             const_key = None
             if getattr(opts, "tie_blocks", True) and ins[1] in b.tied and alpha == 1.0:
                 const_key = ins[1]
-            out_ids, rec = b.add_dense(A.ids, W, bias, 0, layer_index + 1, label2, as_block, const_key)
+            out_ids, rec = b.add_dense(A.ids, W, bias, 0, layer_index + 1, label2, as_block,
+                                      const_key, transB)
             layer_index += 1
             groups[outs[0]] = Group(out_ids, rec)
             nblk = len(b.blocks) - nb0
@@ -1003,9 +1130,9 @@ def import_onnx(path, opts):
                 continue
             cidx = 1 if G0 is not None else 0
             bias = b.use_const(ins[cidx], C, f"{label} 的常量加数").reshape(-1)
-            # 只有"这一层的输出只被这一个 Add 用"时才能把偏置折进层里；否则别的分支
-            # 也会跟着变，那就得老老实实再开一层
-            if G.layer is None or consumers.get(act_in, 0) != 1:
+            # 只允许折进独占的线性层。激活后的加法不能挪到激活前，
+            # 否则 Relu(x) + b 就会变成 Relu(x + b)。
+            if G.layer is None or G.layer.act != 0 or consumers.get(act_in, 0) != 1:
                 K = len(G.ids)
                 out_ids = b.add_layer(G.ids, np.eye(K, dtype=np.float32), bias, 0,
                                       layer_index + 1, f"bias{layer_index + 1}_")
@@ -1045,9 +1172,7 @@ def import_onnx(path, opts):
                 for at in node.attribute:
                     if at.name == "approximate":
                         approx = at.s.decode()
-                if approx not in ("", "none"):
-                    raise Unsupported(
-                        f"{label}：Gelu 用的是 approximate={approx}，编辑器里的 gelu 是精确版（erf）")
+                b.gelu_mode(label, approx)
             code = nforge.ACT_NAMES.index(ACT_MAP[op])
             if G.layer is not None and consumers.get(ins[0], 0) == 1 and G.layer.act == 0:
                 G.layer.act = code
@@ -1100,15 +1225,35 @@ def import_onnx(path, opts):
                     b.note(f"{label}：原模型把数据转成 {dtype_name(to)} 再往后算；编辑器全程按 "
                            f"float32 计算——精度只会更高，但逐位结果和原模型会有极小差异。")
             if op == "Dropout":
-                tm = 0
+                # training_mode 有两个来源：老 opset 的属性、opset 12+ 的第 3 个输入。
+                # 两个都要看——只查属性会把「输入里写着 True」的图当成推理模式悄悄放过去。
+                tm = None
                 for a in node.attribute:
                     if a.name == "training_mode":
                         tm = int(a.i)
+                if len(ins) > 2 and ins[2]:
+                    c3 = getc(2)
+                    if c3 is None:
+                        raise Unsupported(
+                            f"{label}：Dropout 的第 3 个输入（training_mode）不是常量——"
+                            f"跑起来才知道是推理还是训练，折进来的图就不保证是恒等变换了。"
+                            f"把开关固定成常量 0（推理模式）再导出就能导进来。")
+                    arr = np.asarray(c3).reshape(-1)
+                    v = int(arr[0]) if arr.size else 0
+                    if tm is not None and tm != v:
+                        raise Unsupported(
+                            f"{label}：Dropout 的属性 training_mode={tm} 跟第 3 个输入（{v}）"
+                            f"对不上，这里不猜哪个算数。")
+                    tm = v
                 if tm:
                     raise Unsupported(
                         f"{label}：Dropout 的 training_mode=1（训练模式）。它按随机掩码丢掉一部分"
                         f"激活值，不是恒等变换，编辑器里没有这个语义。用 model.eval() 导出成推理图"
-                        f"（training_mode=0）就能导进来。")
+                        f"（training_mode=0 / 第 3 个输入是常量 False）就能导进来。")
+                if len(outs) > 1 and outs[1] and b.userCount.get(outs[1], 0) > 0:
+                    raise Unsupported(
+                        f"{label}：Dropout 的第 2 个输出（随机掩码）被后面的算子用到了——"
+                        f"推理模式下掩码没有意义，编辑器里也没有掩码张量，折进去会改变数值。")
             b.mark(ins[0], f"{op} 直通（形状没变）")
             groups[outs[0]] = Group(ids, G.layer)
             b.tensorOp[outs[0]] = b.tensorOp.get(ins[0], -1)
@@ -1259,7 +1404,11 @@ def import_onnx(path, opts):
         "kind": "onnx",
         "generator": "NeuroForge import_model.py",
         "model": os.path.basename(str(getattr(b.opts, "model", "") or "")),
+        # exact 留着给旧界面 / 旧脚本：它只表示"结构上没跳过算子"，不表示数值逐位一致。
+        # 完整分类读 report（结构 / 数值 / 精度 / 共享四项分开记）。
         "exact": not b.skipped,
+        "structureExact": not b.skipped,
+        "report": build_report(b),
         "auto": {"names": bool(b.opts.names), "positions": True,
                  "layout": getattr(b.opts, "layout", "ring"),
                  "spacing": float(b.opts.spacing)},
@@ -1473,6 +1622,9 @@ def main(argv=None):
     if b.skipped:
         print(f"  跳过的算子  {len(b.skipped)} 个（数值不再等价于原模型）：" +
               "、".join(f"{s['op']}@{s['n']}" for s in b.skipped[:8]))
+    if b.approx:
+        print(f"  数值近似    {len(b.approx)} 处（跟原模型不是逐位相同）：" +
+              "、".join(str(a["n"]) for a in b.approx[:8]))
     for nt in b.notes:
         print(f"  · {nt}")
     if opts.report:

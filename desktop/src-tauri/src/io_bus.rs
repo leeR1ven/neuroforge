@@ -9,8 +9,9 @@
 //!   tcpc   —— 主动连到别的程序（Simulink / LabVIEW / Python 那种"我是服务端"的）
 //!   serial —— 打开 COM 口，先调 mode 设好波特率再读写
 //!
-//! 收进来的数据一律按「帧」塞进总线：UDP 一个数据报一帧；TCP / 串口按换行分帧
-//! （一直没换行就攒够 4096 字节切一帧，免得对数流卡住）。
+//! 收进来的数据一律按「帧」塞进总线：UDP 一个数据报一帧；TCP / 串口的文本按换行，
+//! 二进制按页面给的固定帧长（信号位数 × 每个值的字节数）。半帧留到下一次 read，
+//! 多帧逐帧交付，不能把 float32 内部恰巧出现的 0x0A 当换行。
 //! 帧用 base64 传给页面：二进制信号（float32 这种）走 JSON 数组会膨胀十几倍。
 //!
 //! 为什么不引现成的 crate：这里要的就是 std::net + std::fs，不添依赖，编译快、
@@ -110,7 +111,17 @@ pub struct Link {
 #[derive(Default)]
 pub struct IoLinks(pub Mutex<HashMap<u32, Link>>);
 
-fn split_frames(acc: &mut Vec<u8>, id: u32, bus: &IoBus) {
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+fn split_frames(acc: &mut Vec<u8>, id: u32, bus: &IoBus, frame_bytes: usize) {
+    if frame_bytes > 0 {
+        let complete = acc.len() / frame_bytes * frame_bytes;
+        for frame in acc[..complete].chunks_exact(frame_bytes) {
+            bus.push(id, b64_encode(frame));
+        }
+        acc.drain(..complete);
+        return;
+    }
     loop {
         if let Some(p) = acc.iter().position(|&b| b == b'\n') {
             let frame: Vec<u8> = acc.drain(..=p).collect();
@@ -124,7 +135,7 @@ fn split_frames(acc: &mut Vec<u8>, id: u32, bus: &IoBus) {
     }
 }
 
-fn spawn_stream_recv(mut st: TcpStream, id: u32, bus: IoBus, stop: Arc<AtomicBool>, eof_breaks: bool) {
+fn spawn_stream_recv(mut st: TcpStream, id: u32, bus: IoBus, stop: Arc<AtomicBool>, eof_breaks: bool, frame_bytes: usize) {
     std::thread::spawn(move || {
         let _ = st.set_read_timeout(Some(Duration::from_millis(150)));
         let mut acc: Vec<u8> = Vec::new();
@@ -137,7 +148,7 @@ fn spawn_stream_recv(mut st: TcpStream, id: u32, bus: IoBus, stop: Arc<AtomicBoo
                 }
                 Ok(k) => {
                     acc.extend_from_slice(&buf[..k]);
-                    split_frames(&mut acc, id, &bus);
+                    split_frames(&mut acc, id, &bus, frame_bytes);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(_) => std::thread::sleep(Duration::from_millis(60)),
@@ -146,7 +157,7 @@ fn spawn_stream_recv(mut st: TcpStream, id: u32, bus: IoBus, stop: Arc<AtomicBoo
     });
 }
 
-fn spawn_serial_recv(mut f: File, id: u32, bus: IoBus, stop: Arc<AtomicBool>) {
+fn spawn_serial_recv(mut f: File, id: u32, bus: IoBus, stop: Arc<AtomicBool>, frame_bytes: usize) {
     std::thread::spawn(move || {
         let mut acc: Vec<u8> = Vec::new();
         let mut buf = vec![0u8; 4096];
@@ -155,7 +166,7 @@ fn spawn_serial_recv(mut f: File, id: u32, bus: IoBus, stop: Arc<AtomicBool>) {
                 Ok(0) => std::thread::sleep(Duration::from_millis(20)),
                 Ok(k) => {
                     acc.extend_from_slice(&buf[..k]);
-                    split_frames(&mut acc, id, &bus);
+                    split_frames(&mut acc, id, &bus, frame_bytes);
                 }
                 Err(_) => std::thread::sleep(Duration::from_millis(40)),
             }
@@ -172,10 +183,26 @@ fn resolve(addr: &str, port: u16) -> Result<std::net::SocketAddr, String> {
         .ok_or_else(|| format!("地址 {}:{} 解析不出结果", host, port))
 }
 
+/* 断开的客户端从广播表移除；它不能阻止同批数据发给其它仍然健康的连接。 */
+fn broadcast_frame(peers: &mut Vec<TcpStream>, data: &[u8]) -> Result<usize, String> {
+    if peers.is_empty() { return Err("还没有任何程序连上来（TCP 服务端）".into()); }
+    let mut sent = 0;
+    let mut last_error = None;
+    peers.retain_mut(|peer| match peer.write_all(data) {
+        Ok(()) => { sent += data.len(); true }
+        Err(e) => { last_error = Some(e); false }
+    });
+    if sent == 0 {
+        if let Some(e) = last_error { return Err(format!("TCP 帧没发完整：{}", e)); }
+    }
+    Ok(sent)
+}
+
 /* ----------------------------------------------------------------- 命令层 */
 
 /// 打开一个通道。kind / addr / port / extra 由页面按传输方式给。
 /// extra：串口写 "COM3:115200"，其它可不填。
+/// frame_bytes：TCP / 串口二进制接收的整帧字节数；省略或 0 保持旧版文本分帧。
 #[tauri::command]
 pub fn nf_io_open(
     id: u32,
@@ -183,9 +210,14 @@ pub fn nf_io_open(
     addr: String,
     port: u16,
     extra: Option<String>,
+    frame_bytes: Option<usize>,
     bus: tauri::State<IoBus>,
     links: tauri::State<IoLinks>,
 ) -> Result<String, String> {
+    let frame_bytes = frame_bytes.unwrap_or(0);
+    if frame_bytes > MAX_FRAME_BYTES {
+        return Err("二进制信号帧不能超过 16 MiB，请减少信号位数量".into());
+    }
     {
         let mut m = links.0.lock().unwrap();
         if let Some(l) = m.remove(&id) { l.stop.store(true, Ordering::SeqCst); }
@@ -247,9 +279,10 @@ pub fn nf_io_open(
                     match l.accept() {
                         Ok((st, _)) => {
                             let _ = st.set_nodelay(true);
+                            let _ = st.set_write_timeout(Some(Duration::from_millis(800)));
                             if let Ok(c) = st.try_clone() {
                                 if let Ok(mut v) = peers_r.lock() { v.push(c); }
-                                spawn_stream_recv(st, id, b1.clone(), s1.clone(), true);
+                                spawn_stream_recv(st, id, b1.clone(), s1.clone(), true, frame_bytes);
                             }
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(60)),
@@ -262,13 +295,7 @@ pub fn nf_io_open(
                 stop: s2,
                 send: Box::new(move |d: &[u8]| {
                     let mut v = peers_s.lock().map_err(|_| "连接表锁坏了".to_string())?;
-                    v.retain(|s| s.peer_addr().is_ok());
-                    if v.is_empty() { return Err("还没有任何程序连上来（TCP 服务端）".into()); }
-                    let mut sent = 0usize;
-                    for s in v.iter_mut() {
-                        if let Ok(k) = s.write(d) { sent += k; }
-                    }
-                    Ok(sent)
+                    broadcast_frame(&mut v, d)
                 }),
                 kind: "tcp".into(),
                 desc: format!("TCP 服务端 {}", sa),
@@ -282,13 +309,14 @@ pub fn nf_io_open(
             let _ = st.set_nodelay(true);
             let w = st.try_clone().map_err(|e| e.to_string())?;
             let _ = w.set_write_timeout(Some(Duration::from_millis(800)));
-            spawn_stream_recv(st, id, bus.clone(), stop.clone(), true);
+            spawn_stream_recv(st, id, bus.clone(), stop.clone(), true, frame_bytes);
             let mut m = links.0.lock().unwrap();
             m.insert(id, Link {
                 stop,
                 send: Box::new(move |d: &[u8]| {
                     let mut w2 = &w;
-                    w2.write(d).map_err(|e| format!("TCP 发不出去：{}", e))
+                    w2.write_all(d).map_err(|e| format!("TCP 发不出去：{}", e))?;
+                    Ok(d.len())
                 }),
                 kind: "tcpc".into(),
                 desc: format!("TCP 客户端 {}", sa),
@@ -310,13 +338,14 @@ pub fn nf_io_open(
             let f = OpenOptions::new().read(true).write(true).open(&dev)
                 .map_err(|e| format!("打不开串口 {}：{}（口对不对？被别的软件占了没？）", dev, e))?;
             let w = f.try_clone().map_err(|e| format!("串口复制句柄失败：{}", e))?;
-            spawn_serial_recv(f, id, bus.clone(), stop.clone());
+            spawn_serial_recv(f, id, bus.clone(), stop.clone(), frame_bytes);
             let mut m = links.0.lock().unwrap();
             m.insert(id, Link {
                 stop,
                 send: Box::new(move |d: &[u8]| {
                     let mut w2 = &w;
-                    w2.write(d).map_err(|e| format!("串口写不进去：{}", e))
+                    w2.write_all(d).map_err(|e| format!("串口写不进去：{}", e))?;
+                    Ok(d.len())
                 }),
                 kind: "serial".into(),
                 desc: format!("串口 {} @ {}", com, baud),
@@ -367,6 +396,115 @@ pub fn nf_io_links(links: tauri::State<IoLinks>) -> Vec<(u32, String, String)> {
     let mut v: Vec<(u32, String, String)> = m.iter().map(|(k, l)| (*k, l.kind.clone(), l.desc.clone())).collect();
     v.sort_by_key(|x| x.0);
     v
+}
+
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+
+    fn take(bus: &IoBus) -> Vec<Vec<u8>> {
+        std::mem::take(&mut *bus.0.lock().unwrap()).into_iter()
+            .map(|(id, data)| { assert_eq!(id, 7); b64_decode(&data).unwrap() }).collect()
+    }
+
+    #[test]
+    fn binary_float_frames_keep_newline_bytes_and_fragmented_values() {
+        let frames = [1.0f32.to_le_bytes().to_vec(), 0.54f32.to_le_bytes().to_vec()];
+        let bytes = frames.concat();
+        assert!(bytes.contains(&b'\n'));
+        for cut in 0..=bytes.len() {
+            let bus = IoBus::default();
+            let mut acc = bytes[..cut].to_vec();
+            split_frames(&mut acc, 7, &bus, 4);
+            acc.extend_from_slice(&bytes[cut..]);
+            split_frames(&mut acc, 7, &bus, 4);
+            assert_eq!(take(&bus), frames);
+            assert!(acc.is_empty());
+        }
+    }
+
+    #[test]
+    fn binary_multislot_frames_do_not_merge_or_deliver_partial_tail() {
+        let frame = [10i16.to_le_bytes(), (-300i16).to_le_bytes()].concat();
+        let bus = IoBus::default();
+        let mut acc = [frame.clone(), frame.clone(), vec![10]].concat();
+        split_frames(&mut acc, 7, &bus, 4);
+        assert_eq!(take(&bus), [frame.clone(), frame.clone()]);
+        assert_eq!(acc, [10]);
+        acc.extend_from_slice(&frame[1..]);
+        split_frames(&mut acc, 7, &bus, 4);
+        assert_eq!(take(&bus), [frame]);
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn binary_large_frame_waits_for_its_whole_payload() {
+        let frame = vec![10u8; 8196];
+        let bus = IoBus::default();
+        let mut acc = frame[..8192].to_vec();
+        split_frames(&mut acc, 7, &bus, frame.len());
+        assert!(take(&bus).is_empty());
+        acc.extend_from_slice(&frame[8192..]);
+        split_frames(&mut acc, 7, &bus, frame.len());
+        assert_eq!(take(&bus), [frame]);
+    }
+
+    #[test]
+    fn text_frames_still_wait_for_newlines() {
+        let bus = IoBus::default();
+        let mut acc = b"1,2\n3".to_vec();
+        split_frames(&mut acc, 7, &bus, 0);
+        assert_eq!(take(&bus), [b"1,2\n".to_vec()]);
+        assert_eq!(acc, b"3");
+        acc.extend_from_slice(b",4\n");
+        split_frames(&mut acc, 7, &bus, 0);
+        assert_eq!(take(&bus), [b"3,4\n".to_vec()]);
+    }
+
+    #[test]
+    fn tcp_receiver_delivers_binary_frames_without_a_newline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (receiver, _) = listener.accept().unwrap();
+        let bus = IoBus::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        spawn_stream_recv(receiver, 7, bus.clone(), stop.clone(), true, 8);
+        let frame = [1.0f32.to_le_bytes(), 0.54f32.to_le_bytes()].concat();
+        sender.write_all(&frame[..3]).unwrap();
+        sender.write_all(&[frame[3..].to_vec(), frame.clone()].concat()).unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(3);
+        let mut received = Vec::new();
+        while received.len() < 2 && std::time::Instant::now() < end {
+            received.extend(take(&bus));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::SeqCst);
+        sender.shutdown(std::net::Shutdown::Both).unwrap();
+        assert_eq!(received, [frame.clone(), frame]);
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_discards_failed_peer_and_reaches_healthy_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_dead_receiver, _) = listener.accept().unwrap();
+        dead.shutdown(std::net::Shutdown::Both).unwrap();
+        let live = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut receiver, _) = listener.accept().unwrap();
+        receiver.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut peers = vec![dead, live];
+        let payload = [1.0f32.to_le_bytes(), 0.54f32.to_le_bytes()].concat();
+        assert_eq!(broadcast_frame(&mut peers, &payload).unwrap(), payload.len());
+        assert_eq!(peers.len(), 1);
+        let mut received = vec![0; payload.len()];
+        receiver.read_exact(&mut received).unwrap();
+        assert_eq!(received, payload);
+    }
 }
 
 /* ------------------------------------------------------- 系统按键（SendInput） */

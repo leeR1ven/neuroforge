@@ -55,6 +55,7 @@ def run_case(tag, model, exporter, tmp, expect_err=None, save_as=None):
     try:
         b, _ = import_model.import_onnx(path, opts)
         neu, edg, blk, _ = import_model.build_arrays(b, opts)
+        ops = import_model.build_ops(b)
     except import_model.Unsupported as e:
         if expect_err is None:
             log(False, tag, "本不该报错：" + str(e)[:160])
@@ -67,15 +68,17 @@ def run_case(tag, model, exporter, tmp, expect_err=None, save_as=None):
 
     nfile = save_as or os.path.join(tmp, tag + ".nforge")
     nforge.write(nfile, neu, edg, name=tag, chunk_neurons=opts.chunk_neurons, names=b.names,
-                 blocks=blk)
-    _h, neu2, edg2, _blk = nforge.read(nfile)
+                 blocks=blk, ops=ops)
+    _h, neu2, edg2, blk2 = nforge.read(nfile)
+    ops2 = nforge.read_ops(nfile)          # 算子节点（Softmax 这类）单独一段，别漏读
 
     with torch.no_grad():
         want = model(x).numpy().reshape(-1)
-    got = ir_forward(neu2, edg2, x.numpy(), b.out_ids)
+    got = ir_forward(neu2, edg2, x.numpy(), b.out_ids, blk2, ops2)
+    extra = f" / {len(ops2)} 算子节点" if ops2 else ""
     err = float(np.max(np.abs(want - got)))
     log(err < 2e-5, f"{tag} 数值和 PyTorch 一致",
-        f"最大误差 {err:.3e}（{len(neu2)} 神经元 / {len(edg2)} 连接）")
+        f"最大误差 {err:.3e}（{len(neu2)} 神经元 / {len(edg2)} 连接{extra}）")
 
 
 class Mlp(nn.Module):
@@ -112,6 +115,14 @@ class WithFlat(nn.Module):
 
 
 class WithSoftmax(nn.Module):
+    """Softmax 走的是算子节点那条路（不是逐神经元折叠）。
+
+    以前这里写的是 expect_err="Softmax"：那时导入器确实会把 Softmax 整块拒掉。
+    现在它被记成一个算子节点、落到输出神经元上，所以这里改成**真比数值**——
+    算子节点单独存在一段 （header["ops"]），写入时忘了带上、或者读出来算错，
+    都会立刻在误差上露馅。ir_forward 认不出的算子会抛错，不会静默跳过。
+    """
+
     def __init__(self):
         super().__init__()
         self.in_f = 4
@@ -136,7 +147,7 @@ def main():
             run_case(f"deep_{xname}", Deep(), xkw, tmp,
                      save_as=os.path.join(PROTO, "torch_demo.nforge") if xname == "ts" else None)
             run_case(f"flatten_{xname}", WithFlat(), xkw, tmp)
-            run_case(f"softmax_{xname}", WithSoftmax(), xkw, tmp, expect_err="Softmax")
+            run_case(f"softmax_{xname}", WithSoftmax(), xkw, tmp)
 
     for l in OUT:
         print(l)

@@ -4,10 +4,11 @@
   "version": "0.1.0",
   "description": "NeuroForge 神经元搭建器 —— Windows 桌面壳（Tauri 2 + WebView2）",
   "scripts": {
+    "frontend": "node ../prototype/build_all.mjs",
     "sync": "node sync_frontend.mjs",
     "icon": "tauri icon ../_dump/app_icon.png",
-    "check": "node sync_frontend.mjs && tauri build --no-bundle",
-    "build": "node sync_frontend.mjs && tauri build",
+    "check": "npm run frontend && node sync_frontend.mjs && tauri build --no-bundle",
+    "build": "npm run frontend && node sync_frontend.mjs && tauri build",
     "dev": "tauri dev"
   },
   "devDependencies": {

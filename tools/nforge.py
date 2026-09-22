@@ -97,6 +97,14 @@ IO_NONE, IO_IN, IO_OUT, IO_BOTH = 0, 1, 2, 3
 ACT_NAMES = ["linear", "relu", "leaky_relu", "sigmoid", "tanh", "gelu", "elu", "silu"]
 
 
+def _inflate(body: bytes, what: str) -> bytes:
+    """解压一块体。坏数据统一转成 ValueError —— 读取层只抛这一种错，调用方好认。"""
+    try:
+        return zlib.decompress(body)
+    except zlib.error as exc:
+        raise ValueError(f"{what}解压失败（压缩数据损坏或被截断）：{exc}") from exc
+
+
 def _align4(o: int) -> int:
     return (o + 3) & ~3
 
@@ -333,6 +341,16 @@ def decode_blocks(raw: bytes, remap=None, sg_base: int = 0):
     dst = np.frombuffer(mv[L["dst"]:L["dst"] + sum_n * 4], dtype="<u4")
     lock = np.frombuffer(mv[L["lock"]:L["lock"] + total_w], dtype=np.uint8) if has_lock else None
     ks, ns = meta[0::2].copy(), meta[1::2].copy()
+    if nb <= 0 or ks.size != nb:
+        raise ValueError("权重块区里没有块，文件可能损坏")
+    sum_ks = int(ks.astype(np.int64).sum())
+    sum_ns = int(ns.astype(np.int64).sum())
+    if sum_ks != sum_k or sum_ns != sum_n:
+        raise ValueError(
+            f"权重块区的行列计数跟各块对不上：各块加起来 {sum_ks}/{sum_ns}，"
+            f"文件头里写的是 {sum_k}/{sum_n}——文件损坏，或者被改过")
+    if int(ks.min()) <= 0 or int(ns.min()) <= 0:
+        raise ValueError("权重块区里有 0 行或 0 列的块，文件可能损坏")
     ow, os_, od = _block_offsets(ks, ns)
     # 引用表：只允许往前指，所以顺着下标走一遍就能拍平成"最终存在哪一块"（用不着递归）
     ref = np.full(nb, -1, dtype=np.int64)
@@ -345,6 +363,12 @@ def decode_blocks(raw: bytes, remap=None, sg_base: int = 0):
             if v >= i:
                 raise ValueError(f"权重块引用表不对：块 {i} 指向了 {v}（只能指向它前面那块）")
             ref[i] = int(ref[v]) if ref[v] >= 0 else v
+    own = ref < 0
+    stored = int((ks.astype(np.int64)[own] * ns.astype(np.int64)[own]).sum())
+    if stored != total_w:
+        raise ValueError(
+            f"权重块区里真正存着的权重个数跟文件头对不上：算下来 {stored} 个，"
+            f"文件头里写的是 {total_w} 个——文件损坏，或者被改过")
     # 被引用过的块才是组长；组号是段内编号（从 1 开始），加 sg_base 才全局唯一
     is_rep = np.zeros(nb, dtype=bool)
     for i in range(nb):
@@ -495,8 +519,12 @@ def read_block_parts(f, base: int, bm: dict, ids=None, remap=None, sg_base: int 
         f.seek(base + int(p["off"]))
         body = f.read(int(p["len"]))
         nbytes += len(body)
+        if len(body) != int(p["len"]):
+            raise ValueError(
+                f"权重块第 {p['i']} 段的字节不够：文件头说 {p['len']} 字节，只读到 {len(body)} 字节"
+                f"——文件被截断了")
         if p["codec"] == "deflate":
-            body = zlib.decompress(body)
+            body = _inflate(body, f"权重块第 {p['i']} 段")
         elif p["codec"] != "raw":
             raise ValueError("不认识的权重块分段压缩方式：" + str(p["codec"]))
         b, dr = decode_blocks(body, remap, sg_off)
@@ -544,8 +572,11 @@ def read_block_region(f, base: int, bm: dict, ids=None, remap=None):
     f.seek(base + (bm.get("off") or 0))
     body = f.read(bm["len"])
     nbytes = len(body)
+    if len(body) != int(bm["len"]):
+        raise ValueError(
+            f"权重块区的字节不够：文件头说 {bm['len']} 字节，只读到 {len(body)} 字节——文件被截断了")
     if bm.get("codec") == "deflate":
-        body = zlib.decompress(body)
+        body = _inflate(body, "权重块区")
     blk, dropped = decode_blocks(body, remap)
     return blk, dropped, nbytes
 
@@ -590,15 +621,33 @@ OP_BY_NAME = {nm: (c, dt) for c, nm, dt in OP_DTYPES}
 OP_ITEMSIZE = {c: np.dtype(dt).itemsize for c, nm, dt in OP_DTYPES}
 
 
+# 参数的角色：决定它编译成 PyTorch 时是 nn.Parameter（可训练）还是 buffer（不可训练）。
+# 跟浏览器端 opParamRole / OP_ROLES 必须一致。
+#   weight —— 可训练权重（卷积核、全连接矩阵、BN 的 scale / bias）
+#   stat   —— 运行统计量（BN 的 running mean / var）：必须是 buffer，不然带梯度的前向直接报错
+#   const  —— 字面常量（ONNX Constant 折进来的、固定缩放系数）：优化器不该动它
+#   int    —— 整型 / 布尔的索引与常量
+OP_ROLES = ("weight", "stat", "const", "int")
+
+
 @dataclass
 class OpParam:
-    """一个参数张量。shape 是逻辑形状，data 是拍平之后的数值。"""
+    """一个参数张量。shape 是逻辑形状，data 是拍平之后的数值。
+
+    role / same 不进参数体（header["ops"] 的字节分区），只记在文件头目录那一份里：
+    改角色不用重写数值。same 非空 = 跟另一个算子参数共用同一份数值（权值共享）。
+    """
     name: str
     dtype: str
     shape: list
     data: np.ndarray
+    role: str = "weight"
+    same: str = ""
 
     def __post_init__(self):
+        if self.role not in OP_ROLES:
+            raise ValueError(f"认不出的参数角色：{self.role}")
+        self.same = str(self.same or "")
         if self.dtype not in OP_BY_NAME:
             raise ValueError(f"认不出的参数类型：{self.dtype}")
         code, dt = OP_BY_NAME[self.dtype]
@@ -758,6 +807,17 @@ def op_ids_dec(e):
     return np.arange(a, max(a, b), dtype=np.uint32)
 
 
+def param_dir_entry(p: OpParam) -> dict:
+    """文件头目录里的一条参数描述（不含数值）。角色 / 共享只在非默认时才写——
+    老软件读到不认识的键会直接忽略，所以旧文件格式仍然读得动。"""
+    d = {"name": p.name, "dtype": p.dtype, "shape": list(p.shape)}
+    if p.role != "weight":
+        d["role"] = p.role
+    if p.same:
+        d["same"] = str(p.same)
+    return d
+
+
 def op_dir_entry(node: OpNode, rank=None) -> dict:
     """一个算子节点在文件头 JSON 里的那一份（不含参数数值）。"""
     ins = []
@@ -774,8 +834,7 @@ def op_dir_entry(node: OpNode, rank=None) -> dict:
     d = {"id": int(node.id), "op": node.op, "name": node.name, "ins": ins,
          "out": [int(x) for x in node.out], "land": op_range_enc(node.land, rank),
          "attrs": dict(node.attrs), "fold": list(node.fold),
-         "params": [{"name": p.name, "dtype": p.dtype, "shape": list(p.shape)}
-                    for p in node.params],
+         "params": [param_dir_entry(p) for p in node.params],
          "note": node.note, "color": int(node.color), "colOn": 1 if node.col_on else 0}
     if node.pos:
         d["pos"] = {"x": float(node.pos["x"]), "y": float(node.pos["y"]), "z": float(node.pos["z"])}
@@ -829,8 +888,12 @@ def read_ops_region(f, base: int, om: dict, remap=None):
         f.seek(base + int(p["off"]))
         body = f.read(int(p["len"]))
         nbytes += len(body)
+        if len(body) != int(p["len"]):
+            raise ValueError(
+                f"算子区第 {p['i']} 段的字节不够：文件头说 {p['len']} 字节，只读到 {len(body)} 字节"
+                f"——文件被截断了")
         if p.get("codec") == "deflate":
-            body = zlib.decompress(body)
+            body = _inflate(body, f"算子区第 {p['i']} 段")
         elif p.get("codec") != "raw":
             raise ValueError("不认识的算子参数压缩方式：" + str(p.get("codec")))
         params = decode_op_blob(body)
@@ -875,11 +938,29 @@ def op_node_from_dir(d: dict, params: list, remap=None) -> OpNode:
     land = map_ids(d.get("land"))
     if d.get("land") is not None and land is None:
         raise _OpSkip(f"算子 {d['name']} 的落点神经元这次没载入")
+    # 角色（weight / stat / const / int）与「跟谁共享」记在文件头目录里，按名字对回参数体。
+    # 老文件没有这两个键 -> OpParam 的默认 role = weight（跟加角色之前的行为一致）。
+    role_of = {}
+    for dp in (d.get("params") or []):
+        if isinstance(dp, dict) and "name" in dp:
+            role_of[str(dp["name"])] = dp
+    fixed = []
+    for p in params:
+        dp = role_of.get(str(p.name))
+        if dp is not None:
+            try:
+                p.role = str(dp.get("role") or "weight")
+                p.same = str(dp.get("same") or "")
+            except ValueError:
+                p.role, p.same = "weight", ""
+            if p.role not in OP_ROLES:
+                p.role = "weight"
+        fixed.append(p)
     return OpNode(op=d["op"], name=d["name"], ins=ins, out=d.get("out") or [], land=land,
                   attrs=dict(d.get("attrs") or {}), fold=list(d.get("fold") or []),
                   note=d.get("note") or "", color=int(d.get("color") or 0),
                   col_on=int(d.get("colOn") or 0), pos=d.get("pos"), id=int(d.get("id") or 0),
-                  params=params)
+                  params=fixed)
 
 
 def _edge_order(src: np.ndarray, n: int):
@@ -1223,6 +1304,9 @@ def decode_chunk(raw, n, e):
     只做解码，不做 id 重映射——重映射是「只载入一部分块」那一层的事。
     """
     L = layout(n, e)
+    if len(raw) < L["total"]:
+        raise ValueError(
+            f"神经元块被截断了（{n} 个神经元 / {e} 条连接要 {L['total']} 字节，只有 {len(raw)} 字节）")
     m = memoryview(raw)
     return {
         "pos": np.frombuffer(m[L["pos"]:L["pos"] + n * 12], dtype="<f4").reshape(-1, 3).copy(),
@@ -1276,13 +1360,16 @@ class StreamReader:
             f.seek(self.data_start + c["off"])
             b = f.read(c["len"])
         self.read_bytes += len(b)
+        if len(b) != int(c["len"]):
+            raise ValueError(
+                f"第 {k} 块的字节不够：文件头说 {c['len']} 字节，只读到 {len(b)} 字节——文件被截断了")
         return b
 
     def chunk(self, k):
         """读 + 解压第 k 块，返回 decode_chunk 的字段字典。"""
         c = self.chunks[k]
         body = self.chunk_bytes(k)
-        raw = zlib.decompress(body) if c["codec"] == "deflate" else body
+        raw = _inflate(body, f"第 {k} 块") if c["codec"] == "deflate" else body
         return decode_chunk(raw, c["n1"] - c["n0"], c["e1"] - c["e0"])
 
     def read_all(self):
@@ -1308,6 +1395,9 @@ class StreamReader:
             f.seek(self.blocks_base() + int(p["off"]))
             b = f.read(int(p["len"]))
         self.read_bytes += len(b)
+        if len(b) != int(p["len"]):
+            raise ValueError(
+                f"权重块第 {i} 段的字节不够：文件头说 {p['len']} 字节，只读到 {len(b)} 字节——文件被截断了")
         return b
 
     def read_blocks(self, ids=None, remap=None):
@@ -1381,7 +1471,11 @@ def read(path, ids=None, block_ids=None):
         for c in pick:
             f.seek(data_start + c["off"])
             body = f.read(c["len"])
-            raw = zlib.decompress(body) if c["codec"] == "deflate" else body
+            if len(body) != int(c["len"]):
+                raise ValueError(
+                    f"第 {c['i']} 块的字节不够：文件头说 {c['len']} 字节，只读到 {len(body)} 字节"
+                    f"——文件被截断了")
+            raw = _inflate(body, f"第 {c['i']} 块") if c["codec"] == "deflate" else body
             n, e = c["n1"] - c["n0"], c["e1"] - c["e0"]
             cd = decode_chunk(raw, n, e)   # 别叫 f：外面那个 f 是文件句柄
             pos.append(cd["pos"]); io.append(cd["io"]); thr.append(cd["thr"])

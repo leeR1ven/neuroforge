@@ -262,6 +262,7 @@ fn main() {
             io_bus::send_keys,
             io_bus::send_keys_combo,
             sys_exec::nf_sys_allow,
+        sys_exec::nf_sys_ask_allow,
             sys_exec::nf_approve_file,
             sys_exec::nf_sys_info,
             sys_exec::nf_run,

@@ -695,6 +695,107 @@ const TEST = `
     try { await NF.loadBuffer(buf.slice(0, Math.floor(buf.length / 2))); }
     catch (err) { threwTrunc = true; }
     log(threwTrunc, '被截断的 v3 文件会明确报错，不会静默载入半张图');
+    /* B20：打开损坏的工程必须是**原子**的。旧图、名字、分组、连接一个都不能动。
+       造一份三块的文件，把第 1 块（第二块）剪到只剩 4 个字节 —— 老实现会先把第一块写进全局、
+       名字和分组也清掉，然后才在第二块上抛错，用户的旧工程就半残了。 */
+    {
+      const b20keep = await NF.encodeV3({ chunkNeurons: 16 });
+      const b20idx = NF.inspectFile(b20keep);
+      const b20dv = new DataView(b20keep.buffer, b20keep.byteOffset, b20keep.byteLength);
+      const b20start = 16 + b20dv.getUint32(8, true);
+      const b20c1 = b20idx.chunks[1];
+      NF.clear();
+      const b20a = NF.addNode(9, 0, 0), b20b = NF.addNode(90, 0, 0), b20c = NF.addNode(180, 0, 0);
+      NF.addEdge(b20a, b20b, 1.25);
+      NF.setName(b20a, '保命名字');
+      NF.setGroup([b20b, b20c], '保命分组');
+      const b20canon = () => { const o = NF.serializeV2(); o.created = ''; return JSON.stringify(o); };
+      const b20doc = b20canon();
+      const b20n = NF.graph().n, b20e = NF.graph().e;
+      let b20threw = false;
+      try { await NF.loadBuffer(b20keep.slice(0, b20start + b20c1.off + 4)); }
+      catch (err) { b20threw = true; }
+      log(b20threw, 'B20：第 2 块被剪断时打开明确报错（不是静默载入半张图）');
+      log(NF.graph().n === b20n && NF.graph().e === b20e, 'B20：打开失败后神经元/连接数没变',
+          NF.graph().n + '/' + NF.graph().e + ' vs ' + b20n + '/' + b20e);
+      log(Math.abs(NF.node(0).x - 9) < 1e-6, 'B20：打开失败后坐标没被覆盖', String(NF.node(0).x));
+      log(NF.nameOf(0) === '保命名字', 'B20：打开失败后名字还在', JSON.stringify(NF.nameOf(0)));
+      log(NF.groups().length === 1 && NF.groupOf(b20b) === '保命分组', 'B20：打开失败后分组还在',
+          JSON.stringify(NF.groups()));
+      const b20now = b20canon();
+      let b20d = -1; for (let i = 0; i < Math.max(b20now.length, b20doc.length); i++) { if (b20now[i] !== b20doc[i]) { b20d = i; break; } }
+      log(b20now === b20doc, 'B20：打开失败后整份工程一字未改',
+          b20d < 0 ? '' : ('len ' + b20doc.length + '->' + b20now.length + ' 首处不同 @' + b20d + ' || ' + b20doc.slice(Math.max(0, b20d - 80), b20d + 80) + ' || ' + b20now.slice(Math.max(0, b20d - 80), b20d + 80)));
+      const b20ok = await NF.loadBuffer(b20keep);
+      log(b20ok.n === b20idx.counts.neurons && b20ok.e === b20idx.counts.edges,
+          'B20：完好的那份文件仍然正常载入', b20ok.n + ' 神经元 / ' + b20ok.e + ' 连接');
+    }
+
+    /* B18：学习档位表最多 255 项（含第 0 项「固定」）。超了必须明确失败——
+       档位号最后是一个字节，静默回绕会把神经元挂到别的档位上，比失败坏得多。 */
+    {
+      NF.plastReset();
+      let b18ok = 0;
+      for (let i = 1; i < 255; i++) if (NF.plastAdd({ name: '档' + i, rule: 'hebb' }) === i) b18ok++;
+      log(b18ok === 254, 'B18：前 254 次新增都拿到正确编号', String(b18ok));
+      log(NF.plastProfiles().length === 255, 'B18：档位表能长到 255 项（含固定）', String(NF.plastProfiles().length));
+      log(NF.plastAdd({ name: '溢出', rule: 'hebb' }) === -1, 'B18：满表时新增明确失败（回 -1）');
+      log(NF.plastProfiles().length === 255, 'B18：满表新增没有改到表', String(NF.plastProfiles().length));
+      log(NF.setPlast([0, 1], 254) === true, 'B18：合法档位号照常能赋值');
+      const b18was = NF.plastOf(0).prof;
+      log(NF.setPlast([0], 255) === false, 'B18：越界档位号明确失败');
+      log(NF.plastOf(0).prof === b18was, 'B18：越界没改到神经元（没有回绕成 0）', String(NF.plastOf(0).prof));
+      const b18buf = await NF.encodeV3();
+      await NF.loadBuffer(b18buf);
+      log(NF.plastProfiles().length === 255, 'B18：满档位表存下来再读回来还是 255 项',
+          String(NF.plastProfiles().length));
+      log(NF.checkIndex(NF.inspectFile(b18buf)).length === 0, 'B18：满档位表存出来仍然过文件头校验', JSON.stringify(NF.checkIndex(NF.inspectFile(b18buf))));
+      NF.plastReset();
+    }
+    /* B03：通用接口调用（run_api）也得有撤销 / 回滚。模型的 run_api 能调到整个 NF 表面，
+       偏置 / 阈值 / 连接 / 分组这些常见修改以前没有单独立成工具，改完撤不回来；
+       抛错时前面写进去的那半截也留在图上。这里按角色表开事务：改工程的拍一格
+       （成功留着当撤销点，抛错回滚），只读的不进撤销栈。 */
+    {
+      NF.aiConfig({ autoRun: true });   /* 自测环境不受用户设置影响 */
+      NF.clear();
+      const b03p = NF.addNode(0, 0, 0), b03q = NF.addNode(10, 0, 0);
+      NF.setBias([b03p], 0);
+      const b03s0 = NF.histStats().steps;
+      const b03r = await NF.aiTool('run_api', { name: 'setBias', args: [[b03p], 3] });
+      log(b03r && b03r.ok, 'B03：run_api 调 setBias 成功', JSON.stringify(b03r && b03r.error));
+      log(Math.abs(NF.node(b03p).bias - 3) < 1e-6, 'B03：run_api 真的改到了值', String(NF.node(b03p).bias));
+      log(NF.histStats().steps === b03s0 + 1, 'B03：改工程的那一次调用正好多一格撤销点',
+          NF.histStats().steps + ' vs ' + (b03s0 + 1));
+      NF.undo();
+      log(Math.abs(NF.node(b03p).bias - 0) < 1e-6, 'B03：按一次撤销就回到原值（不是两次）', String(NF.node(b03p).bias));
+      const b03s1 = NF.histStats().steps;
+      const b03r2 = await NF.aiTool('run_api', { name: 'stats' });
+      log(b03r2 && b03r2.ok && NF.histStats().steps === b03s1, 'B03：只读调用不往撤销栈里塞格子',
+          NF.histStats().steps + ' vs ' + b03s1);
+      /* 抛错回滚：让第二次赋值炸掉 —— 第一次已经写进数组了，事务没做对就留下来了 */
+      NF.setBias([b03p, b03q], 0.25);
+      const b03s2 = NF.histStats().steps;
+      let b03n = 0;
+      const b03bad = { valueOf: () => { if (++b03n > 1) throw new Error('B03 故意炸一下'); return 2; } };
+      const b03r3 = await NF.aiTool('run_api', { name: 'setBias', args: [[b03p, b03q], b03bad] });
+      log(!b03r3.ok, 'B03：抛错的调用明确失败', JSON.stringify(b03r3 && b03r3.error));
+      log(Math.abs(NF.node(b03p).bias - 0.25) < 1e-6, 'B03：抛错前写进去的那半个也回滚了', String(NF.node(b03p).bias));
+      log(NF.histStats().steps === b03s2, 'B03：回滚后撤销栈没有多出空格子',
+          NF.histStats().steps + ' vs ' + b03s2);
+      /* B20 那条路的入口换成 run_api 也一样：打开坏文件失败后不留格子 */
+      const b03keep = await NF.encodeV3({ chunkNeurons: 16 });
+      const b03idx = NF.inspectFile(b03keep);
+      const b03dv = new DataView(b03keep.buffer, b03keep.byteOffset, b03keep.byteLength);
+      const b03start = 16 + b03dv.getUint32(8, true);
+      const b03s3 = NF.histStats().steps;
+      const b03r4 = await NF.aiTool('run_api',
+        { name: 'loadBuffer', args: [b03keep.slice(0, b03start + b03idx.chunks[0].off + 4)] });
+      log(!b03r4.ok, 'B03：run_api 打开被剪断的文件同样失败');
+      log(NF.histStats().steps === b03s3, 'B03：失败之后撤销栈一格没多（事务收干净了）',
+          NF.histStats().steps + ' vs ' + b03s3);
+    }
+
     let threwMagic = false;
     const badBuf = buf.slice(); badBuf[2] = 0;
     try { NF.inspectFile(badBuf); } catch (err) { threwMagic = true; }
@@ -1661,7 +1762,7 @@ const TEST = `
     log(f2 >= f1 + 12, '没写过的连接列走的是「整张沿用」的近路（两拍 = 那几列各不扫两次）', '近路列数 ' + f1 + ' -> ' + f2);
     const pc0 = NF.histStats().perCol;
     let edgeCopied = 0;
-    for (let k = 10; k < 18 && k < pc0.length; k++) edgeCopied += pc0[k].copied;   /* 10..15 连接列 + selN + selE */
+    for (let k = 12; k < 20 && k < pc0.length; k++) edgeCopied += pc0[k].copied;   /* 12..17 连接列 + selN + selE */
     log(edgeCopied === 0, '最近一拍里连接那几列一共重拷 0 块（真没动它们）', '重拷 ' + edgeCopied + ' 块');
     NF.histVerify(true);
     /* 撤销必须逐位还原（位置 / 权重 / 颜色 / 接口都要对得上） */
@@ -2525,14 +2626,15 @@ const TEST = `
     log(m27hs.blkBytes <= 9 * 4 * 3, '块权重的历史占用只跟「存了几个版本」有关，不按格数翻倍',
         m27hs.blkBytes + ' 字节（9 个权重 = 36 字节一个版本）');
     log(m27hs.naive >= 9 * 4, '不做共享的对比数字里也算上了块权重', m27hs.naive + ' 字节');
-    log(m27hs.perCol.length === 18, '历史里注册的列数是 18', m27hs.perCol.length + ' 列');
-    /* 面板的列名表必须跟真正注册的 18 列一一对上：删掉后面那句就会错位，
+    log(m27hs.perCol.length === 20, '历史里注册的列数是 20（含学习档位与强硬抑制）', m27hs.perCol.length + ' 列');
+    /* 面板的列名表必须跟真正注册的 20 列一一对上：删掉后面那句就会错位，
        错位以后「权重」那行显示的是别的列，看数字会看错列。 */
     document.querySelector('[data-cmd=hist]').click();
     const m27body = document.getElementById('dlgbody');
     const m27txt = m27body ? m27body.textContent : '';
-    log(!!m27body && m27txt.indexOf('分组') >= 0 && m27txt.indexOf('列 17') < 0 && m27txt.indexOf('列 16') < 0,
-        '历史面板 18 列每列都有名字（没有一列退化成「列 N」）', m27txt.slice(0, 70));
+    log(!!m27body && m27txt.indexOf('分组') >= 0 && m27txt.indexOf('学习档位') >= 0 && m27txt.indexOf('强硬抑制') >= 0 &&
+        m27txt.indexOf('列 19') < 0 && m27txt.indexOf('列 18') < 0,
+        '历史面板 20 列每列都有名字（没有一列退化成「列 N」）', m27txt.slice(0, 70));
 
     /* ---- 28. 名称表：也走分块 + 结构共享
        以前每拍一格快照就 new Map(nName) 整份拷一遍——12 万个名字的工程里，
@@ -3665,6 +3767,21 @@ const TEST = `
             '对话存档：每段的标题也回来了');
         const qj = NF.serializeV2();
         log(!!qj.ai && qj.ai.sessions.length >= 1, '对话存档：v2 JSON 工程里也带着对话');
+        /* 只读接口必须「同状态同字节」：serializeV2 / aiSessionDoc 以前每次快照都盖一个新的
+           Date.now()，隔一毫秒调两次就自己跟自己不一样（B20 的「一字未改」断言就是这么被抖出来的）。 */
+        await sleep(5);
+        const qd1 = JSON.stringify(NF.aiSessionDoc());
+        await sleep(5);
+        const qd2 = JSON.stringify(NF.aiSessionDoc());
+        log(qd1 === qd2, '对话存档：什么都没变时连调两次给同样的字节（跨毫秒也不抖）',
+            qd1 === qd2 ? '' : ('len ' + qd1.length + '->' + qd2.length));
+        NF.aiNewSession('自测');
+        await sleep(5);
+        const qd3 = NF.aiSessionDoc();
+        const qcur3 = qd3.sessions.filter((x) => x.id === qd3.sid)[0];
+        log(!!qcur3 && Math.abs(qcur3.at - Date.now()) < 5000,
+            '对话存档：真发生了事（新建一段对话）活动时间照样更新',
+            qcur3 ? String(qcur3.at) : '没找到当前那段');
         const qput = await NF.aiArchivePut();
         log(!!(qput && qput.ok), '对话存档：本机那份兜底副本写得进去', 'pid=' + (qput && qput.pid));
         NF.aiSessionReset('自测：本机存档');
@@ -3887,6 +4004,52 @@ const TEST = `
           '有状态神经元：模拟结果与闭式解逐位相同（保持系数真的在起作用）',
           'memory=' + r36.val[g36m] + ' leaky=' + r36.val[g36l] + ' spike=' + r36.val[g36p]);
 
+      /* ---- B09 / B10：状态型神经元的膜电位 —— 界面连续运行和导出模型必须是同一个状态机 ---- */
+      log(!!r36.stOut && r36.stOut.length === 5 && r36.stCarried === false,
+          'B10：模拟返回内部膜电位（长度 = 神经元数），第一次跑没有外部状态可继承',
+          'stOut=' + (r36.stOut ? r36.stOut.length : 'null') + ' carried=' + r36.stCarried);
+      log(r36.stCarried === false, 'B10：不传 stIn 时每次模拟都从零开始（默认行为和以前一样）');
+      const r36st2 = NF.simCompute([g36s], { stIn: r36.stOut });
+      log(r36st2.stCarried === true && Math.abs(r36st2.stOut[g36m] - 16) < 1e-9,
+          'B10：把上一帧的膜电位传进去 → 真的接着上一帧算（记忆神经元 8 → 16）',
+          'memory=' + (r36st2.stOut ? r36st2.stOut[g36m] : 'null') + ' carried=' + r36st2.stCarried);
+      const r36st3 = NF.simCompute([g36s], { stIn: new Float64Array(99) });
+      log(r36st3.stCarried === false && Math.abs(r36st3.stOut[g36m] - 8) < 1e-9,
+          'B10：膜电位长度和当前图对不上 → 丢掉旧状态，从零开始算',
+          'memory=' + (r36st3.stOut ? r36st3.stOut[g36m] : 'null') + ' carried=' + r36st3.stCarried);
+      /* 接口运行时：默认「每帧从零开始」，切成「跨帧保留」才和导出模型一致 */
+      NF.ifaceStateMode('reset');
+      NF.ifaceBind(g36s, { kind: 'const', value: 1 });
+      NF.ifaceBindOut(g36o, { kind: 'log' });
+      NF.ifaceOn(true);
+      NF.ifaceForward();
+      const f36x = NF.ifaceState();
+      const os36a = (f36x.outVal.filter(function (x) { return x[0] === g36o; })[0] || [0, 0])[1];
+      NF.ifaceForward();
+      const f36y = NF.ifaceState();
+      const os36b = (f36y.outVal.filter(function (x) { return x[0] === g36o; })[0] || [0, 0])[1];
+      log(f36x.stMode === 'reset' && !f36x.stHeld && os36a === os36b && os36a > 0,
+          'B10：reset 模式下每一帧都是独立的单帧预览（两帧输出逐位相同、不留膜电位）',
+          os36a + ' / ' + os36b + ' mode=' + f36x.stMode + ' held=' + f36x.stHeld);
+      NF.ifaceStateMode('keep');
+      NF.ifaceForward();
+      const os36c = (NF.ifaceState().outVal.filter(function (x) { return x[0] === g36o; })[0] || [0, 0])[1];
+      NF.ifaceForward();
+      const f36d = NF.ifaceState();
+      const os36d = (f36d.outVal.filter(function (x) { return x[0] === g36o; })[0] || [0, 0])[1];
+      log(f36d.stMode === 'keep' && f36d.stHeld === true && os36d > os36c,
+          'B10：keep 模式下膜电位跨帧保留（记忆神经元每帧往上加，和导出模型的连续 forward 一致）',
+          os36c + ' -> ' + os36d + ' held=' + f36d.stHeld);
+      const cl36st = NF.ifaceResetState();
+      NF.ifaceForward();
+      const os36e = (NF.ifaceState().outVal.filter(function (x) { return x[0] === g36o; })[0] || [0, 0])[1];
+      log(cl36st.cleared === true && Math.abs(os36e - os36c) < 1e-9,
+          'B10：显式清空内部状态之后，下一帧回到最初的数值（复位真的有效）',
+          '清空前第一帧=' + os36c + ' 清空后=' + os36e);
+      NF.ifaceStateMode('reset');
+      NF.ifaceResetState();
+      NF.ifaceOn(false);
+
       const py36 = NF.compile('pytorch');
       const mu36 = (py36.code.match(/USED_ACT_IDS = \\[([^\\]]*)\\]/) || [])[1];
       const mv36 = (mu36 || '').split(',').map(function (s) { return parseInt(s.trim(), 10); })
@@ -3896,6 +4059,14 @@ const TEST = `
           'USED_ACT_IDS=[' + mu36 + ']');
       log(py36.code.indexOf('keep_bias') >= 0 && py36.code.indexOf('self.st') >= 0,
           '有状态神经元：生成的 .py 里注册了状态缓冲（self.st / keep_bias）');
+      log(py36.code.indexOf('def reset_state(self)') >= 0 && py36.code.indexOf('def detach_state(self)') >= 0 &&
+          py36.code.indexOf('STATE_RESET = str(TRAIN_CFG.get("state", "reset")).lower() != "keep"') >= 0,
+          'B09：生成的 .py 带 reset_state / detach_state 两个公开接口，以及 STATE_RESET 状态策略开关');
+      log(py36.code.indexOf('shuffle=reset_each_batch') >= 0 && py36.code.indexOf('                net.reset_state()') >= 0 &&
+          py36.code.indexOf('reset_each_batch = (str(cfg["state"]).lower() != "keep")') >= 0,
+          'B09：训练骨架按状态策略复位（每个批次前 reset_state）+ shuffle 跟着策略走，且能被 cfg 覆盖');
+      log(py36.code.indexOf("'state': 'reset'") >= 0,
+          'B09：训练配置里多了状态策略这一项（默认独立样本 = reset）');
       const c36 = NF.compile('exe');
       log(c36.errors.length === 0 && c36.code.indexOf('static double st[') >= 0 &&
           c36.code.indexOf('h[i] = act_code[i] >= 8 ? 0.0 : (double)bias[i];') >= 0,
@@ -3917,9 +4088,13 @@ const TEST = `
 
       /* ---- AI 思考强度：用户在设置里选，AI 自己也有一条 ai_think 工具 ---- */
       const tk0 = NF.aiThinkLevel();
-      log(tk0.level === 'default' && tk0.levels.join(',') === 'default,off,low,medium,high,max' &&
+      log(tk0.level === 'default' && tk0.levels.join(',') === 'default,off,low,medium,high,xhigh,max' &&
           tk0.bad === false,
-          'AI 思考强度：默认档是 default，六档都在', tk0.label);
+          'AI 思考强度：默认档是 default，七档都在', tk0.label);
+      const tkMedium = NF.aiThinkLevel('medium');
+      const tkXhigh = NF.aiThinkLevel('xhigh');
+      log(tkMedium.label === '中（medium）' && tkXhigh.level === 'xhigh' && NF.aiThinkLevel().level === 'xhigh',
+          'AI 思考强度：medium 标签通用，xhigh 档可选择', tkMedium.label + '/' + tkXhigh.label);
       const tk1 = NF.aiThinkLevel('high');
       log(tk1.level === 'high' && NF.aiThinkLevel().level === 'high' && tk1.bad === false,
           'AI 思考强度：改得动，读回来也是新档', tk1.label);
@@ -4120,7 +4295,7 @@ const TEST = `
         /* 标题栏那个常驻的思考强度：跟「设置」里那一项是同一个值，两边同步 */
         const top38 = document.getElementById('ai-think-top');
         const set38 = document.getElementById('ai-think');
-        if (top38 && set38 && top38.options.length === 6) {
+        if (top38 && set38 && top38.options.length === 7) {
           top38.value = 'high';
           top38.dispatchEvent(new Event('change', { bubbles: true }));
           await sleep(80);
@@ -4131,7 +4306,7 @@ const TEST = `
           await sleep(80);
           log(top38.value === 'default', '38 反过来改设置，标题栏也跟着同步', top38.value);
         } else {
-          log(false, '38 标题栏的思考强度下拉框在位且有 6 档',
+          log(false, '38 标题栏的思考强度下拉框在位且有 7 档',
             'top=' + !!top38 + ' set=' + !!set38 + ' opts=' + (top38 ? top38.options.length : -1));
         }
 

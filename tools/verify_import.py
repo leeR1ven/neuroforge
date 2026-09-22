@@ -41,19 +41,33 @@ def _ref_erf(t):
     return np.vectorize(erf)(np.asarray(t, dtype=np.float64) / sqrt(2.0))
 
 
-class Gelu(OpRun):
-    """onnx 1.22 的参考实现里没有 Gelu（opset 20 才进标准），这里补一个精确版。
+def gelu_tanh(t):
+    """编辑器里的 gelu：F.gelu(..., approximate="tanh")。
 
-    必须和编辑器里 gelu（激活码 5，erf 版）逐点一致，否则"数值等价"这句是空的。
+    常数跟 main.js 里那串（生成 Python / C 与编辑器模拟用的）逐字一致，
+    否则"导入后的图和编辑器算的一样"这句就是空的。
+    """
+    return 0.5 * t * (1.0 + np.tanh(0.7978845608028654 * (t + 0.044715 * t * t * t)))
+
+
+class Gelu(OpRun):
+    """onnx 1.22 的参考实现里没有 Gelu（opset 20 才进标准），这里补上。
+
+    照 ONNX 的语义分两种：approximate 缺省或 "none" 是精确 erf 版；"tanh" 是近似版。
+    编辑器里的 gelu 固定是 tanh 近似（激活码 5），所以对拍模型写成 approximate="tanh"；
+    "none" 那种能导进来，但导入器会把它记成「数值近似」（见 verify_audit_import.py）。
     """
 
     op_domain = ""
 
     def _run(self, x, approximate=None):
-        if approximate is not None and approximate not in ("", "none"):
-            raise ValueError(f"参考实现只做精确版 Gelu，approximate={approximate} 不支持")
         x = np.asarray(x, dtype=np.float64)
-        return (0.5 * x * (1.0 + _ref_erf(x)),)
+        a = "" if approximate in (None, "") else str(approximate)
+        if a in ("", "none"):
+            return (0.5 * x * (1.0 + _ref_erf(x)),)
+        if a == "tanh":
+            return (gelu_tanh(x),)
+        raise ValueError(f"参考实现不认 Gelu 的 approximate={approximate}")
 
 
 class Silu(OpRun):
@@ -82,7 +96,7 @@ def ACT_VALUES(code, t):
     if code == 4:
         return np.tanh(t)
     if code == 5:
-        return 0.5 * t * (1.0 + _ref_erf(t))
+        return gelu_tanh(t)
     if code == 6:
         return np.where(t > 0, t, np.expm1(t))
     if code == 7:
@@ -90,11 +104,60 @@ def ACT_VALUES(code, t):
     raise ValueError("未知激活码 " + str(code))
 
 
-def ir_forward(neu, edg, x, out_ids, blk=None):
+def _softmax(t, axis=0):
+    """数值稳定的 softmax（减最大值）。"""
+    m = np.max(t, axis=axis, keepdims=True)
+    e = np.exp(t - m)
+    return e / np.sum(e, axis=axis, keepdims=True)
+
+
+def _op_axis(attrs, rank, default):
+    """算子里记的 axis：负数按 rank 折回来，越界直接报错（别猜）。"""
+    if not attrs or 'axis' not in attrs:
+        return default
+    ax = int(attrs['axis'])
+    if ax < 0:
+        ax += rank
+    if not (0 <= ax < rank):
+        raise ValueError(f"算子的 axis={attrs['axis']} 超出秩 {rank}")
+    return ax
+
+
+def _op_eval(nd, op_val, val):
+    """算一个算子节点，返回输出张量。认不出的算子直接报错，不许静默跳过。"""
+    parts = []
+    for r in nd.ins:
+        if r.get('k') == 'o':
+            a = np.asarray(op_val[int(r['id'])], dtype=np.float64)
+        else:
+            ids = np.asarray(r['ids'], dtype=np.int64)
+            a = np.asarray(val[ids], dtype=np.float64)
+        shape = [int(v) for v in (r.get('shape') or [a.size])]
+        parts.append(a.reshape(shape))
+    if not parts:
+        raise ValueError('ir_forward 不认识没有输入的算子 ' + str(nd.op))
+    if len(parts) > 1:
+        raise ValueError('ir_forward 还不认识多输入算子 ' + str(nd.op) + '（%d 路输入）' % len(parts))
+    t = parts[0]
+    rank = max(1, t.ndim)
+    if nd.op == 'Softmax':
+        y = _softmax(t, _op_axis(nd.attrs, rank, rank - 1))
+    elif nd.op == 'LogSoftmax':
+        y = np.log(_softmax(t, _op_axis(nd.attrs, rank, rank - 1)))
+    else:
+        raise ValueError('ir_forward 不认识算子 ' + str(nd.op) + '，别拿它当数值基准')
+    out_shape = [int(v) for v in nd.out] or list(y.shape)
+    return y.reshape(out_shape)
+
+
+def ir_forward(neu, edg, x, out_ids, blk=None, ops=None):
     """按编辑器的语义前向：先取偏置，输入神经元由外部写入，再按拓扑序推进。
 
     权重块在这里被摊成逐条贡献——只是求值方式不同，语义跟编译产物里那次 matmul 一致：
     h[列 j] += Σ_行 W[行, j] · h[src[行]]。
+
+    算子节点（Softmax / LogSoftmax 这类无状态、单输入的）也一起算：它们出现在落点上，
+    落点神经元要等算子算完再往下传。认不出的算子会抛错，不会被当成"没事"跳过。
     """
     n = len(neu)
     succ = [[] for _ in range(n)]
@@ -118,6 +181,21 @@ def ir_forward(neu, edg, x, out_ids, blk=None):
                     dj = int(bdst[j])
                     succ[sa].append((dj, wa))
                     indeg[dj] += 1
+    op_list = list(getattr(ops, 'list', None) or [])
+    op_dep_n, op_dep_o, op_land = [], [], []
+    for nd in op_list:
+        dn, do = set(), set()
+        for r in nd.ins:
+            if r.get('k') == 'o':
+                do.add(int(r['id']))
+            else:
+                dn.update(int(v) for v in r['ids'])
+        op_dep_n.append(dn)
+        op_dep_o.append(do)
+        land = [] if nd.land is None else [int(v) for v in nd.land]
+        op_land.append(land)
+        for i in land:
+            indeg[i] += 1          # 落点要等这个算子算完
     val = neu.bias.astype(np.float64).copy()
     ins = np.nonzero(neu.io & nforge.IO_IN)[0]   # 双向接口（IO_BOTH）的也要当输入喂
     xf = np.asarray(x, dtype=np.float64).reshape(-1)
@@ -126,23 +204,56 @@ def ir_forward(neu, edg, x, out_ids, blk=None):
     for k, i in enumerate(ins):
         val[i] = xf[k]
     ins_set = set(ins.tolist())
-    q = deque(np.nonzero(indeg == 0)[0].tolist())
-    order = []
+
+    # 拓扑序列：把算子节点也当一个节点排进去 —— 它的"入边"是它依赖的神经元 / 上游算子，
+    # "出边"是落点神经元。这样值传播只走一遍，算子拿到的一定是上游已经算完的值。
+    # （早先的写法是在拓扑遍历里顺手算算子，那会儿逐神经元的贡献还没加进去，
+    # 算出来的必然是偏置那一层，Softmax 就会静默算错。）
+    settled = set()
+    op_done = set()
+    op_queued = set()
+    op_val = {}
+    seq = []
+    q = deque(('n', i) for i in np.nonzero(indeg == 0)[0].tolist())
+
+    def admit_ops():
+        for oi in range(len(op_list)):
+            if oi in op_queued or oi in op_done:
+                continue
+            if op_dep_n[oi] <= settled and op_dep_o[oi] <= op_done:
+                op_queued.add(oi)
+                q.append(('op', oi))
+
+    admit_ops()
     while q:
-        i = q.popleft()
-        order.append(i)
-        for d, _ in succ[i]:
-            indeg[d] -= 1
-            if indeg[d] == 0:
-                q.append(d)
-    if len(order) != n:
+        kind, v = q.popleft()
+        seq.append((kind, v))
+        if kind == 'n':
+            settled.add(v)
+            for d, _ in succ[v]:
+                indeg[d] -= 1
+                if indeg[d] == 0:
+                    q.append(('n', d))
+        else:
+            op_done.add(v)
+            for i in op_land[v]:
+                indeg[i] -= 1
+                if indeg[i] == 0:
+                    q.append(('n', i))
+        admit_ops()
+    if sum(1 for k, _ in seq if k == 'n') != n:
         raise ValueError("导入出来的图有环")
-    for i in order:
-        if i not in ins_set:
-            pass                      # val[i] 已经累加完所有上游贡献
-        val[i] = ACT_VALUES(int(neu.act[i]), val[i])
-        for d, w in succ[i]:
-            val[d] += w * val[i]
+    for kind, v in seq:
+        if kind == 'n':
+            val[v] = ACT_VALUES(int(neu.act[v]), val[v])
+            for d, w in succ[v]:
+                val[d] += w * val[v]
+        else:
+            out = _op_eval(op_list[v], op_val, val)
+            op_val[v] = out
+            flat = out.reshape(-1)
+            for pos, i in enumerate(op_land[v]):
+                val[i] = float(flat[pos])
     return np.concatenate([val[ids] for ids in out_ids])
 
 
@@ -170,7 +281,9 @@ def make_model(specs, in_features, name="t"):
             nodes.append(helper.make_node("Gemm", args, [f"g{i}"], transB=1))
         cur = f"g{i}"
         if act:
-            nodes.append(helper.make_node(act, [cur], [f"a{i}"]))
+            # 编辑器里的 gelu 是 tanh 近似：对拍模型也写 tanh，两边才是同一个函数
+            akw = {"approximate": "tanh"} if act == "Gelu" else {}
+            nodes.append(helper.make_node(act, [cur], [f"a{i}"], **akw))
             cur = f"a{i}"
         prev = cur
     out_f = specs[-1][0].shape[0]
@@ -777,6 +890,102 @@ def main():
         log("转了置" in _why and "手工" in _why,
             "tied_transposed 转置两用：理由里写清是转置两用、并且可以在界面里手工建组",
             _why[:140])
+
+        # 26. B05：opset 12+ 的 Dropout 第 3 个输入（training_mode）。
+        #     以前只查属性，输入里写着 True 的图会被当成推理模式悄悄放过去。
+        def dropout3(train_val, dynamic=False, ratio=0.5, mask=False, attr_conflict=False):
+            W = rand_w(4, 4)
+            inits = [numpy_helper.from_array(np.ascontiguousarray(W, dtype=np.float32), "W"),
+                     numpy_helper.from_array(np.array(ratio, dtype=np.float32), "R")]
+            ins_in = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])]
+            nodes = [helper.make_node("Gemm", ["X", "W"], ["g0"], transB=1)]
+            if dynamic:
+                # 开关是图输入：跑起来才知道是推理还是训练
+                ins_in.append(helper.make_tensor_value_info("T", TensorProto.BOOL, []))
+            else:
+                inits.append(numpy_helper.from_array(np.array(bool(train_val), dtype=np.bool_), "T"))
+            outs = ["Y", "MASK"] if mask else ["Y"]
+            nd = helper.make_node("Dropout", ["g0", "R", "T"], outs)
+            if attr_conflict:
+                nd.attribute.append(helper.make_attribute("training_mode", 1))
+            nodes.append(nd)
+            gouts = [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])]
+            if mask:
+                nodes.append(helper.make_node("Identity", ["MASK"], ["Y2"]))
+                gouts.append(helper.make_tensor_value_info("Y2", TensorProto.BOOL, [1, 4]))
+            g = helper.make_graph(nodes, "dp3", ins_in, gouts, inits)
+            return helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+
+        run_case("dropout3_train", dropout3(True), tmp, expect_err="training_mode")
+        run_case("dropout3_dynamic", dropout3(True, dynamic=True), tmp, expect_err="第 3 个输入")
+        run_case("dropout3_eval", dropout3(False), tmp)
+        run_case("dropout3_conflict", dropout3(False, attr_conflict=True), tmp, expect_err="对不上")
+        run_case("dropout3_mask", dropout3(False, mask=True), tmp, expect_err="掩码")
+
+        # 27. B06：Gelu 的两种模式——tanh（跟编辑器一致）照导，none（精确 erf）照导但
+        #     必须在报告里写成「数值近似」。以前是反的：tanh 被拒，none 被当成等价。
+        def gelu_model(approx=None):
+            W = rand_w(4, 4)
+            kw = {} if approx is None else {"approximate": approx}
+            nodes = [helper.make_node("Gemm", ["X", "W"], ["g0"], transB=1),
+                     helper.make_node("Gelu", ["g0"], ["Y"], **kw)]
+            g = helper.make_graph(nodes, "gelu",
+                                  [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+                                  [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+                                  [numpy_helper.from_array(np.ascontiguousarray(W, dtype=np.float32), "W")])
+            return helper.make_model(g, opset_imports=[helper.make_opsetid("", 20)])
+
+        m27 = gelu_model("tanh")
+        run_case("gelu_tanh", m27, tmp)
+        opts27, b27 = _import(tmp, "gelu_tanh", onnx.load(os.path.join(tmp, "gelu_tanh.onnx")))
+        log(b27.source["report"]["numeric"] == "exact" and b27.approx == [],
+            "Gelu approximate=tanh：跟编辑器同一个函数，报告写 exact",
+            str(b27.source["report"]["numeric"]))
+
+        m27n = gelu_model()          # 缺省 = none = 精确 erf
+        run_case("gelu_erf", m27n, tmp, num_tol=2e-3)
+        opts27n, b27n = _import(tmp, "gelu_erf", onnx.load(os.path.join(tmp, "gelu_erf.onnx")))
+        rep27 = b27n.source["report"]
+        log(rep27["structure"] == "exact" and rep27["numeric"] == "approximate" and
+            any(i["k"] == "approx" for i in rep27["items"]) and rep27["exactAll"] is False,
+            "Gelu approximate=none（精确 erf）：能导进来，但报告里写成「数值近似」而不是等价",
+            f'structure={rep27["structure"]} numeric={rep27["numeric"]} '
+            f'items={[i["k"] for i in rep27["items"]]}')
+        # 两种模式的差真的只有 5e-4 量级（说明记的是"近似"而不是"算错"）。上面那条
+        # run_case 已经用 ONNX 参考执行器（erf 版）对过完整管线；这里再单看函数本身。
+        xs = np.linspace(-3.0, 3.0, 601)
+        gap = float(np.max(np.abs(gelu_tanh(xs) - 0.5 * xs * (1.0 + _ref_erf(xs)))))
+        log(gap < 2e-3, "精确 erf 与编辑器 tanh 近似的最大差在 5e-4 量级（不是算错）",
+            f"最大绝对差 {gap:.6g}")
+
+        run_case("gelu_bogus", gelu_model("fastgelu"), tmp, expect_err="approximate")
+
+        # 28. B13：分类报告——结构 / 数值 / 精度 / 共享四项分开记，verified 不假装已验证
+        opts28, b28 = _import(tmp, "double_weights", onnx.load(os.path.join(tmp, "double_weights.onnx")))
+        rep28 = b28.source["report"]
+        log(rep28["structure"] == "exact" and rep28["numeric"] == "exact" and
+            rep28["dtype"] == "widened" and rep28["verified"] == "none" and
+            rep28["exactAll"] is False and
+            any(i["k"] == "dtype" for i in rep28["items"]),
+            "float64 权重：报告写 结构=exact / 数值=exact / 精度=widened / 未验证数值等价",
+            f'{rep28["structure"]}/{rep28["numeric"]}/{rep28["dtype"]}/{rep28["verified"]}')
+        opts28b, b28b = _import(tmp, "tied_weights", onnx.load(os.path.join(tmp, "tied_weights.onnx")),
+                                blocks="always")
+        rep28b = b28b.source["report"]
+        log(rep28b["shared"] == "kept" and rep28b["structure"] == "exact" and
+            rep28b["numeric"] == "exact" and b28b.source["exact"] is True and
+            b28b.source["structureExact"] is True and
+            rep28b["exactAll"] == (rep28b["dtype"] == "exact"),
+            "tied weights：报告写 共享=kept；exactAll 由四项一起决定"
+            "（这里常量是 float64，所以精度那一项是 widened）",
+            f'shared={rep28b["shared"]} dtype={rep28b["dtype"]} exactAll={rep28b["exactAll"]}')
+        opts28c, b28c = _import(tmp, "bn_skip", onnx.load(os.path.join(tmp, "bn_skip.onnx")),
+                                blocks="auto", allow_skip="BatchNormalization")
+        rep28c = b28c.source["report"]
+        log(rep28c["structure"] == "skipped" and rep28c["exactAll"] is False and
+            any(i["k"] == "skip" for i in rep28c["items"]),
+            "跳过的算子：报告里结构写成 skipped，exactAll=false，条目指向具体节点",
+            f'structure={rep28c["structure"]} items={[i["k"] for i in rep28c["items"]]}')
 
     fails = [l for l in OUT if l.startswith("FAIL")]
     for l in OUT:

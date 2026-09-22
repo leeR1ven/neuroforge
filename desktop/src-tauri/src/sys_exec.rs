@@ -74,10 +74,65 @@ fn home_dir() -> PathBuf {
 fn kv(k: &str, v: impl ToString) -> (String, String) { (k.to_string(), v.to_string()) }
 
 /* ---- 门 ---- */
+
+/// 同步页面上的两个勾选框状态。**只允许降权**：请求打开一个当前关着的东西会被忽略。
+///
+/// 为什么只降不升：页面上的每个方法模型都能用 run_api 调到（list_api 把 NF 全扫给模型），
+/// 只在前端拦名字，等于把授权边界建在模型自己身上（审计 B01）。要开权限必须走
+/// nf_sys_ask_allow —— 那条路会弹一个系统对话框，是进程外的，页面伪造不出来。
 #[tauri::command]
 pub fn nf_sys_allow(fs: bool, run: bool, gate: tauri::State<SysGate>) -> Vec<bool> {
-    gate.fs.store(fs, Ordering::SeqCst);
-    gate.run.store(run, Ordering::SeqCst);
+    if !fs {
+        gate.fs.store(false, Ordering::SeqCst);
+    }
+    if !run {
+        gate.run.store(false, Ordering::SeqCst);
+    }
+    vec![gate.fs.load(Ordering::SeqCst), gate.run.load(Ordering::SeqCst)]
+}
+
+/// 唯一能**开**权限的入口：弹一个系统对话框，用户点「是」才真开。
+///
+/// 这是「用户亲手授权」唯一真实的凭据：对话框由宿主进程弹，页面（包括模型写进去的任何
+/// 脚本）既伪造不了它，也点不到它。降权（关掉）不用确认，随时生效。
+#[tauri::command]
+pub fn nf_sys_ask_allow(fs: bool, run: bool, gate: tauri::State<SysGate>) -> Vec<bool> {
+    let up_fs = fs && !gate.fs.load(Ordering::SeqCst);
+    let up_run = run && !gate.run.load(Ordering::SeqCst);
+    if up_fs || up_run {
+        let mut what = String::new();
+        if up_fs {
+            what.push_str("  · 读写文件 / 联网下载\n");
+        }
+        if up_run {
+            what.push_str("  · 运行命令（等于把这台机器交给对面的模型）\n");
+        }
+        let text = format!(
+            "AI 助手请求打开本机操作权限：\n\n{}\n只有你点「是」才会生效；关掉软件后自动回到关闭状态。",
+            what
+        );
+        let yes = rfd::MessageDialog::new()
+            .set_title("NeuroForge · 允许 AI 操作本机？")
+            .set_description(text)
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .set_level(rfd::MessageLevel::Warning)
+            .show()
+            == rfd::MessageDialogResult::Yes;
+        if yes {
+            if up_fs {
+                gate.fs.store(true, Ordering::SeqCst);
+            }
+            if up_run {
+                gate.run.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+    if !fs {
+        gate.fs.store(false, Ordering::SeqCst);
+    }
+    if !run {
+        gate.run.store(false, Ordering::SeqCst);
+    }
     vec![gate.fs.load(Ordering::SeqCst), gate.run.load(Ordering::SeqCst)]
 }
 
@@ -1196,6 +1251,43 @@ fn cfg_field(v: &serde_json::Value, name: &str) -> String {
     v.get(name).and_then(|x| x.as_str()).unwrap_or("").to_string()
 }
 
+/// 接口地址规范化成「哪一家服务」：去空白、小写、削掉末尾斜杠和常见的端点尾巴。
+///
+/// Key 只跟服务走，不跟模型名走（同一家换个模型名照样能用）。
+fn svc_of(base: &str) -> String {
+    let mut s = base.trim().to_lowercase();
+    for tail in ["/chat/completions", "/responses", "/completions", "/models"] {
+        if s.len() > tail.len() && s.ends_with(tail) {
+            let n = s.len() - tail.len();
+            s.truncate(n);
+        }
+    }
+    while s.ends_with('/') {
+        s.pop();
+    }
+    s
+}
+
+/// 两边都写了地址就必须对得上；都没写才当同一家（没地址就没法区分，只能信它）。
+fn svc_same(a: &str, b: &str) -> bool {
+    let (x, y) = (svc_of(a), svc_of(b));
+    if x.is_empty() || y.is_empty() {
+        x.is_empty() && y.is_empty()
+    } else {
+        x == y
+    }
+}
+
+/// 某一份配置里，某个 Key 字段该跟哪个地址配对（视觉 Key 用它自己的地址，没写就退回主地址）。
+fn cfg_svc_of(v: &serde_json::Value, f: &str) -> String {
+    if f == "visKey" {
+        let vb = cfg_field(v, "visBase");
+        if vb.is_empty() { cfg_field(v, "base") } else { vb }
+    } else {
+        cfg_field(v, "base")
+    }
+}
+
 /* 写设置。force = 用户在界面上明确按了「保存 / 清除 Key」，这时候才允许把 Key 写成空的。
    别的任何路径（开机同步、测试脚本、界面顺手一改）都不许把已有的 Key 抹掉：
    非空的 Key 只会被非空的 Key 换掉。这一条放在壳里，页面那侧写错了也丢不了。 */
@@ -1213,11 +1305,20 @@ pub fn nf_cfg_write(text: String, force: Option<bool>) -> Result<Vec<(String, St
     let cur_v: serde_json::Value = serde_json::from_str(&cur).unwrap_or(serde_json::Value::Null);
     let bak_v: serde_json::Value = serde_json::from_str(&prev_bak).unwrap_or(serde_json::Value::Null);
     let mut carried: usize = 0;
+    /* 兜底补 Key 时**必须比对服务地址**：只看「有没有 Key」的话，A 家的凭证会被填进 B 家，
+       下一次请求就把 A 的 Key 发到 B 去了（审计 B02）。地址对不上就保持为空，让用户自己填。 */
     if !force {
         for f in ["key", "visKey"] {
             if cfg_field(&want, f).is_empty() {
-                let mut got = cfg_field(&cur_v, f);
-                if got.is_empty() { got = cfg_field(&bak_v, f); }
+                let want_base = cfg_svc_of(&want, f);
+                let mut got = String::new();
+                for src in [&cur_v, &bak_v] {
+                    let v = cfg_field(src, f);
+                    if v.is_empty() { continue; }
+                    if !svc_same(&cfg_svc_of(src, f), &want_base) { continue; }
+                    got = v;
+                    break;
+                }
                 if !got.is_empty() {
                     want[f] = serde_json::Value::String(got);
                     if f == "key" { carried = 1; }

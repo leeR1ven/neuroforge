@@ -300,6 +300,124 @@ const TEST = `
         '选中文字时来一次重画，选中的东西还在（推迟到选择清掉之后再画）',
         picked.length + ' 字 -> ' + String(sel.toString()).length + ' 字');
     sel.removeAllRanges();
+
+    /* ---------- 15) 设置不能被长日志和多行草稿挤成细缝 ----------
+       只测真实布局和用户入口，不以某个 CSS class 是否存在作为通过条件。
+       不点保存、不读写设置/Key；测试工程、草稿、视口内联样式在 finally 恢复。 */
+    const viewEl = document.getElementById('viewport');
+    const aiEl = document.getElementById('ai');
+    const settingsEl = document.getElementById('aiset');
+    const barEl = document.getElementById('aibar');
+    const saveEl = document.getElementById('ai-save');
+    const setBtn = document.querySelector('#aihead [data-aicmd="set"]');
+    const sessBtn = document.querySelector('#aihead [data-aicmd="sessions"]');
+    const layoutOriginal = {
+      project: JSON.parse(JSON.stringify(NF.serializeV2())),
+      viewStyle: viewEl.getAttribute('style'), textStyle: taEl.getAttribute('style'), draft: taEl.value,
+      folded: aiEl.getBoundingClientRect().height === 0,
+      set: settingsEl.getBoundingClientRect().height > 0,
+      sess: panel.getBoundingClientRect().height > 0,
+    };
+    const restoreStyle = (el, value) => value === null ? el.removeAttribute('style') : el.setAttribute('style', value);
+    const nl = String.fromCharCode(10);
+    const draft = Array.from({ length: 30 }, (_, i) => '未发送的多行草稿 ' + (i + 1)).join(nl);
+    const layoutDoc = JSON.parse(JSON.stringify(layoutOriginal.project));
+    const layoutSeed = layoutDoc.ai.sessions.find(x => x.id === layoutDoc.ai.sid) || layoutDoc.ai.sessions[0];
+    const layoutMain = Object.assign({}, layoutSeed, {
+      id: 'layout-main', n: 901, title: '布局长日志', msgs: [{ role: 'user', content: '布局回归上下文' }],
+      /* 日志上限是 140 条；100 条、每条 5 行，覆盖实际显示的 500 行。 */
+      log: Array.from({ length: 100 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user',
+        text: Array.from({ length: 5 }, (_, j) => '布局长日志 ' + (i * 5 + j + 1)).join(nl) })),
+    });
+    const layoutOther = Object.assign({}, layoutSeed, {
+      id: 'layout-other', n: 902, title: '布局另一段', msgs: [{ role: 'user', content: '另一段上下文' }],
+      log: [{ role: 'user', text: '布局切换成功标记' }],
+    });
+    layoutDoc.ai = { v: 1, sid: layoutMain.id, seq: 902, sessions: [layoutMain, layoutOther] };
+    try {
+      NF.loadV2(layoutDoc);
+      NF.aiSetUI({ folded: false, set: false, sess: false });
+      taEl.value = draft;
+      taEl.dispatchEvent(new Event('input', { bubbles: true }));
+      await raf();
+      log(logEl.textContent.indexOf('布局长日志 500') >= 0 && logEl.scrollHeight > logEl.clientHeight,
+          '布局用例确实载入 500 行可滚动聊天记录', '内容高=' + logEl.scrollHeight + ' / 可见高=' + logEl.clientHeight);
+      log(taEl.getBoundingClientRect().height >= 218 && taEl.getBoundingClientRect().height <= 222,
+          '布局用例确实把多行输入框撑到 220px', taEl.getBoundingClientRect().height + 'px');
+
+      for (const shortHeight of [null, 360]) {
+        const scene = shortHeight === null ? '正常视口' : '360px 短视口';
+        if (shortHeight !== null) {
+          viewEl.style.height = shortHeight + 'px';
+          viewEl.style.minHeight = shortHeight + 'px';
+          viewEl.style.maxHeight = shortHeight + 'px';
+          viewEl.style.alignSelf = 'start';
+          await raf();
+          log(Math.abs(viewEl.getBoundingClientRect().height - shortHeight) < 2,
+              scene + '：测试视口高度实际生效', viewEl.getBoundingClientRect().height + 'px');
+        }
+        const beforeText = logEl.textContent;
+        setBtn.click();
+        await raf();
+        const available = viewEl.getBoundingClientRect();
+        const settingsBox = settingsEl.getBoundingClientRect();
+        const minUsable = Math.min(180, available.height * 0.45);
+        log(settingsEl.clientHeight >= minUsable && settingsBox.height >= minUsable,
+            scene + '：长日志和 220px 草稿不能压扁设置面板',
+            '设置=' + settingsBox.height.toFixed(1) + ' / client=' + settingsEl.clientHeight + ' / 视口=' + available.height);
+        log(logEl.getBoundingClientRect().height === 0 && barEl.getBoundingClientRect().height === 0,
+            scene + '：设置打开时聊天和输入栏让出布局空间');
+        log(settingsEl.scrollHeight > settingsEl.clientHeight,
+            scene + '：设置内容在独立面板内滚动', '内容=' + settingsEl.scrollHeight + ' / 可见=' + settingsEl.clientHeight);
+        settingsEl.scrollTop = settingsEl.scrollHeight;
+        await raf();
+        const clipped = settingsEl.getBoundingClientRect();
+        const saveBox = saveEl.getBoundingClientRect();
+        log(settingsEl.scrollTop > 0 && saveBox.height >= 20 &&
+            saveBox.top >= Math.max(clipped.top, available.top, 0) - 1 &&
+            saveBox.bottom <= Math.min(clipped.bottom, available.bottom, innerHeight) + 1,
+            scene + '：底部保存按钮能完整滚入可见区域（不点击）',
+            'scrollTop=' + settingsEl.scrollTop + ' / 保存按钮=' + saveBox.top.toFixed(1) + '–' + saveBox.bottom.toFixed(1));
+
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'F8', code: 'F8', bubbles: true, cancelable: true }));
+        await raf();
+        log(aiEl.getBoundingClientRect().height === 0 && settingsEl.getBoundingClientRect().height === 0,
+            scene + '：F8 可以折叠正在打开的设置');
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'F8', code: 'F8', bubbles: true, cancelable: true }));
+        await raf();
+        log(settingsEl.clientHeight >= minUsable && taEl.value === draft,
+            scene + '：F8 展开后设置仍有可用高度，草稿仍在', settingsEl.clientHeight + 'px');
+        setBtn.click();
+        await raf();
+        log(settingsEl.getBoundingClientRect().height === 0 && logEl.getBoundingClientRect().height > 0 &&
+            barEl.getBoundingClientRect().height > 0 && taEl.value === draft && logEl.textContent === beforeText,
+            scene + '：关闭设置恢复聊天和输入栏，日志与草稿内容不变');
+
+        /* 从设置直接切到对话列表，再使用真实的「打开」入口换会话。 */
+        setBtn.click(); sessBtn.click();
+        await raf();
+        const openOther = document.querySelector('#aislist [data-sess="layout-other"] [data-sesscmd="open"]');
+        log(settingsEl.getBoundingClientRect().height === 0 && panel.getBoundingClientRect().height > 0 && !!openOther,
+            scene + '：设置可切到对话列表，列表入口可用');
+        if (openOther) openOther.click();
+        await raf();
+        log(S().当前 === layoutOther.id && logEl.textContent.indexOf('布局切换成功标记') >= 0 && taEl.value === draft,
+            scene + '：切换对话正常，未发送草稿保留');
+        const openMain = document.querySelector('#aislist [data-sess="layout-main"] [data-sesscmd="open"]');
+        if (openMain) openMain.click();
+        sessBtn.click();
+        await raf();
+        log(S().当前 === layoutMain.id && logEl.textContent.indexOf('布局长日志 500') >= 0 && taEl.value === draft,
+            scene + '：切回长日志后聊天和草稿仍完整');
+      }
+    } finally {
+      restoreStyle(viewEl, layoutOriginal.viewStyle);
+      NF.loadV2(layoutOriginal.project);
+      taEl.value = layoutOriginal.draft;
+      restoreStyle(taEl, layoutOriginal.textStyle);
+      NF.aiSetUI({ folded: layoutOriginal.folded, set: layoutOriginal.set, sess: layoutOriginal.sess });
+      await raf();
+    }
     const fails = out.filter(l => l.startsWith('FAIL')).length;
     done('NFSESS ' + (out.length - fails) + 'P/' + fails + 'F' + (fails ? ' BAD' : ''));
   } catch (e) {

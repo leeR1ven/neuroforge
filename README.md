@@ -1,5 +1,11 @@
 # NeuroForge
 
+> Development handoff: see [FIX_LOG.md](FIX_LOG.md) for the 2026-09-22 audit fixes, GPT-6 integration, regression results, and desktop build status.
+>
+> **GPT-6 Astra:** Open AI assistant settings → **OpenAI GPT-6**, then enter your own OpenAI API key and apply. Responses support includes chat, screenshots, and editor tools. Use the connection test to check your account access. Existing DeepSeek and local model endpoints remain available.
+>
+> **Model selection:** AI settings → **选择模型** (Select model) → **刷新模型列表** (Refresh model list). Choose a model supplied by the configured endpoint, or enter its model ID manually. Refreshing the list keeps your current model. OpenAI API billing is separate from included ChatGPT/Codex plan usage ([official documentation](https://learn.chatgpt.com/docs/auth)).
+
 **Place neurons in 3D space, wire them up, and compile the result into code that actually runs.**
 
 No Python environment to set up. No training script to write. No code at all, unless you want it.
@@ -85,9 +91,11 @@ everything inlined, no network access needed). Download it from Releases and dou
 - **See the network's state, not just its shape.** Weight histograms, global health checks,
   pruning, connection-width-by-weight, node-size-by-strength. This is the part a model *viewer*
   cannot show you.
-- **Scale.** Built to hold 500,000 neurons / 2,000,000 connections in the editor, verified on a
-  real network of 16.8 million edges. Large projects stream in from disk — open the summary first,
-  and blocks are decompressed only as the camera approaches them.
+- **Scale.** Capacity grows on demand up to a hard ceiling of 16,777,216 neurons / 67,108,864
+  connections — the physical memory limit, not a performance promise. 500,000 / 2,000,000 was
+  measured at a locked 60 fps on the reference machine (461 MB of heap), and a real network of
+  16.8 million edges loads and runs. Large projects can also stream in from disk — open the summary
+  first, and blocks are decompressed only as the camera approaches them.
 
 ## Recurrent and spiking networks
 
@@ -143,9 +151,10 @@ rewiring, editing weights, pruning, compiling, opening channels, running the sim
 
 ## Honest limits
 
-- **The editor is a pre-allocated hard ceiling**: 500,000 neurons / 2,000,000 connections. Above
-  that it refuses with a clear message rather than truncating. Use chunked load, or pre-slice the
-  network with the scripts in `tools/`.
+- **The editor's hard ceiling is 16,777,216 neurons / 67,108,864 connections.** Capacity grows on
+  demand (it starts at 8,192 / 16,384), so how far you can actually go depends on your machine.
+  Above the ceiling it refuses with a clear message rather than truncating. Use chunked load, or
+  pre-slice the network with the scripts in `tools/`.
 - **The standalone target is C source plus a build script**, not a prebuilt binary. The target
   machine needs a compiler. The C backend also does not support operator nodes (convolutions and
   friends) — use PyTorch or ONNX for those.
@@ -163,7 +172,7 @@ rewiring, editing weights, pruning, compiling, opening channels, running the sim
 
 ## Verified, not asserted
 
-The build is exercised by 875 interaction assertions plus cross-language checks (JS against Python
+The build is exercised by 992 interaction assertions plus cross-language checks (JS against Python
 on the project container, the compiled PyTorch against the compiled C target, and the importer
 against reference ONNX models). The Go2 numbers above come from a real MuJoCo run, not a mock.
 
