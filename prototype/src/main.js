@@ -8519,13 +8519,15 @@ function buildModel() {
   const rptr = new Array(maxLayer + 2).fill(0);
   if (recE.length) { const rp = wavePtr(recE); for (let k = 0; k < rp.length; k++) rptr[k] = rp[k]; }
   const src = [], dst = [], w = [], bias = [], wFrozen = [], bFrozen = [];
-  for (const e of eorder) { src.push(eSrc[e]); dst.push(eDst[e]); w.push(eW[e]); wFrozen.push(eLock[e]); }
+  /* eids：编译顺序的第 k 条边在图里是第几条（F09 回填要按它写回 eW，不用再查一遍）。 */
+  const eids = [];
+  for (const e of eorder) { src.push(eSrc[e]); dst.push(eDst[e]); w.push(eW[e]); wFrozen.push(eLock[e]); eids.push(e); }
   /* 回边的参数就接在前向连接后面：src/dst 是同一个数组、权重在同一段 self.weight 里。
      所以 model.bin 的布局一个字都不用改，只是多了一段「第几波用到哪几条回边」的下标。 */
   const rsrc = [], rdst = [], rw = [], rFrozen = [];
   for (const e of recE) {
     rsrc.push(eSrc[e]); rdst.push(eDst[e]); rw.push(eW[e]); rFrozen.push(eLock[e]);
-    src.push(eSrc[e]); dst.push(eDst[e]); w.push(eW[e]); wFrozen.push(eLock[e]);
+    src.push(eSrc[e]); dst.push(eDst[e]); w.push(eW[e]); wFrozen.push(eLock[e]); eids.push(e);
   }
   for (let i = 0; i < G.n; i++) { bias.push(nBias[i]); bFrozen.push(nLock[i]); }
   /* 权重块：按"列所在的波次"分组。块不拆成边，而是在每一波做一次矩阵乘。
@@ -8665,6 +8667,7 @@ function buildModel() {
        编译不报错，跑出来全是噪声。实测就是这么踩的。 */
     N: G.n, E: w.length, EGraph: G.e, numWaves: maxLayer + 1,
     inputNodes: nIn, outputNodes: nOut,
+    eids, wrep,
     nodeOrder: order, nptr, ptr, src, dst, w, bias, acts, lockN,
     wFrozen, bFrozen, layer: Array.from(layer),
     blocks: blocks.slice(), bEntries, bptr,
@@ -8684,6 +8687,373 @@ function buildModel() {
 
 /* 规模大到权重不该内联进源码时，走 model.bin 这条路 */
 function needsBin(m) { return m.E > 3000 || m.N > 3000 || m.blocks.length > 0 || m.ops.length > 0; }
+
+/* ==========================================================================
+   F09：拓扑指纹 + 权重回灌
+   --------------------------------------------------------------------------
+   训练是生成出来的 .py 在跑；训练完的权重得能**灌回这张图**：连线的粗细颜色跟着变，
+   然后还能接着改、重新编译。要安全地做这件事，先得回答一个问题：
+   「这份权重文件，是这张图训练出来的吗？」
+
+   答案用**结构指纹**：神经元数 / 编译顺序的连接两端 / 激活码 / 权重块与算子节点的结构
+   （形状、共享组、参数名与角色）算一个 sha256。**数值一律不进指纹**——权重、阈值、偏置、
+   冻结标记正是要回填的东西，进了指纹就永远对不上。同一个指纹在编译时写进生成的 .py
+   （NF_TOPOLOGY），导出权重时带着它；回填时编辑器现算一遍，对不上就明确拒绝。
+
+   为什么不用下标当参数 ID：连接在编译时是**重排过**的（按目标节点的波次排），
+   下标换个排序就全错位；而 (源, 目标) 这对神经元编号是稳定的。指纹认"同一张图"，
+   (源, 目标) 认"同一条边"。
+   ========================================================================== */
+/* ---- SHA-256：纯实现，只拿来算结构指纹（不做安全用途），不依赖宿主环境 ---- */
+const SHA256_K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2]);
+function sha256New() {
+  const h = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                             0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+  const buf = new Uint8Array(64), w = new Uint32Array(64);
+  let len = 0, total = 0;
+  function blockAt(p, off) {
+    for (let i = 0; i < 16; i++) {
+      const j = off + i * 4;
+      w[i] = ((p[j] << 24) | (p[j + 1] << 16) | (p[j + 2] << 8) | p[j + 3]) >>> 0;
+    }
+    for (let i = 16; i < 64; i++) {
+      const a = w[i - 15], b = w[i - 2];
+      const s0 = (((a >>> 7) | (a << 25)) ^ ((a >>> 18) | (a << 14)) ^ (a >>> 3)) >>> 0;
+      const s1 = (((b >>> 17) | (b << 15)) ^ ((b >>> 19) | (b << 13)) ^ (b >>> 10)) >>> 0;
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (let i = 0; i < 64; i++) {
+      const s1 = (((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7))) >>> 0;
+      const ch = ((e & f) ^ (~e & g)) >>> 0;
+      const t1 = (hh + s1 + ch + SHA256_K[i] + w[i]) >>> 0;
+      const s0 = (((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10))) >>> 0;
+      const mj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+      const t2 = (s0 + mj) >>> 0;
+      hh = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0; h[2] = (h[2] + c) >>> 0; h[3] = (h[3] + d) >>> 0;
+    h[4] = (h[4] + e) >>> 0; h[5] = (h[5] + f) >>> 0; h[6] = (h[6] + g) >>> 0; h[7] = (h[7] + hh) >>> 0;
+  }
+  return {
+    update(u8) {
+      total += u8.length;
+      let i = 0;
+      if (len) {
+        while (i < u8.length && len < 64) buf[len++] = u8[i++];
+        if (len === 64) { blockAt(buf, 0); len = 0; }
+      }
+      while (i + 64 <= u8.length) { blockAt(u8, i); i += 64; }
+      while (i < u8.length) buf[len++] = u8[i++];
+      return this;
+    },
+    /* 收尾。注意：调过一次之后这个实例就废了，别复用。 */
+    hex() {
+      const bits = total * 8;
+      const hi = Math.floor(bits / 4294967296), lo = bits >>> 0;
+      const pad = new Uint8Array(len < 56 ? 64 : 128);
+      pad.set(buf.subarray(0, len));
+      pad[len] = 0x80;
+      const dv = new DataView(pad.buffer);
+      dv.setUint32(pad.length - 8, hi, false);
+      dv.setUint32(pad.length - 4, lo, false);
+      for (let i = 0; i < pad.length; i += 64) blockAt(pad, i);
+      let out = '';
+      for (let i = 0; i < 8; i++) out += h[i].toString(16).padStart(8, '0');
+      return out;
+    },
+  };
+}
+/* UTF-8 自己编：生成产物的沙箱里不保证有 TextEncoder。 */
+function utf8Bytes(str) {
+  const out = [];
+  for (let i = 0; i < str.length; i++) {
+    let c = str.charCodeAt(i);
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+    else if (c >= 0xd800 && c < 0xdc00 && i + 1 < str.length) {
+      const d = str.charCodeAt(++i);
+      c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00);
+      out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    } else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+  }
+  return Uint8Array.from(out);
+}
+const LE_INT32 = (function () {
+  try { return new Uint8Array(new Uint32Array([1]).buffer)[0] === 1; } catch (e) { return true; }
+})();
+/* int32 小端字节。普通数组和整型数组都能吃；按块儿来，免得为 1681 万条边再开一份大缓冲。 */
+function i32leBytes(arr, from, to) {
+  const n = to - from, tmp = new Int32Array(n);
+  for (let i = 0; i < n; i++) tmp[i] = arr[from + i] | 0;
+  if (!LE_INT32) {
+    const dv = new DataView(tmp.buffer);
+    for (let i = 0; i < n; i++) dv.setInt32(i * 4, tmp[i], true);
+  }
+  return new Uint8Array(tmp.buffer, tmp.byteOffset, n * 4);
+}
+/* 结构指纹的规范文本。两份实现都按这个顺序写（生成的 .py 里那份是编译期算死的），
+   **数值不进这里**：权重 / 阈值 / 偏置 / 冻结标记一变，指纹不该跟着变。 */
+function topoCanonText(m) {
+  const L = [];
+  L.push('neuroforge-topology/1');
+  L.push('n=' + m.N + ' e=' + m.E + ' fwd=' + m.ptr[m.ptr.length - 1] + ' rec=' + (m.recurrent ? 1 : 0) +
+         ' waves=' + m.numWaves + ' nb=' + m.blocks.length + ' nop=' + m.ops.length +
+         ' nin=' + m.inputNodes.length + ' nout=' + m.outputNodes.length);
+  L.push('in=' + m.inputNodes.join(','));
+  L.push('out=' + m.outputNodes.join(','));
+  for (let i = 0; i < m.blocks.length; i++) {
+    const b = m.blocks[i];
+    L.push('b' + i + ' k=' + b.k + ' n=' + b.n + ' sg=' + (b.sg | 0) + ' rep=' + m.wrep[i] +
+           ' rows=' + Array.from(b.src).join(',') + ' cols=' + Array.from(b.dst).join(','));
+  }
+  for (let i = 0; i < m.ops.length; i++) {
+    const o = m.ops[i];
+    const ins = o.ins.map((r) => (r.k === 'n' ? 'n' + (r.ids ? r.ids.length : 0) : 'o' + r.id)).join(',');
+    const ps = o.params.map((p) => [p.name, p.dtype, p.shape.join('x'), p.role || 'weight', p.same || ''].join(':')).join(',');
+    L.push('o' + i + ' op=' + o.op + ' name=' + o.name + ' out=' + o.outShape.join('x') +
+           ' ins=' + ins + ' land=' + (o.land ? o.land.length : 0) + ' params=' + ps);
+  }
+  L.push('acts=' + m.acts.join(','));
+  return L.join(String.fromCharCode(10)) + String.fromCharCode(10);
+}
+/* 一张图的结构指纹。<b>只跟结构有关</b>：同一张图训练前训练后算出来一样。 */
+function irTopologyId(m) {
+  const h = sha256New();
+  h.update(utf8Bytes(topoCanonText(m)));
+  const CH = 1 << 20;
+  for (let a = 0; a < m.E; a += CH) {
+    const b = Math.min(m.E, a + CH);
+    h.update(i32leBytes(m.src, a, b));
+    h.update(i32leBytes(m.dst, a, b));
+  }
+  return h.hex();
+}
+/* 当前图的指纹（给界面和接口用；编译不出来就返回空串）。 */
+function graphTopologyId() {
+  const m = buildModel();
+  return m ? irTopologyId(m) : '';
+}
+/* ---- 权重文档：生成出来的 .py 导出它，编辑器读它 -------------------------------
+   {
+     format / version / topology,
+     graph:  {n, e, fwd, rec, blocks, ops, inputs, outputs},
+     layout: {edges: [[src,dst]…], blocks: [{i,k,n,sg,rep}…], params: [{op,name,shape,role,same}…]},
+     values: {edges: […], bias: […], blocks: {"<块号>": […]}, params: {"<op>:<名字>": […]}},
+     meta:   {what, when, note}
+   }
+   layout 是"稳定 ID"那一半：连接按 (源, 目标) 写、参数按名字写；values 是数值那一半。 */
+const WEIGHTS_FORMAT = 'neuroforge-weights';
+const WEIGHTS_VERSION = 1;
+function weightsParamKey(i, name) { return i + ':' + name; }
+function weightsLayoutOf(m) {
+  const edges = [];
+  for (let k = 0; k < m.E; k++) edges.push([m.src[k], m.dst[k]]);
+  const bl = [];
+  for (let i = 0; i < m.blocks.length; i++) {
+    const b = m.blocks[i];
+    bl.push({ i: i, k: b.k, n: b.n, sg: b.sg | 0, rep: m.wrep[i] });
+  }
+  const params = [];
+  for (let i = 0; i < m.ops.length; i++) {
+    for (let k = 0; k < m.ops[i].params.length; k++) {
+      const p = m.ops[i].params[k];
+      params.push({ op: i, name: p.name, shape: p.shape.slice(), role: p.role || 'weight', same: p.same || '' });
+    }
+  }
+  return { edges: edges, blocks: bl, params: params };
+}
+/* 编辑器这一侧的导出：值直接从图里取（编译顺序的连接权重 / 偏置 / 块 / 算子参数）。 */
+function weightsDocOf(m, meta) {
+  const layout = weightsLayoutOf(m);
+  const values = { edges: [], bias: [], blocks: {}, params: {} };
+  for (let k = 0; k < m.E; k++) values.edges.push(m.w[k]);
+  for (let i = 0; i < m.N; i++) values.bias.push(m.bias[i]);
+  for (let i = 0; i < m.blocks.length; i++) if (m.wrep[i] === i) values.blocks[String(i)] = Array.from(m.blocks[i].w);
+  for (let i = 0; i < m.ops.length; i++) {
+    for (let k = 0; k < m.ops[i].params.length; k++) {
+      const p = m.ops[i].params[k];
+      if ((p.role || 'weight') !== 'weight') continue;    /* stat / const / int：优化器碰不到，不来回填 */
+      values.params[weightsParamKey(i, p.name)] = Array.from(p.data);
+    }
+  }
+  return { format: WEIGHTS_FORMAT, version: WEIGHTS_VERSION, topology: irTopologyId(m),
+           graph: { n: m.N, e: m.E, fwd: m.ptr[m.ptr.length - 1], rec: m.recurrent ? 1 : 0,
+                    blocks: m.blocks.length, ops: m.ops.length,
+                    inputs: m.inputNodes.length, outputs: m.outputNodes.length },
+           layout: layout, values: values, meta: meta || {} };
+}
+/* 解析文本 / 对象 → 文档。只做"像个文档吗"这一层检查，拓扑是否对得上交给 weightsCheck。 */
+function weightsReadDoc(src) {
+  let d = src;
+  if (typeof src === 'string') {
+    try { d = JSON.parse(src); } catch (e) { return { err: '这不是 JSON：' + e.message + '（权重文件应该是生成的脚本 export_weights() 写出来的 .json）' }; }
+  }
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return { err: '权重文件的顶层应该是一个 JSON 对象' };
+  if (d.format !== WEIGHTS_FORMAT) return { err: '认不出的文件：format=' + JSON.stringify(d.format) + '（要 ' + WEIGHTS_FORMAT + '）' };
+  const v = Number(d.version);
+  if (!isFinite(v) || v < 1 || Math.floor(v) !== v) return { err: '版本号不合法：' + JSON.stringify(d.version) };
+  if (v > WEIGHTS_VERSION) return { err: '这份权重文件来自更新的版本（version=' + v + '，本机只认到 ' + WEIGHTS_VERSION + '），先升级编辑器' };
+  if (typeof d.topology !== 'string' || !d.topology) return { err: '权重文件里没有结构指纹（topology）' };
+  if (!d.layout || !d.values) return { err: '权重文件里缺 layout / values' };
+  for (const k of ['edges', 'bias']) if (!Array.isArray(d.values[k])) return { err: 'values.' + k + ' 应该是数组' };
+  if (!Array.isArray(d.layout.edges)) return { err: 'layout.edges 应该是数组' };
+  return { doc: d };
+}
+function weightsNum(v) { return typeof v === 'number' && isFinite(v); }
+/* 拓扑 / 形状是否对得上（返回 null = 可以填；否则一句人话）。值是**先全查完再写**的。 */
+function weightsCheck(doc, m) {
+  const topo = irTopologyId(m);
+  if (doc.topology !== topo) {
+    return '这份权重不是这张图训练出来的（结构指纹对不上）。' +
+           '可能是：换了工程 / 编译之后又改过图（增删神经元、连接、算子或权重块）/ 拿错了文件。' +
+           '指纹一致才敢填——填错的权重是静默的，跑出来全是错的。';
+  }
+  const lay = doc.layout, val = doc.values;
+  if (lay.edges.length !== m.E || val.edges.length !== m.E) {
+    return '连接数对不上：文件 ' + val.edges.length + ' 条（layout ' + lay.edges.length + '），这张图编译出来是 ' + m.E + ' 条';
+  }
+  for (let k = 0; k < m.E; k++) {
+    const p = lay.edges[k];
+    if (!Array.isArray(p) || p.length !== 2 || p[0] !== m.src[k] || p[1] !== m.dst[k]) {
+      return '第 ' + k + ' 条连接的两端对不上：文件写的是 ' + JSON.stringify(p) + '，这张图是 [' + m.src[k] + ', ' + m.dst[k] + ']';
+    }
+    if (!weightsNum(val.edges[k])) return '第 ' + k + ' 条连接的权重不是有限数：' + JSON.stringify(val.edges[k]);
+  }
+  if (val.bias.length !== m.N) return '偏置个数对不上：文件 ' + val.bias.length + ' 个，这张图有 ' + m.N + ' 个神经元';
+  for (let i = 0; i < m.N; i++) if (!weightsNum(val.bias[i])) return '第 ' + i + ' 个神经元的偏置不是有限数：' + JSON.stringify(val.bias[i]);
+  const bl = val.blocks || {};
+  for (let i = 0; i < m.blocks.length; i++) {
+    if (m.wrep[i] !== i) continue;
+    const a = bl[String(i)];
+    const want = m.blocks[i].k * m.blocks[i].n;
+    if (!Array.isArray(a)) return '缺第 ' + i + ' 个权重块的数值';
+    if (a.length !== want) return '第 ' + i + ' 个权重块要 ' + want + ' 个数，文件里是 ' + a.length + ' 个';
+    for (let t = 0; t < want; t++) if (!weightsNum(a[t])) return '第 ' + i + ' 个权重块第 ' + t + ' 个值不是有限数';
+  }
+  const ps = val.params || {};
+  for (const p of lay.params) {
+    if ((p.role || 'weight') !== 'weight') continue;
+    const a = ps[weightsParamKey(p.op, p.name)];
+    if (a === undefined) continue;                       /* 老文件里可能没带，不阻塞 */
+    const o = m.ops[p.op];
+    if (!o) return '文件里引用了第 ' + p.op + ' 个算子，这张图没有';
+    let want = 1;
+    for (const d of p.shape) want *= d;
+    if (!Array.isArray(a) || a.length !== want) return '算子参数 ' + p.name + ' 要 ' + want + ' 个数，文件里是 ' + (Array.isArray(a) ? a.length : '非数组');
+    for (let t = 0; t < want; t++) if (!weightsNum(a[t])) return '算子参数 ' + p.name + ' 第 ' + t + ' 个值不是有限数';
+  }
+  return null;
+}
+/* 权重回填落到人话里的一句（菜单、脚本接口、AI 工具都用这一句）。 */
+function weightsApplyLine(r) {
+  let s = '权重已回填：连接 ' + fmt(r.edges) + ' 条 / 阈值 ' + fmt(r.bias) + ' 个';
+  if (r.blocks) s += ' / 权重块 ' + fmt(r.blocks) + ' 个';
+  if (r.params) s += ' / 算子参数 ' + fmt(r.params) + ' 组';
+  if (r.locked) s += '（跳过冻结 ' + fmt(r.locked) + ' 处）';
+  if (r.vanished) s += '（文件里缺 ' + fmt(r.vanished) + ' 处，已略过）';
+  if (r.changed) s += '；' + fmt(r.changed) + ' 个数值有变，最大变动 ' + (Math.round(r.maxDelta * 1e6) / 1e6);
+  else s += '；数值一个没变';
+  return s;
+}
+/* 让用户自己挑一份权重 .json 填进来。故意**不用页内的系统文件对话框**：
+   自测页里那个 API 不存在，一调就挂；detached input 到处都能用。 */
+function openWeightsFile(onDone) {
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.accept = '.json,.nfweights,application/json';
+  inp.onchange = () => {
+    const f = inp.files[0]; if (!f) return;
+    const rd = new FileReader();
+    rd.onload = () => {
+      try {
+        const r = weightsApply(String(rd.result), {});
+        toast(f.name + ' — ' + weightsApplyLine(r), r.changed ? 'ok' : 'warn');
+        if (typeof onDone === 'function') onDone(r);
+      } catch (err) { toast('回填失败：' + err.message, 'err'); }
+    };
+    rd.onerror = () => toast('读不出这个文件', 'err');
+    rd.readAsText(f);
+  };
+  inp.click();
+  return { opened: true };
+}
+/* 回填。整件事是**一个撤销格**：填错了 Ctrl+Z 一把全回来。 */
+function weightsApply(src, opt) {
+  opt = opt || {};
+  const rd = weightsReadDoc(src);
+  if (rd.err) throw new Error(rd.err);
+  const doc = rd.doc;
+  const m = buildModel();
+  if (!m) throw new Error('这张图现在编译不出来（算子之间有环 / 参数不合法），先把图修好再回填');
+  const why = weightsCheck(doc, m);
+  if (why) throw new Error(why);
+  const val = doc.values, lay = doc.layout, force = !!opt.force;
+  const r = { edges: 0, bias: 0, blocks: 0, params: 0, locked: 0, changed: 0, maxDelta: 0, vanished: 0 };
+  const eList = [], nList = [];
+  snapshot();                                   /* ← 一个撤销格，从这里开始 */
+  histWDirty = 1;
+  for (let k = 0; k < m.E; k++) {
+    const gi = m.eids[k], v = val.edges[k];
+    if (eLock[gi] && !force) { r.locked++; continue; }
+    if (eW[gi] !== v) { const d = Math.abs(eW[gi] - v); if (d > r.maxDelta) r.maxDelta = d; r.changed++; }
+    eW[gi] = v; eList.push(gi); r.edges++;
+  }
+  for (let i = 0; i < m.N; i++) {
+    const v = val.bias[i];
+    if (nLock[i] && !force) { r.locked++; continue; }
+    if (nBias[i] !== v) { const d = Math.abs(nBias[i] - v); if (d > r.maxDelta) r.maxDelta = d; r.changed++; }
+    nBias[i] = v; nList.push(i); r.bias++;
+  }
+  const bl = val.blocks || {};
+  for (let i = 0; i < m.blocks.length; i++) {
+    if (m.wrep[i] !== i) continue;
+    const a = bl[String(i)], b = m.blocks[i];
+    if (!Array.isArray(a)) { r.vanished++; continue; }
+    for (let t = 0; t < a.length; t++) {
+      if (b.w[t] !== a[t]) { const d = Math.abs(b.w[t] - a[t]); if (d > r.maxDelta) r.maxDelta = d; r.changed++; }
+      b.w[t] = a[t];
+    }
+    b.texTag = '';                              /* 热力图要按新权重重画 */
+    r.blocks++;
+  }
+  const ps = val.params || {};
+  for (const p of lay.params) {
+    if ((p.role || 'weight') !== 'weight') continue;
+    const a = ps[weightsParamKey(p.op, p.name)];
+    if (a === undefined) continue;
+    const o = m.ops[p.op];
+    if (!o) continue;
+    const k = opParamIndex(o, p.name);
+    if (k < 0) { r.vanished++; continue; }
+    const sub = o.params[k];
+    let changed = false;
+    for (let t = 0; t < a.length; t++) {
+      if (sub.data[t] !== a[t]) { const d = Math.abs(sub.data[t] - a[t]); if (d > r.maxDelta) r.maxDelta = d; changed = true; }
+      sub.data[t] = a[t];
+    }
+    if (changed) r.changed++;
+    o.texTag = '';
+    r.params++;
+  }
+  /* 落到显示 / 统计 / 撤销的登记上：连接的三个钩子必须打全（见 check_histhook） */
+  if (eList.length) afterEdgeParamChange(eList);
+  else histWDirty = 0;
+  if (nList.length) afterNodeParamChange(nList);
+  if (r.blocks) { blockTintFill(); }
+  if (r.params) rebuildOpViews();
+  markDirty(); refreshAll();
+  r.topo = doc.topology;
+  r.file = { what: (doc.meta && doc.meta.what) || '', when: (doc.meta && doc.meta.when) || '' };
+  return r;
+}
 /* 这张图里有没有「有状态」的神经元（记忆 8 / 漏电积分 9 / 脉冲 10）。
    生成的 C / PyTorch 两条路都要按它决定要不要多带一张状态表和一段更新代码。 */
 function modelHasState(m) {
@@ -9244,6 +9614,23 @@ function generatePyTorch(m, opts) {
   const pAny = pl.list.length > 1;
   const pHard = pl.pairSrc.length > 0 && !m.recurrent;
   const L = [];
+  /* F09：这张图的结构指纹 + 回填要用到的「稳定 ID」那一半。编译期算一次带进产物，
+     权重文件里也带一份；编辑器回填时现算一遍它那张图的指纹，对不上就明确拒绝。 */
+  const topoId = irTopologyId(m);
+  const nfGraph = { n: m.N, e: m.E, fwd: m.ptr[m.ptr.length - 1], rec: m.recurrent ? 1 : 0,
+                    blocks: m.blocks.length, ops: m.ops.length,
+                    inputs: m.inputNodes.length, outputs: m.outputNodes.length };
+  const nfBlocks = m.blocks.map((b, i) => ({ i: i, k: b.k, n: b.n, sg: b.sg | 0, rep: m.wrep[i] }));
+  const nfParams = [];
+  for (let i = 0; i < m.ops.length; i++) {
+    for (let k = 0; k < m.ops[i].params.length; k++) {
+      const p = m.ops[i].params[k];
+      /* attr 是这份参数在生成出来的类里的属性名（o<i>_p<k>）：权值共享时好几个算子的属性是
+         同一个对象，各写各的也写出同一份数值，不影响。 */
+      nfParams.push({ op: i, name: p.name, shape: p.shape.slice(), role: p.role || 'weight',
+                      same: p.same || '', attr: opParamName(i, k) });
+    }
+  }
   /* 「造一个随机输入」集中在这一处：循环网是 3 维 (B, T, K)，前馈网还是 2 维 (B, K)。
      散在好几个函数里各写一遍迟早会漏改一个，漏了就是运行时报错。 */
   const RANDX = (b) => (m.recurrent
@@ -9748,6 +10135,19 @@ function generatePyTorch(m, opts) {
     L.push('# 循环网按时间展开的步数。改这里就行——模型结构自动跟着走，不用回编辑器重编译。');
     L.push('NUM_STEPS = ' + m.recSteps);
   }
+  L.push('');
+  L.push('# ==============================================================');
+  L.push('# 结构指纹（训练完把权重灌回编辑器时对的就是这一把）');
+  L.push('# ==============================================================');
+  L.push('NF_TOPOLOGY = ' + pyLit(topoId));
+  L.push('# 上面这串只跟**结构**有关：神经元数、每条连接的两端、激活码、权重块与算子节点的');
+  L.push('# 形状 / 共享组 / 参数名。权重、阈值、偏置、冻结标记怎么变它都不会变——它们正是要');
+  L.push('# 回填的东西；而改了图（加删神经元或连接、动权重块）它一定会变。');
+  L.push('# --export-weights 导出的 .json 里带着同样一份；编辑器那边会现算一遍它那张图的');
+  L.push('# 指纹，两边对不上就明确拒绝——绝不半填，填错的权重是静默的，跑出来全是错的。');
+  L.push('NF_GRAPH = ' + JSON.stringify(nfGraph));
+  L.push('NF_LAYOUT_BLOCKS = ' + JSON.stringify(nfBlocks));
+  L.push('NF_LAYOUT_PARAMS = ' + JSON.stringify(nfParams));
   L.push('');
   L.push('TRAIN_CFG = {');
   for (const k of Object.keys(T)) L.push('    ' + pyLit(k) + ': ' + pyLit(T[k]) + ',');
@@ -10321,6 +10721,55 @@ function generatePyTorch(m, opts) {
     L.push('');
     L.push('');
   }
+  L.push('def export_weights(path="weights.json", note=""):');
+  L.push('    \x22\x22\x22把现在的权重导出成一个 .json——编辑器「回填训练权重」读的就是它。');
+  L.push('');
+  L.push('    导出的东西：每条连接的权重、每个神经元的偏置、每个权重块的矩阵、算子节点的');
+  L.push('    可训练参数，外加这张图的**结构指纹** NF_TOPOLOGY。编辑器读进来会现算一遍它那张');
+  L.push('    图的指纹，对不上就明确拒绝（换了工程 / 编译之后又改过图 / 拿错文件都在这一步拦住）。');
+  L.push('    冻结的连接与神经元在回填时默认跳过——这是编辑器那一侧的行为，这里不用管。\x22\x22\x22');
+  L.push('    import json');
+  L.push('    import time');
+  L.push('    net = HandBuiltNet().eval()');
+  L.push('    W = net.weight.detach().reshape(-1).cpu().tolist()');
+  L.push('    B = net.bias.detach().reshape(-1).cpu().tolist()');
+  L.push('    src = [int(v) for v in net.src.reshape(-1).cpu().tolist()]');
+  L.push('    dst = [int(v) for v in net.dst.reshape(-1).cpu().tolist()]');
+  L.push('    E = len(src)');
+  L.push('    # NaN / Inf 先拦下来。json.dump 会把它们写成 NaN / Infinity —— 那不是合法 JSON，');
+  L.push('    # 编辑器那边 JSON.parse 会当场炸，用户看到的是"语法错"，根本想不到是训练发散了。');
+  L.push('    for _nm, _t in (("weight", net.weight), ("bias", net.bias), ("bw", getattr(net, "bw", None))):');
+  L.push('        if _t is not None and not bool(torch.isfinite(_t).all()):');
+  L.push('            raise ValueError("权重里有 NaN / Inf（" + _nm + "）：这份权重回填回去就是坏的，先看看训练是不是发散了")');
+  L.push('    values = {"edges": W[:E], "bias": B, "blocks": {}, "params": {}}');
+  L.push('    bw = getattr(net, "bw", None)');
+  L.push('    if bw is not None and NF_LAYOUT_BLOCKS:');
+  L.push('        flat = bw.detach().reshape(-1).cpu().tolist()');
+  L.push('        for e in NF_LAYOUT_BLOCKS:');
+  L.push('            if e["rep"] != e["i"]:');
+  L.push('                continue    # 共享参数组里只有代表块存权重，同组别的块读的是同一段');
+  L.push('            o = int(net.bwoff[e["i"]])');
+  L.push('            values["blocks"][str(e["i"])] = flat[o:o + e["k"] * e["n"]]');
+  L.push('    for e in NF_LAYOUT_PARAMS:');
+  L.push('        if e.get("role", "weight") != "weight":');
+  L.push('            continue        # stat / const / int：优化器碰不到它们，不来回填');
+  L.push('        t = getattr(net, e.get("attr", ""), None)');
+  L.push('        if t is None:');
+  L.push('            continue');
+  L.push('        values["params"][str(e["op"]) + ":" + e["name"]] = t.detach().reshape(-1).cpu().tolist()');
+  L.push('    doc = {"format": "neuroforge-weights", "version": 1, "topology": NF_TOPOLOGY,');
+  L.push('           "graph": NF_GRAPH,');
+  L.push('           "layout": {"edges": [[src[k], dst[k]] for k in range(E)],');
+  L.push('                      "blocks": NF_LAYOUT_BLOCKS, "params": NF_LAYOUT_PARAMS},');
+  L.push('           "values": values,');
+  L.push('           "meta": {"what": "NeuroForge 训练出来的权重",');
+  L.push('                    "when": time.strftime("%Y-%m-%d %H:%M:%S"), "note": note}}');
+  L.push('    with open(path, "w", encoding="utf-8") as f:');
+  L.push('        json.dump(doc, f)');
+  L.push('    print("已导出权重:", path, "（连接", E, "/ 神经元", len(B), "）")');
+  L.push('    return path');
+  L.push('');
+  L.push('');
   L.push('if __name__ == "__main__":');
   L.push('    import argparse');
   L.push('    ap = argparse.ArgumentParser(description="NeuroForge 生成的模型：自检 / 导出 ONNX / 训练")');
@@ -10347,6 +10796,8 @@ function generatePyTorch(m, opts) {
   L.push('    ap.add_argument("--history", default=None, help="把每轮指标写成 JSON")');
   L.push('    ap.add_argument("--log-every", type=int, default=None,');
   L.push('                    help="每几轮往终端打一行进度（默认 1 = 每轮）")');
+  L.push('    ap.add_argument("--export-weights", nargs="?", const="weights.json", metavar="PATH",');
+  L.push('                    help="把当前权重导出成 .json（编辑器「回填训练权重」读它）")');
   if (opts && opts.quant) {
     L.push('    ap.add_argument("--quantize-int8", nargs="?", const="model_int8.npz", metavar="PATH",');
     L.push('                    help="导出 int8 权重包（.npz），并跟原模型对拍")');
@@ -10355,6 +10806,9 @@ function generatePyTorch(m, opts) {
   }
   L.push('    args = ap.parse_args()');
   L.push('    done = False');
+  L.push('    if args.export_weights:');
+  L.push('        export_weights(args.export_weights)');
+  L.push('        done = True');
   if (wantOnnx) {
     L.push('    if args.export_onnx:');
     L.push('        export_onnx(args.export_onnx, args.batch, args.opset)');
@@ -10403,7 +10857,7 @@ function generatePyTorch(m, opts) {
   L.push('        y = net(' + RANDX('4') + ')');
   L.push('        print("输出张量:", tuple(y.shape))');
   L.push('        print("输出样本:", y[0].tolist())');
-  L.push('        print("试试: python hand_built_net.py --export-onnx model.onnx  或  --train --data data.npz")');
+  L.push('        print("试试: python hand_built_net.py --train --data data.npz  或  --export-weights weights.json")');
   L.push('');
   if (!inline) {
     L.push('#');
@@ -10984,6 +11438,23 @@ function renderModal() {
       const info = document.getElementById('rec-info');
       if (info) info.textContent = '已改成 ' + REC.steps + ' 拍：生成的文件里 NUM_STEPS = ' + REC.steps + '，模拟激活也按这个拍数展开。';
     });
+    const tImp = document.getElementById('train-import');
+    if (tImp) tImp.addEventListener('click', () => openWeightsFile(() => {
+      regenArtifacts();
+      const el = document.getElementById('train-import-info');
+      if (el) el.textContent = '已回填。生成的代码预览也跟着重算了；再点「下载模型文件」就是新权重编译出来的模型。';
+    }));
+    const tTopo = document.getElementById('train-topo');
+    if (tTopo) tTopo.addEventListener('click', () => {
+      const out = document.getElementById('train-topo-out');
+      if (out) out.textContent = '正在算…';
+      /* 先让这一帧画出来，再干活：大工程算指纹要过一遍整张图 */
+      window.setTimeout(() => {
+        const m = buildModel();
+        const id = m ? irTopologyId(m) : '';
+        if (out) out.textContent = id || '（这张图现在编译不出来，算不出指纹）';
+      }, 0);
+    });
     $('#dl-info').textContent = '这些值写进生成文件里的 TRAIN_CFG。';
   } else if (DLG.tab === 'code') {
     const note = '<div class="rline ' + (DLG.target === 'pytorch' ? 'info' : 'ok') + '" style="padding:7px 16px">' + targetNote() + '</div>' +
@@ -11067,6 +11538,16 @@ function trainPanel() {
   h += '<div class="rline info" id="rec-info">现在是 <b>' + REC.steps + '</b> 拍。' + (recEdges
     ? ('当前工程是循环网，有 <b>' + fmt(recEdges) + '</b> 条回边——这个值直接决定生成文件里的 NUM_STEPS。')
     : '当前工程是前馈网（没有回边），这一项用不上，改了也不影响生成结果。') + '</div>';
+  /* ---- F09：训练完把权重灌回来 ---- */
+  h += '<div class="rtitle">训练完把权重灌回来</div>';
+  h += '<div class="rline info">生成的脚本里带一个 <b>--export-weights 权重.json</b>：跑完训练导出这份文件，' +
+    '再在下面把它选回来，连线粗细 / 颜色、热力图、右栏数值就全按训练结果更新，可以接着改、接着重新编译。' +
+    '每一份权重文件里带着<b>这张图的结构指纹</b>，指纹对不上会明确拒绝，绝不半填。</div>';
+  h += '<div style="display:flex;gap:10px;align-items:center;padding:14px 16px;font-size:12px;color:var(--tc-9db0c6)">' +
+    '<button id="train-import">选择权重文件...</button>' +
+    '<button id="train-topo">算一下当前图的结构指纹</button>' +
+    '<span id="train-topo-out" style="font-family:var(--mono);color:var(--tc-7f8c9b)">（还没算）</span></div>';
+  h += '<div class="rline info" id="train-import-info">回填整件事是<b>一个撤销格</b>：填错了 Ctrl+Z 一把全回来。冻结的连接和神经元默认跳过。</div>';
   h += '</div>';
   return h;
 }
@@ -17282,6 +17763,7 @@ function doCommand(cmd, opts) {
     case 'compile-py': runCompile('pytorch'); break;
     case 'compile-onnx': runCompile('onnx'); break;
     case 'compile-exe': runCompile('exe'); break;
+    case 'weights-import': openWeightsFile(); break;
     case 'help': DLG.analysis = DLG.analysis || analyzeGraph(); openHelp(); break;
     case 'toggle-left': togglePanel('left'); break;
     case 'toggle-right': togglePanel('right'); break;
@@ -21460,6 +21942,17 @@ window.NF = {
   },
   tuneWeights: (o) => tuneWeights(o || {}),
   weightStats: (o) => weightStatsOf(o || {}),
+  /* ---- F09：把训练出来的权重灌回这张图 ------------------------------------------
+     三件事：拿当前图的结构指纹（weightsDoc）、把一份权重文档填进去（weightsApplyText /
+     weightsApplyBuffer）、让用户自己挑文件（weightsLoadFile）。整件事是一个撤销格。 */
+  weightsDoc: (o) => {
+    const m = buildModel();
+    if (!m) throw new Error('这张图现在编译不出来（算子之间有环 / 参数不合法），算不出结构指纹');
+    return weightsDocOf(m, o || {});
+  },
+  weightsApplyText: (text, opt) => weightsApply(text, opt || {}),
+  weightsApplyBuffer: (u8, opt) => weightsApply(new TextDecoder().decode(u8), opt || {}),
+  weightsLoadFile: () => openWeightsFile(),
   setName: (i, n) => { if (n) nName.set(i, String(n)); else nName.delete(i); },
   /* ---- 全局体检 / 剪枝 / 搜索 / 分组 / 视角书签 ---- */
   insight: () => {
@@ -23055,6 +23548,12 @@ const AI_TOOLS = [
     args: { nodes: ['int[]?', '默认用当前选中的'], dir: ['str?', 'in（默认）| out | both'], edges: ['int[]?', '直接给连接号'], includeLocked: ['bool?', '默认 false'] },
     api: 'weightStats',
     run: (a) => window.NF.weightStats(a) },
+  { name: 'weights_doc', desc: '取当前图的结构指纹和「权重文档」空壳（layout 那一半：每条连接的两端、每个权重块、每个算子参数）。指纹只由结构决定，和数值无关；拿它跟权重文件里的 topology 一比就知道这份权重是不是这张图训练出来的。',
+    args: {}, api: 'weightsDoc',
+    run: () => window.NF.weightsDoc() },
+  { name: 'weights_import', desc: '把训练出来的权重灌回这张图（连线的粗细颜色、热力图立刻跟着变）。text 是权重文档的 JSON 文本（生成的脚本里 --export-weights x.json 导出的那个文件）。规则：结构指纹必须一致，连接 / 阈值 / 权重块 / 算子参数的个数与形状必须一致——对不上会明确拒绝，绝不半填。冻结的连接和神经元默认跳过，force=true 才会连冻结的一起覆盖。整件事是一个撤销格，填错了 ctrl+z 一把全回来。返回值里 changed=实际变了的数值个数、maxDelta=最大变动量、locked=跳过的冻结处数。',
+    args: { text: ['str', '权重文档的 JSON 文本'], force: ['bool?', 'true = 连冻结的也覆盖，默认 false'] }, api: 'weightsApplyText',
+    run: (a) => window.NF.weightsApplyText(a.text, { force: a.force === true }) },
   { name: 'freeze_edges', desc: '冻结 / 解冻一组连接。',
     args: { edges: ['int[]?', '默认用当前选中'], lock: ['bool?', 'true=冻结，默认 true'] }, api: 'setEdgeLock', mut: true,
     run: (a) => {
@@ -23205,7 +23704,7 @@ const AI_TOOLS = [
       const cmd = String(a.cmd || '');
       const ok = ['new', 'open', 'save', 'save-spatial', 'save-json', 'open-chunks', 'open-stream', 'demo', 'stress',
                   'undo', 'redo', 'selall', 'selnone', 'del', 'reset', 'focus', 'top', 'layout',
-      'layout-line', 'layout-grid', 'layout-force', 'struct', 'srcreport',
+      'layout-line', 'layout-grid', 'layout-force', 'struct', 'srcreport', 'weights-import',
                   'compile', 'compile-py', 'compile-onnx', 'compile-exe', 'help', 'about', 'lang-zh', 'lang-en',
                   'toggle-left', 'toggle-right', 'toggle-both', 'ai',
                   'seed', 'hist', 'autosave', 'autosave-now', 'autosave-restore', 'autosave-forget', 'autorestore',
@@ -23507,10 +24006,10 @@ async function aiUserToolDelete(a) {
    没列进表的按 mut 处理：宁可多拍一格，也不能让模型的修改撤不回来。
    名单由 prototype/check_b03_roles.mjs 把着：列进 read / flat 的接口，源码里一旦出现
    写工程数据的动作就会当场报错（名单漏了比多拍一格坏得多）。 */
-const AI_API_ROLE_MUT = ("loadBuffer loadV2 streamOpen streamOpenPath streamLoad streamLoadAll streamBlocks streamReset select marquee setColor rainbow setIO setThr setBias setAct setLock setEdgeLock setPos setName setW addEdge addNode delNodes clear tuneWeights pruneByWeight pruneRandom pruneUnused pruneOrphans distPick selectIds groupCompact setGroup groupAdd groupRemove setHidden showAllHidden saveView setPlast setHard plastReset plastAdd plastSet plastDel plastApply simCompute simRun place bulkPlace batchConnect relayout addBlock delBlocks blockShare blockUnshare packSelected expandBlockById selectBlocks addOp delOps opSetParam opSetParamRole opSetPos selectOps instantiate moduleImport autosaveRestore distPrune snapshot").split(' ');
+const AI_API_ROLE_MUT = ("loadBuffer loadV2 streamOpen streamOpenPath streamLoad streamLoadAll streamBlocks streamReset select marquee setColor rainbow setIO setThr setBias setAct setLock setEdgeLock setPos setName setW addEdge addNode delNodes clear tuneWeights pruneByWeight pruneRandom pruneUnused pruneOrphans distPick selectIds groupCompact setGroup groupAdd groupRemove setHidden showAllHidden saveView setPlast setHard plastReset plastAdd plastSet plastDel plastApply simCompute simRun place bulkPlace batchConnect relayout addBlock delBlocks weightsApplyText weightsApplyBuffer blockShare blockUnshare packSelected expandBlockById selectBlocks addOp delOps opSetParam opSetParamRole opSetPos selectOps instantiate moduleImport autosaveRestore distPrune snapshot").split(' ');
 const AI_API_ROLE_FLAT = ("seed ifaceOn ifaceBind ifaceBindOut ifaceFeedMany ifaceFeed ifaceKey ifaceForward ifaceMinGap ifaceStateMode ifaceResetState ifaceManual ifaceClear ifaceLogClear ifaceQuickBind ifaceChanAdd ifaceChanSet ifaceChanDel ifaceChanEmit ifaceChanFeed ifaceApply recSetSteps wrapSelection moduleDrop moduleClear").split(' ');
-const AI_API_ROLE_EXT = ("exportFiles saveTo exportArtifacts autosaveOn autorestore autosaveNow autosaveProbe autosaveForget wireMujoco aiSend aiShot aiEndpoint aiLocalProbe aiLocalModels aiLocalTest aiLocalUse aiCfgBoot aiSaveCfg aiDefineTool defineTool aiUserToolsReload aiNewSession aiSessionNew aiSessionLoad aiSessionRename aiSessionDel aiSessionReset aiArchivePut aiArchiveLoad aiArchiveDel aiReloadCfg ifaceChanOpen ifaceChanClose").split(' ');
-const AI_API_ROLE_READ = ("version ext histStats adjAudit selListAudit adjSkipStats histVerify restoreFastStats bigBufHash histMarks nameStats autosaveInfo histLimit encodeV3 spatialPlan mortonCodes round3 checkIndex inspectFile serializeV2 detectFile inShell showChunks chunkPanel chunkIds canZip blockPartCount streamState streamAuto streamMinPx streamMaxN streamBlocksAuto streamPick streamTickNow streamLiveN streamMemMax streamEvictOn streamPlan streamBoxes streamOff graph analyze node edge renderColor instPos instScale bigTexPos renderEdgeColor debugScene screenOf highlight stats placement setPlacement pickEdgeAt pickBench selectedNodes selectedEdges ioLists ifaceState ifaceBrief ifaceLog ifaceChanList ifaceCodecProbe ifaceSlots ifacePanel ifaceSerialize simState simLimit simClear simPush recSteps sourceOf sourceLabel sourceSummary sourceShared structModel structView structTab openSourceReport viewScale radiusOf edgeWidthOf strengthOf setLod setLang lang capState bigProbe bigState lodState edgeWMinBudget edgeWMin setEdgeWMin orphans cull renderProbe camState camFocus camCenter camFollow camPan camPanHold camPanFrame panAuto panState camBounds fog plateFade plastRules plastOf plastProfiles plastList plastStats plastLearn plastLearned themes appear setTheme setViewportBg setViewportBgHex neuronPalette fogState camFar frameGraph resetView graphBounds viewFill langDetect starter starterForce voidHint setCam chunkCoverage cullSafety chunkState grabFrame renderOnly glInfo pixelDiff live edgesOf weightStats insight dist openDist distSummary findNodes groupOf groupsOfNode groupMembers groupCount hiddenCount hiddenNodes hiddenEdges neuronHidden edgeHidden openNodeList views view2 view2State orbit gotoView acts ir compile artifacts modules moduleExport focusOp opsInfo opsStats opRefs opParamValues opView opViewStats opColorOf pickOpAt opTexel opSimWaves blocksInfo blockTotal blockTotalAll blockWeights blockArrId blockIds blockStatsOf blockView blockViewStats blockTexel pickBlockAt blockGroups panels setPanels aiState aiPrompt aiPromptSlim aiPromptFull aiLocalPresets aiLocalNote aiStateLine aiManualOutline aiManualSection aiManual aiCommands aiTools aiAudit aiLog shot aiVis aiTool aiUserTools aiBakKey aiTrim aiMsgsFix aiTrimList aiSetUI aiThinkLevel aiSessions aiSessionRead aiSessionDoc aiLogCleanTest aiArchive aiConfig nameOf forceRebuild rebuild bigSet flushPos setHoverOp setHoverNode setHoverBlock streamEvictKeep regionMap regionCells groups nodeListScan setCamera screenOfPoint aiEnv undo redo").split(' ');
+const AI_API_ROLE_EXT = ("exportFiles saveTo exportArtifacts autosaveOn autorestore autosaveNow autosaveProbe autosaveForget wireMujoco aiSend aiShot aiEndpoint aiLocalProbe aiLocalModels aiLocalTest aiLocalUse aiCfgBoot aiSaveCfg aiDefineTool defineTool aiUserToolsReload aiNewSession aiSessionNew aiSessionLoad aiSessionRename aiSessionDel aiSessionReset aiArchivePut aiArchiveLoad aiArchiveDel aiReloadCfg ifaceChanOpen ifaceChanClose weightsLoadFile").split(' ');
+const AI_API_ROLE_READ = ("version ext histStats adjAudit selListAudit adjSkipStats histVerify restoreFastStats bigBufHash histMarks nameStats autosaveInfo histLimit encodeV3 spatialPlan mortonCodes round3 checkIndex inspectFile serializeV2 detectFile inShell showChunks chunkPanel chunkIds canZip blockPartCount streamState streamAuto streamMinPx streamMaxN streamBlocksAuto streamPick streamTickNow streamLiveN streamMemMax streamEvictOn streamPlan streamBoxes streamOff graph analyze node edge renderColor instPos instScale bigTexPos renderEdgeColor debugScene screenOf highlight stats placement setPlacement pickEdgeAt pickBench selectedNodes selectedEdges ioLists ifaceState ifaceBrief ifaceLog ifaceChanList ifaceCodecProbe ifaceSlots ifacePanel ifaceSerialize simState simLimit simClear simPush recSteps sourceOf sourceLabel sourceSummary sourceShared structModel structView structTab openSourceReport viewScale radiusOf edgeWidthOf strengthOf setLod setLang lang capState bigProbe bigState lodState edgeWMinBudget edgeWMin setEdgeWMin orphans cull renderProbe camState camFocus camCenter camFollow camPan camPanHold camPanFrame panAuto panState camBounds fog plateFade plastRules plastOf plastProfiles plastList plastStats plastLearn plastLearned themes appear setTheme setViewportBg setViewportBgHex neuronPalette fogState camFar frameGraph resetView graphBounds viewFill langDetect starter starterForce voidHint setCam chunkCoverage cullSafety chunkState grabFrame renderOnly glInfo pixelDiff live edgesOf weightStats insight dist openDist distSummary findNodes groupOf groupsOfNode groupMembers groupCount hiddenCount hiddenNodes hiddenEdges neuronHidden edgeHidden openNodeList views view2 view2State orbit gotoView acts ir compile artifacts modules moduleExport focusOp opsInfo opsStats opRefs opParamValues opView opViewStats opColorOf pickOpAt opTexel opSimWaves weightsDoc blocksInfo blockTotal blockTotalAll blockWeights blockArrId blockIds blockStatsOf blockView blockViewStats blockTexel pickBlockAt blockGroups panels setPanels aiState aiPrompt aiPromptSlim aiPromptFull aiLocalPresets aiLocalNote aiStateLine aiManualOutline aiManualSection aiManual aiCommands aiTools aiAudit aiLog shot aiVis aiTool aiUserTools aiBakKey aiTrim aiMsgsFix aiTrimList aiSetUI aiThinkLevel aiSessions aiSessionRead aiSessionDoc aiLogCleanTest aiArchive aiConfig nameOf forceRebuild rebuild bigSet flushPos setHoverOp setHoverNode setHoverBlock streamEvictKeep regionMap regionCells groups nodeListScan setCamera screenOfPoint aiEnv undo redo").split(' ');
 const AI_API_ROLE = (function () {
   const m = Object.create(null);
   const put = (list, role) => { for (const n of list) m[n] = role; };

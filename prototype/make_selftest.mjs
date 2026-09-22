@@ -5009,6 +5009,139 @@ const TEST = `
   }
 
 
+  /* ---- 46 组：训练出来的权重灌回编辑器（F09） ----
+     生成的脚本 --export-weights 导出一份权重文件，编辑器读它把训练结果填回来。
+     安全的前提是**结构指纹**：只由结构算出来，数值（权重 / 阈值 / 偏置 / 冻结标记）
+     一律不进。这一组把这几条钉住：以后要是有人“顺手把数值也算进指纹”，
+     所有训练完的权重文件就永远对不上了。 */
+  try {
+    NF.clear();
+    await raf();
+    for (let k = 0; k < 5; k++) NF.addNode(k * 2, 0, 0);
+    NF.addEdge(0, 1); NF.addEdge(1, 2); NF.addEdge(2, 3); NF.addEdge(3, 4);
+    NF.setIO([0], 1); NF.setIO([4], 2);
+    await raf();
+
+    const d46 = NF.weightsDoc();
+    const t46 = d46.topology;
+    log(typeof t46 === 'string' && /^[0-9a-f]{64}$/.test(t46),
+      '46 结构指纹是一串 64 位的十六进制 sha256', String(t46).slice(0, 16));
+    log(d46.format === 'neuroforge-weights' && d46.version === 1 && d46.layout.edges.length === 4 &&
+        d46.values.edges.length === 4 && d46.values.bias.length === 5,
+      '46 权重文档带着 format / version / 每条连接的两端 / 每条权重 / 每个偏置',
+      JSON.stringify(d46.graph));
+
+    /* 数值不进指纹：权重 / 阈值 / 偏置 / 冻结各改一遍，指纹一个字都不能变 */
+    NF.setW(0, 3.5); NF.setThr([1], 0.4); NF.setBias([2], -1.25); NF.setEdgeLock([3], true);
+    await raf();
+    log(NF.weightsDoc().topology === t46,
+      '46 权重 / 阈值 / 偏置 / 冻结改了：结构指纹一个字都不变（数值不进指纹）', '');
+
+    /* 结构进指纹：加一条连接 / 加一个神经元 */
+    NF.addEdge(0, 2);
+    await raf();
+    const tE46 = NF.weightsDoc().topology;
+    log(tE46 !== t46, '46 加一条连接：结构指纹立刻变', tE46.slice(0, 16));
+    NF.addNode(9, 9, 9);
+    await raf();
+    const tN46 = NF.weightsDoc().topology;
+    log(tN46 !== tE46 && tN46 !== t46, '46 再加一个神经元：结构指纹又变了一次', tN46.slice(0, 16));
+
+    /* 回填：拿当前图的文档当“训练结果”，先改掉里面的数值再填回去 */
+    NF.clear();
+    await raf();
+    for (let k = 0; k < 5; k++) NF.addNode(k * 2, 0, 0);
+    NF.addEdge(0, 1); NF.addEdge(1, 2); NF.addEdge(2, 3); NF.addEdge(3, 4);
+    NF.setIO([0], 1); NF.setIO([4], 2);
+    NF.setW(0, 1.5); NF.setW(1, -2.5); NF.setW(2, 0.75); NF.setW(3, 3.25);
+    NF.setBias([2], 0.5);
+    await raf();
+
+    const doc46 = NF.weightsDoc();
+    const gt = function (a, b) { return doc46.layout.edges.findIndex(function (p) { return p[0] === a && p[1] === b; }); };
+    const iA = gt(0, 1), iB = gt(3, 4);
+    log(iA >= 0 && iB >= 0,
+      '46 文档里能按 (源, 目标) 定位到某条连接（回填就是按这对神经元编号认边的，不是编译下标）',
+      JSON.stringify([iA, iB]));
+
+    const trained = JSON.parse(JSON.stringify(doc46));
+    trained.values.edges[iA] = 7.25;
+    trained.values.edges[iB] = 4.5;
+    trained.values.bias[3] = 2.75;
+    trained.meta = { what: '自测造的假训练结果' };
+
+    const rFill = NF.weightsApplyText(JSON.stringify(trained), {});
+    await raf();
+    log(rFill.edges === 4 && rFill.bias === 5 && NF.edge(0).w === 7.25 && NF.edge(3).w === 4.5 &&
+        NF.weightsDoc().values.bias[3] === 2.75,
+      '46 回填：每条连接 / 每个偏置都按文件里的数值写回去了',
+      JSON.stringify({ r: rFill, e0: NF.edge(0).w, e3: NF.edge(3).w }));
+
+    NF.undo();
+    await raf();
+    log(NF.edge(0).w === 1.5 && NF.edge(3).w === 3.25 && NF.weightsDoc().values.bias[3] === 0,
+      '46 回填整件事就是一个撤销格：Ctrl+Z 一把全回来',
+      JSON.stringify({ e0: NF.edge(0).w, e3: NF.edge(3).w, b3: NF.weightsDoc().values.bias[3] }));
+
+    /* 冻结：默认跳过，force=true 才覆盖 */
+    NF.setEdgeLock([0], true);
+    await raf();
+    const rLock46 = NF.weightsApplyText(JSON.stringify(trained), {});
+    await raf();
+    log(rLock46.locked === 1 && NF.edge(0).w === 1.5,
+      '46 冻结的连接默认跳过：值不动，返回里报出跳过了几处',
+      JSON.stringify({ locked: rLock46.locked, e0: NF.edge(0).w }));
+    const rForce46 = NF.weightsApplyText(JSON.stringify(trained), { force: true });
+    await raf();
+    log(rForce46.locked === 0 && NF.edge(0).w === 7.25,
+      '46 force=true 时才连冻结的一起覆盖',
+      JSON.stringify({ locked: rForce46.locked, e0: NF.edge(0).w }));
+
+    /* 拒绝：三种坏文件都得明确拒绝，不能半填 */
+    let msg46 = '';
+    const badTopo = JSON.parse(JSON.stringify(trained));
+    badTopo.topology = new Array(65).join('a');
+    try { NF.weightsApplyText(JSON.stringify(badTopo), {}); } catch (e) { msg46 = String((e && e.message) || e); }
+    log(msg46.indexOf('指纹') >= 0, '46 指纹对不上：明确拒绝', msg46.slice(0, 90));
+
+    msg46 = '';
+    try { NF.weightsApplyText('{ 这不是 json', {}); } catch (e) { msg46 = String((e && e.message) || e); }
+    log(msg46.indexOf('JSON') >= 0, '46 不是 JSON 的文件被明确拒绝', msg46.slice(0, 90));
+
+    msg46 = '';
+    const short46 = JSON.parse(JSON.stringify(trained));
+    short46.values.edges = short46.values.edges.slice(0, 1);
+    try { NF.weightsApplyText(JSON.stringify(short46), {}); } catch (e) { msg46 = String((e && e.message) || e); }
+    log(msg46.indexOf('连接数') >= 0, '46 连接数对不上：明确拒绝', msg46.slice(0, 90));
+
+    /* AI 工具：模型自己能拿指纹、自己能灌回去 */
+    const tn46 = NF.aiTools().map(function (x) { return x.name; });
+    log(tn46.indexOf('weights_doc') >= 0 && tn46.indexOf('weights_import') >= 0,
+      '46 AI 工具表里有 weights_doc / weights_import', '');
+    NF.aiConfig({ autoRun: true });
+    await sleep(40);
+    const tDoc46 = await NF.aiTool('weights_doc', {});
+    log(!!tDoc46 && tDoc46.ok === true && tDoc46.result && tDoc46.result.topology === NF.weightsDoc().topology,
+      '46 weights_doc 能拿到当前图的结构指纹',
+      JSON.stringify(tDoc46 && tDoc46.result && String(tDoc46.result.topology).slice(0, 16)));
+    /* 先把两条连接改成别的值、并解除冻结：上一段已经把数值填成了目标值，
+       不先改就是“填了等于没填”，断言会假通过。 */
+    NF.setEdgeLock([0], false);
+    NF.setW(0, -9); NF.setW(3, -8);
+    await raf();
+    const tImp46 = await NF.aiTool('weights_import', { text: JSON.stringify(trained) });
+    await raf();
+    log(!!tImp46 && tImp46.ok === true && tImp46.result && tImp46.result.edges === 4 &&
+        NF.edge(0).w === 7.25 && NF.edge(3).w === 4.5,
+      '46 AI 走 weights_import 工具也能把权重灌回来',
+      JSON.stringify(tImp46 && tImp46.result));
+
+    NF.clear();
+    await raf();
+  } catch (e) {
+    out.push('ERROR | 第 46 组（回填训练权重）：' + ((e && e.stack) || e));
+  }
+
   /* 收尾：把用户原来的 Key 放回原处（自测绝不给用户留副作用）。
      走的是「用户明确保存」那条路，本机存储、设置文件、备份三份会一起写正确。 */
   try {

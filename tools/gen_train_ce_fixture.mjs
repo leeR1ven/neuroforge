@@ -1,6 +1,7 @@
 /* B11 / B12 的夹具：用**生产代码生成器**建两个小网（前馈 3 分类 / 循环 3 分类），
    连同生成的 .py 一起落盘，交给 tools/verify_train_ce.py 用真 PyTorch 跑训练。
    只读源码、只写给定的临时目录，不碰任何构建产物。
+   每个夹具另外落一份 editor_weights.json：编辑器侧算出来的权重文档，用来跟 --export-weights 对账。
 
    用法：node tools/gen_train_ce_fixture.mjs OUTPUT_DIR [MAIN_JS]
 */
@@ -29,6 +30,8 @@ function include(from, to) {
 include('function computeLayers(', 'function cFloat(');
 include('function frozenIndexPlan(', 'function buildWeightsBin(');
 include('function blockWeightCount(', 'function blockRepIndex(');
+/* 算子节点这条路：analyzeGraph 要按算子之间的引用跑一遍拓扑序。这个函数只读 opList，自足。 */
+include('function opTopoOrder(', 'function opDelete(');
 
 function setup(n, inputs, outputs, edges = [], blocks = [], acts = null) {
   Object.assign(ctx, {
@@ -67,6 +70,10 @@ function emit(name, options = {}) {
   if (ctx.needsBin(m) || options.forceBin) {
     fs.writeFileSync(path.join(dir, 'model.bin'), ctx.weightsBinBytes(m));
   }
+  /* F09：编辑器那一侧的权重文档（结构指纹 + 稳定 ID + 数值）。verify_weights_roundtrip.py
+     拿它跟生成脚本 --export-weights 导出的那一份逐字对：两边必须是同一张图、同一条边序。 */
+  fs.writeFileSync(path.join(dir, 'editor_weights.json'),
+                   JSON.stringify(ctx.weightsDocOf(m, { what: '夹具：编辑器侧导出的权重' })));
   return { name, nodes: m.N, edges: m.E, recurrent: !!m.recurrent,
            inputs: m.inputNodes.length, outputs: m.outputNodes.length };
 }
@@ -90,6 +97,22 @@ setup(4, [0, 1], [3],
       [[0, 2, 1.0], [1, 3, 1.0], [2, 3, 1.0]], [], [0, 0, 8, 0]);
 const st = emit('state_ce', { train: TRAIN });
 
+/* 权重块：块一出现就一定走 model.bin 那条路（权重从二进制里切，源码不带数值）。
+   验 F09 的块权重导出：只有共享组的代表块存一份，bwoff 指向的那一段就是它。 */
+setup(6, [0, 1], [4, 5], [],
+      [{ id: 1, k: 2, n: 2, src: [0, 1], dst: [4, 5], w: [0.5, -1.25, 2.0, 0.75], sg: 0 }]);
+const blk = emit('block_ce', { train: TRAIN });
+
+/* 算子节点：参数张量在 model.bin 里，导出按 o<i>_p<k> 取回来。 */
+setup(6, [0, 1], [4, 5], []);
+ctx.opList = [{ id: 1, op: 'MatMul', name: 'mm1', ins: [{ k: 'n', ids: [0, 1], shape: [1, 2] }, { k: 'c', p: 'W', shape: [2, 2] }],
+                outShape: [1, 2], land: Uint32Array.from([4, 5]), attrs: {}, fold: [],
+                params: [{ name: 'W', dtype: 'f32', shape: [2, 2],
+                           data: [1.0, 0.5, -0.25, 2.0], role: 'weight', same: '' }],
+                note: '', color: 0, colOn: 0, pos: null, mesh: null, tex: null, texTag: '',
+                cx: 0, cy: 0, cz: 0 }];
+const opc = emit('op_ce', { train: TRAIN });
+
 fs.writeFileSync(path.join(out, 'manifest.json'),
-                 JSON.stringify({ feed: ff, rec: rc, state: st }, null, 1));
-console.log(JSON.stringify({ feed: ff, rec: rc, state: st }));
+                 JSON.stringify({ feed: ff, rec: rc, state: st, block: blk, op: opc }, null, 1));
+console.log(JSON.stringify({ feed: ff, rec: rc, state: st, block: blk, op: opc }));

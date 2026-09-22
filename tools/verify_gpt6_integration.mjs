@@ -39,7 +39,7 @@ const actualFunctions = [
   'aiJson', 'aiBrief', 'aiShortArgs', 'aiErrText', 'aiErrIsNoVision', 'aiErrIsMsgArray',
   'aiVisInfo', 'aiCanSend', 'aiMsgsHaveImage', 'aiDropAllImages', 'aiDropOldImages', 'aiMsgsFlush',
   'aiMsgText', 'aiMsgStore', 'aiMsgLoad', 'aiMsgsSafeCut', 'aiSessTitle', 'aiSessById',
-  'aiSessSnap', 'aiSessDropOldest', 'aiSessTrim', 'aiSessDoc', 'aiSessMs', 'aiNoteKey',
+  'aiSessSig', 'aiSessSnap', 'aiSessDropOldest', 'aiSessTrim', 'aiSessDoc', 'aiSessMs', 'aiNoteKey',
   'aiLogClean', 'aiSessNorm', 'aiSessLabel', 'aiSessUse', 'aiSessImport',
   'aiResponsesConnectionTest', 'aiLocalTest', 'aiCfgJson', 'aiSaveCfg', 'aiAdoptCfg', 'aiSysKv',
 ];
@@ -85,6 +85,9 @@ function harness(overrides = {}) {
     aiSystemPrompt: () => '测试系统提示词', aiStateLine: () => '测试状态',
     aiEsc: (s) => String(s).replace(/</g, '&lt;'), aiNetHint: () => '',
     aiSessRnd: () => 'test', aiPid: () => 'test-project', fmt: String,
+    /* 第 77 轮加的「同状态两次快照不许盖新时间」用的指纹槽（main.js 里的 const AI_SNAP = { sig: '' }）。
+       提取出来的那几个函数会读它，隔离环境里得给它一个同形的对象。 */
+    AI_SNAP: { sig: '' },
     aiRender: noop, aiInfo: noop, aiSetUI: noop, aiTrim: noop, aiFillCfg: noop, aiModelListRender: noop,
     aiSysSync: noop, aiSessRender: noop, aiSessPersist: noop, aiSessFlushArchive: noop, toast: noop,
   });
