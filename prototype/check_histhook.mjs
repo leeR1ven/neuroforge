@@ -7,6 +7,9 @@
    所以把它变成一次静态检查：漏了就在这里报行号，构建直接失败。
 
    为什么分三组（拓扑 / 权重 / 选中）：这三类改动的大小差一个数量级。权重列（eW）是调参、
+   2026-09 再拆一刀：拓扑（eSrc / eDst / eId）从「边列」里单独拎出来，因为撤销留不留邻接表
+   同一轮里锁定 / 隐藏也各分一支：那两列的写入点只有三五处，可它们一被打上就要多扫 84 MB。
+   只看拓扑。锁定 / 隐藏一条边以前也算拓扑改动，白重建一遍邻接表。
    学习、剪枝归零唯一会碰的列，单独一组之后那种改动只扫 67 MB 而不是 300 MB。
 
    另一道闸是运行时的裁判（NF.histVerify(true) / 自测里常开）：它不信登记，每一拍整列比一遍，
@@ -18,7 +21,12 @@ import fs from 'node:fs';
 const SRC = new URL('./src/main.js', import.meta.url);
 /* 分组 = 一个「要扫」的登记旗标 + 用这个旗标的列。旗标名必须跟 main.js 里的钩子逐字一致。 */
 const GROUPS = [
-  { hook: 'histEdgeDirty = 1', cols: ['eSrc', 'eDst', 'eLock', 'eId', 'eHid'] },
+  /* 拓扑那三列单独一支旗标：撤销「邻接表能不能留着」只看它。锁定 / 隐藏一条边不是拓扑改动，
+     跟它混在一个旗标里的话，撤销一次「隐藏这条线」就要把三千多万个邻接项整张重建。 */
+  { hook: 'histTopoDirty = 1', cols: ['eSrc', 'eDst', 'eId'] },
+  /* 锁定 / 隐藏各自一支：锁定一列是 67 MB、隐藏一列是 16.8 MB，混在一个旗标里就一起付钱 */
+  { hook: 'histLockDirty = 1', cols: ['eLock'] },
+  { hook: 'histHidDirty = 1', cols: ['eHid'] },
   { hook: 'histWDirty = 1', cols: ['eW'] },
   { hook: 'histSelDirty = 1', cols: ['selE'] },
 ];

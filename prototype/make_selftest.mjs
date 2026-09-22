@@ -1739,6 +1739,97 @@ const TEST = `
     const selA2 = NF.selListAudit();
     log(selA2.list === 0 && selA2.scan === 0 && selA2.bad === 0, '清空选中后列表也清空', JSON.stringify(selA2));
     NF.histVerify(true);
+    /* ---- 撤销的快路：只重抄「真动过的那几段边」 ----
+       撤销以前一律 rebuildScene()：14 万个神经元实例重写一遍、1681 万条边整场抄进
+       GPU 缓冲再整块传一次（269 MB）。改 5 条权重也要为这一下等好几帧。
+       快路只认「只进 bigWriteEdge 那个打包字」的那几列（权重 / 边的选中 / 锁定 / 隐藏），
+       靠逐个分块比对象身份把「动过的块」数出来 —— 判据错一次就会静默画错，
+       所以这里用「快路之后 vs 整场重建之后，整个缓冲的校验和必须相等」来对拍。 */
+    NF.histVerify(false);
+    const bigSave = NF.bigState();
+    NF.bigSet({ eMin: 1 });                       /* 小图也强制走大数据层，才测得到这条快路 */
+    NF.forceRebuild();
+    const bHashA = NF.bigBufHash();
+    log(NF.bigState().on === true && bHashA !== null, '强制切到大数据层并建完',
+        'e=' + NF.graph().e + ' built=' + NF.bigState().built);
+    /* ① 只改权重：撤销走快路，结果必须跟整场重建一字不差 */
+    const rfFast0 = NF.restoreFastStats();
+    NF.snapshot(); NF.setW(0, 0.717); NF.setW(1, -0.42);
+    NF.undo();
+    const rfFast1 = NF.restoreFastStats();
+    const bHashB = NF.bigBufHash();
+    log(rfFast1.restores === rfFast0.restores + 1, '只改权重的撤销走了「只重抄动过的边」快路',
+        rfFast0.restores + ' -> ' + rfFast1.restores);
+    log(rfFast1.edges > 0 && rfFast1.edges < NF.graph().e, '快路只重抄了一小段，不是整场',
+        rfFast1.edges + ' 条 / 全场 ' + NF.graph().e + ' 条');
+    log((bHashB >>> 0) === (bHashA >>> 0), '快路撤销之后整个缓冲跟整场重建一字不差', bHashA + ' / ' + bHashB);
+    NF.forceRebuild();
+    log((NF.bigBufHash() >>> 0) === (bHashB >>> 0), '再整场重建一遍还是同一个校验和', String(NF.bigBufHash()));
+    const rfSkip0 = NF.restoreFastStats();
+    NF.snapshot(); NF.setW(2, 0.55); NF.undo();
+    const rfSkip1 = NF.restoreFastStats();
+    log(rfSkip1.skipChunks - rfSkip0.skipChunks > (rfSkip1.copyChunks - rfSkip0.copyChunks + 1) * 10,
+        '还原时没动过的分块一个字节都不搬（只拷真变过的那几块）',
+        '拷 ' + (rfSkip1.copyChunks - rfSkip0.copyChunks) + ' 块 / 跳过 ' + (rfSkip1.skipChunks - rfSkip0.skipChunks) + ' 块');
+    /* 逐元素比换成了整数位比较（浮点 !== 带 NaN 语义，向量化不了，只有 1.3 GB/s）。
+       这一改最怕的是「其实变了却判成没变」——那会让撤销静默回错一格，所以专门在
+       任意位置改一笔权重再撤销，断言一位不差。 */
+    const wProbeI = Math.max(0, Math.min(3000, NF.graph().e - 1));
+    const wProbe0 = NF.edge(wProbeI).w;
+    NF.snapshot(); NF.setW(wProbeI, 0.1234567); NF.undo();
+    log(Object.is(NF.edge(wProbeI).w, wProbe0), '任意位置改一笔权重再撤销都一位不差（整数位比较不会吞改动）',
+        '第 ' + wProbeI + ' 条：' + wProbe0 + ' -> ' + NF.edge(wProbeI).w);
+    /* ② 改坐标 / 隐藏神经元：这两样烘在实例矩阵和打包字里，必须退回整场重建 */
+    const rfFast2 = NF.restoreFastStats();
+    NF.snapshot(); NF.setPos(3, 10, 20, 30); NF.flushPos(); NF.undo();
+    log(NF.restoreFastStats().restores === rfFast2.restores, '改坐标的撤销不走快路（位置烘在实例矩阵里）',
+        rfFast2.restores + ' -> ' + NF.restoreFastStats().restores);
+    const rfFast3 = NF.restoreFastStats();
+    NF.snapshot(); NF.setHidden([5], [], true); NF.undo();
+    log(NF.restoreFastStats().restores === rfFast3.restores, '隐藏神经元的撤销不走快路（隐藏位也烘在边的打包字里）',
+        rfFast3.restores + ' -> ' + NF.restoreFastStats().restores);
+    /* ③ 隐藏一条连线：只进打包字，应该走快路，结果照样要对 */
+    NF.forceRebuild();
+    const bHashC = NF.bigBufHash();
+    const rfFast4 = NF.restoreFastStats();
+    NF.snapshot(); NF.setHidden([], [2], true); NF.undo();
+    log(NF.restoreFastStats().restores === rfFast4.restores + 1, '隐藏连线的撤销走快路（只动打包字）',
+        rfFast4.restores + ' -> ' + NF.restoreFastStats().restores);
+    log((NF.bigBufHash() >>> 0) === (bHashC >>> 0), '隐藏连线撤销之后缓冲照样对得上', bHashC + ' / ' + NF.bigBufHash());
+    /* ④ 选中一条连线再撤：选中位在同一个字里，也该走快路 */
+    const bHashD = NF.bigBufHash();
+    const rfFast5 = NF.restoreFastStats();
+    NF.snapshot(); NF.select([], [4]); NF.undo();
+    log(NF.restoreFastStats().restores === rfFast5.restores + 1, '只改选中连接的撤销也走快路');
+    log((NF.bigBufHash() >>> 0) === (bHashD >>> 0), '选中之后撤销，缓冲照样对得上', bHashD + ' / ' + NF.bigBufHash());
+    /* ⑥ 锁定 / 隐藏一条边不是拓扑改动：撤销要留着邻接表。
+       以前这两样也把「边列脏了」那一支打上，撤销就白重建一遍三千多万个邻接项（实测 ~135 ms），
+       是锁定 / 隐藏撤销里最大的一笔。判据放宽了，所以这里既断言「真的走近路」，
+       也断言「走完邻接表照样逐条对得上」——放宽判据最怕的就是留下对不上的表。 */
+    const askL0 = NF.adjSkipStats().skips;
+    NF.snapshot(); NF.setEdgeLock([8], 1); NF.undo();
+    log(NF.adjSkipStats().skips === askL0 + 1, '锁定连线的撤销留着邻接表（不算拓扑改动）',
+        askL0 + ' -> ' + NF.adjSkipStats().skips);
+    const aqL = NF.adjAudit();
+    log(aqL.badStart === 0 && aqL.badList === 0, '锁定撤销之后邻接表逐条一致', JSON.stringify(aqL));
+    const askH0 = NF.adjSkipStats().skips;
+    NF.snapshot(); NF.setHidden([], [19], true); NF.undo();
+    log(NF.adjSkipStats().skips === askH0 + 1, '隐藏连线的撤销也留着邻接表',
+        askH0 + ' -> ' + NF.adjSkipStats().skips);
+    /* 反过来：真加过一条边的撤销必须整张重建（放宽了判据也不能把真拓扑改动放过去） */
+    const askT0 = NF.adjSkipStats().skips;
+    NF.snapshot();
+    const tA = NF.addNode(9300, 9300, 0), tB = NF.addNode(9310, 9300, 0);
+    NF.addEdge(tA, tB, 0.5);
+    NF.undo();
+    log(NF.adjSkipStats().skips === askT0, '真加过边的撤销仍然整张重建邻接表',
+        askT0 + ' -> ' + NF.adjSkipStats().skips);
+    /* ⑤ 拧回去：大数据层的阈值 / 开关恢复原样（阈值一回去这一层就整个收起来，缓冲为 null，
+       所以这里对的是开关状态，不是缓冲） */
+    NF.bigSet({ eMin: bigSave.eMin });
+    const bigNow = NF.bigState();
+    log(bigNow.eMin === bigSave.eMin && bigNow.on === bigSave.on, '收尾：大数据层阈值 / 开关恢复原样',
+        'eMin ' + bigSave.eMin + ' -> ' + bigNow.eMin + '，on ' + bigSave.on + ' -> ' + bigNow.on);
 
 
     /* ---- 24. 自动保存（本机 IndexedDB） ---- */
