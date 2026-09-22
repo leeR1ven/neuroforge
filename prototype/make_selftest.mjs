@@ -1779,11 +1779,33 @@ const TEST = `
     NF.snapshot(); NF.setW(wProbeI, 0.1234567); NF.undo();
     log(Object.is(NF.edge(wProbeI).w, wProbe0), '任意位置改一笔权重再撤销都一位不差（整数位比较不会吞改动）',
         '第 ' + wProbeI + ' 条：' + wProbe0 + ' -> ' + NF.edge(wProbeI).w);
-    /* ② 改坐标 / 隐藏神经元：这两样烘在实例矩阵和打包字里，必须退回整场重建 */
+    /* ② 改坐标 / 改颜色：位置和颜色烘在神经元实例缓冲和位置纹理里，
+       现在这几列走另一条快路 —— writeNeuronInstance 从活数据重算半径 / 颜色 /
+       实例矩阵 / 位置纹理，只重写动过的那几个分块，不再整场重建。
+       这条判据最怕的是"该刷的没刷"（画面跟数据静默不一致），所以这里直接读
+       实例缓冲和位置纹理本身跟数据模型对账，而不是只读数据模型。 */
     const rfFast2 = NF.restoreFastStats();
     NF.snapshot(); NF.setPos(3, 10, 20, 30); NF.flushPos(); NF.undo();
-    log(NF.restoreFastStats().restores === rfFast2.restores, '改坐标的撤销不走快路（位置烘在实例矩阵里）',
-        rfFast2.restores + ' -> ' + NF.restoreFastStats().restores);
+    const rfAfter2 = NF.restoreFastStats();
+    log(rfAfter2.restores === rfFast2.restores + 1, '改坐标的撤销走快路（位置重写进实例矩阵 + 位置纹理）',
+        rfFast2.restores + ' -> ' + rfAfter2.restores);
+    log(rfAfter2.neurons > 0 && rfAfter2.neurons <= NF.graph().n, '快路只重写动过的那几个神经元分块',
+        (rfAfter2.neurons - rfFast2.neurons) + ' 个 / 全场 ' + NF.graph().n + ' 个');
+    const ip3 = NF.instPos(3), np3 = NF.node(3);
+    log((Math.abs(ip3[0] - np3.x) < 1e-3 && Math.abs(ip3[1] - np3.y) < 1e-3 && Math.abs(ip3[2] - np3.z) < 1e-3) === true &&
+        (Math.abs(ip3[0] - 10) > 1e-3), '快路撤销之后实例矩阵里的坐标真的回到了原值（不是留着拖走后的值）',
+        '实例 ' + JSON.stringify(ip3) + ' / 数据 ' + JSON.stringify([np3.x, np3.y, np3.z]));
+    const tp3 = NF.bigTexPos(3);
+    log(tp3 && Math.abs(tp3[0] - np3.x) < 1e-3 && Math.abs(tp3[1] - np3.y) < 1e-3 && Math.abs(tp3[2] - np3.z) < 1e-3,
+        '位置纹理也跟着回去了（边是按这张纹理画端点的，漏刷会看到连线留在原地）', JSON.stringify(tp3));
+    const col4 = NF.renderColor(4);
+    const rfFast2b = NF.restoreFastStats();
+    NF.snapshot(); NF.setColor([4], "#ff0000"); NF.undo();
+    log(NF.restoreFastStats().restores === rfFast2b.restores + 1, '改颜色的撤销也走快路');
+    log(NF.renderColor(4) === col4, '改颜色撤销之后实例缓冲里的颜色一位不差',
+        col4 + ' -> ' + NF.renderColor(4));
+    /* 隐藏神经元：隐藏位同时烘进每条边的打包字（nHid[eSrc]|nHid[eDst]），
+       边不是按神经元分块存的，改一格就得扫全场，所以这一列刻意留在快路之外 */
     const rfFast3 = NF.restoreFastStats();
     NF.snapshot(); NF.setHidden([5], [], true); NF.undo();
     log(NF.restoreFastStats().restores === rfFast3.restores, '隐藏神经元的撤销不走快路（隐藏位也烘在边的打包字里）',

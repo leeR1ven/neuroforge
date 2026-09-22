@@ -1483,10 +1483,16 @@ histReg(selE, 1, () => G.e, () => selE, 'sel', 'selE');
    找不到（-1）就永远不走近路 —— 判据里那个 adjBasisSeq >= 0 会挡住。 */
 const HIST_CI_SRC = HIST.cols.findIndex((c) => c.tag === 'eSrc');
 const HIST_CI_DST = HIST.cols.findIndex((c) => c.tag === 'eDst');
-/* 撤销快路认的那几列：它们只进 bigWriteEdge 那个打包字（权重 / 边的选中 / 锁定 / 隐藏）。
-   其余任何一列动了都退回整场重建 —— 那些是烘进神经元实例或者位置纹理里的东西。
-   见 fastEdgeRanges。 */
+/* 撤销快路认的边列：它们只进 bigWriteEdge 那个打包字（权重 / 边的选中 / 锁定 / 隐藏）。
+   见 fastRestoreRanges。 */
 const HIST_FAST_COLS = HIST.cols.map((c, i) => (c.tag === 'eW' || c.tag === 'selE' || c.tag === 'eLock' || c.tag === 'eHid') ? i : -1).filter((i) => i >= 0);
+/* 神经元那几列（位置 / 颜色 / 接口 / 冻结 / 选中 …）走的是另一条快路：writeNeuronInstance
+   从活数据重算半径、颜色、实例矩阵和位置纹理，所以哪一列动过都不用整场重建。
+   只有「隐藏」那一列刻意留在快路之外 —— 隐藏位同时烘进了每条边的打包字
+   （nHid[eSrc] | nHid[eDst]），而边不是按神经元分块存的，改一格就得扫全场，
+   不值得，那边仍旧退回整场重建。 */
+const HIST_CI_NHID = HIST.cols.findIndex((c) => c.getArr && c.getArr() === nHid);
+const HIST_FAST_NCOLS = HIST.cols.map((c, i) => (c.tag === '' && i !== HIST_CI_NHID) ? i : -1).filter((i) => i >= 0);
 const HIST_CI_SEL = HIST.cols.findIndex((c) => c.tag === 'selE');
 /* 历史占了多少：分块按对象身份去重，所以这个数字就是真实驻留内存 */
 function histStats() {
@@ -1915,7 +1921,7 @@ function restore(s) {
   /* 「这一格跟现在差在哪」必须在**写回之前**数：写回那一步就把每一列的当前值
      换成了 s 那一份，数出来的就永远是「没差」。数得出快路就用快路，数不出就走老路。 */
   const diff = histDiffChunks(s);
-  const fastR = fastEdgeRanges(s, diff);
+  const fastR = fastRestoreRanges(s, diff);
   G.n = s.n; G.e = s.e; G.name = s.name;
   /* 先把每个数组的 live 区间按分块写回去。块里存的是原样的字节，所以是无损还原；
      G.n / G.e 必须先设好——count() 读的就是它们。 */
@@ -2002,11 +2008,15 @@ function restore(s) {
     rebuildAdjacency();
   }
   if (fastR) {
-    /* 快路：只把动过的那几段边重抄一遍。神经元实例、位置纹理、没动的边一个字节都不碰。
+    /* 快路：只把动过的那几段重抄一遍。没动过的边、没动过的神经元一个字节都不碰。
        refreshAll 要排在最前面 —— 它顺手重抄「高亮 / 选中 / 鼠标下面」的那些边，
        那些边的颜色是跟着选择走的，得等它算完再让快路覆盖一遍才不打架。 */
     refreshAll();
-    if (fastR.length) { edgeFastEdges += rewriteEdgeRanges(fastR); }
+    if (fastR.neurons.length) { edgeFastNeurons += rewriteNeuronRanges(fastR.neurons); }
+    if (fastR.edges.length) { edgeFastEdges += rewriteEdgeRanges(fastR.edges); }
+    /* 块的落位是按成员神经元的质心算的（blockLayout），神经元挪过就得跟着重算。
+       没块没算子的时候这一步纯属白跑，所以先问一句。 */
+    if (fastR.neurons.length && (blocks.length || opList.length)) rebuildBlockViews();
     edgeFastRestores++;
     syncChunks();
     rebuildSelMesh();
@@ -2056,7 +2066,7 @@ function sameIdSet(a, b) {
    不用猜、也不用再比一遍内容（比内容才是那 50 ms）。
 
    判据一律取「能证明的」：证书不全就走老路。走错了只是慢，走错了还硬走才是错。 */
-function fastEdgeRanges(s, diff) {
+function fastRestoreRanges(s, diff) {
   if (!diff) return null;                        /* 边界对不上：块号不能当区间用 */
   if (!BIG.on || !BIG.buf || !BIG.layer) return null;
   if (BUILD.active) return null;                 /* 场景正在分片建：不插队 */
@@ -2081,27 +2091,39 @@ function fastEdgeRanges(s, diff) {
     for (let i = 0; i < opList.length; i++) if (s.ops[i] !== opList[i]) return null;
   }
   if (!sameIdSet(s.selBlocks, selBlocks) || !sameIdSet(s.selOps, selOps)) return null;
-  const ranges = [];
+  /* 两条路分开数：边按「边的下标」重抄，神经元按「神经元的下标」重写。
+     列里的下标是元素下标，位置那列 stride = 3，换算成神经元号要往外取整
+     （分块的边界不一定落在神经元边界上，一个神经元的三个坐标可能横跨两块）。 */
+  const eR = [], nR = [];
   for (let ci = 0; ci < HIST.cols.length; ci++) {
     const touched = diff[ci];
     if (!touched) continue;                       /* 这一列一块都没动 */
-    if (HIST_FAST_COLS.indexOf(ci) < 0) return null;   /* 认不出的列动了：一律整场重建 */
     const c = HIST.cols[ci];
+    const isE = HIST_FAST_COLS.indexOf(ci) >= 0;
+    const isN = !isE && HIST_FAST_NCOLS.indexOf(ci) >= 0;
+    if (!isE && !isN) return null;                /* 认不出的列动了：一律整场重建 */
+    const st = isN ? c.stride : 1;
     for (let ti = 0; ti < touched.length; ti++) {
       const k = touched[ti];
       const lo = k * c.size, hi = Math.min(c.live, lo + c.size);
-      if (hi > lo) ranges.push([lo, hi]);
+      if (hi <= lo) continue;
+      if (isN) nR.push([Math.floor(lo / st), Math.ceil(hi / st)]);
+      else eR.push([lo, hi]);
     }
   }
   /* 鼠标下面那条的深色也烘在同一个字里：顺手一起重抄 */
-  if (S.hoverEdge >= 0 && S.hoverEdge < G.e) ranges.push([S.hoverEdge, S.hoverEdge + 1]);
-  if (!ranges.length) return [];                 /* 真没动过：连重抄都不用（空拍撤销） */
-  ranges.sort((a, b) => a[0] - b[0]);
-  const out = [ranges[0]];
-  for (let i = 1; i < ranges.length; i++) {
+  if (S.hoverEdge >= 0 && S.hoverEdge < G.e) eR.push([S.hoverEdge, S.hoverEdge + 1]);
+  return { edges: mergeRanges(eR), neurons: mergeRanges(nR) };
+}
+/* 把可能重叠的分块区间并成不相交的几段（返回空数组 = 真没动过，连重抄都不用） */
+function mergeRanges(list) {
+  if (list.length < 2) return list;
+  list.sort((a, b) => a[0] - b[0]);
+  const out = [list[0]];
+  for (let i = 1; i < list.length; i++) {
     const last = out[out.length - 1];
-    if (ranges[i][0] <= last[1]) { if (ranges[i][1] > last[1]) last[1] = ranges[i][1]; }
-    else out.push(ranges[i]);
+    if (list[i][0] <= last[1]) { if (list[i][1] > last[1]) last[1] = list[i][1]; }
+    else out.push(list[i]);
   }
   return out;
 }
@@ -2122,6 +2144,30 @@ function rewriteEdgeRanges(ranges) {
     cnt += hi - lo;
   }
   if (BIG.built < G.e) BIG.built = G.e;
+  return cnt;
+}
+let edgeFastNeurons = 0;
+/* 批量重写神经元实例时，别让 writeNeuronInstance 里的 dirtyN 逐条挂上传区间：
+   一段里几千个神经元就是几千个 bufferSubData，反而更慢。整段收尾只挂一条。 */
+let nBulkDepth = 0;
+/* 把这几段神经元按活数据重写进实例矩阵 / 实例颜色 / 位置纹理。
+   一个神经元身上能变的东西（半径、颜色、坐标）全从活数据重算，所以不用管是哪一列动过。 */
+function rewriteNeuronRanges(ranges) {
+  if (!ranges || !ranges.length) return 0;
+  const m = nLayer.matBuf, c = nLayer.colBuf;
+  const capN = m ? (m.array.length / 16 | 0) : 0;
+  let cnt = 0;
+  nBulkDepth++;
+  for (let ri = 0; ri < ranges.length; ri++) {
+    const lo = Math.max(0, ranges[ri][0]);
+    const hi = Math.min(G.n, ranges[ri][1], capN);
+    if (hi <= lo) continue;
+    for (let i = lo; i < hi; i++) writeNeuronInstance(i);
+    if (m) { m.addUpdateRange(lo * 16, (hi - lo) * 16); m.needsUpdate = true; }
+    if (c) { c.addUpdateRange(lo * 3, (hi - lo) * 3); c.needsUpdate = true; }
+    cnt += hi - lo;
+  }
+  nBulkDepth--;
   return cnt;
 }
 let histOnCp = false;
@@ -2798,6 +2844,7 @@ function markLineCol(o) {
   a.addUpdateRange(o, 6); a.needsUpdate = true;
 }
 function dirtyN(i) {
+  if (nBulkDepth > 0) return;   /* 整段重写：上传区间由 rewriteNeuronRanges 统一挂 */
   if (batchDepth > 0) { markN(i); return; }
   const a = nLayer.matBuf;
   a.addUpdateRange(i * 16, 16); a.needsUpdate = true;
@@ -19507,7 +19554,7 @@ window.NF = {
   histVerify: (v) => { HIST_VERIFY = v !== false; return HIST_VERIFY; },
   /* 撤销快路的账：多少次撤销走了「只重抄动过的边」，一共重抄了多少条。
      自测靠它断言这条快路真的在跑（不是写了没人走）。 */
-  restoreFastStats: () => ({ restores: edgeFastRestores, edges: edgeFastEdges,
+  restoreFastStats: () => ({ restores: edgeFastRestores, edges: edgeFastEdges, neurons: edgeFastNeurons,
                              copyChunks: histCopyChunks, skipChunks: histSkipChunks }),
   /* 大数据层那条缓冲的校验和（自测：快路之后跟整场重建对拍，一个 bit 都不能差） */
   bigBufHash: () => {
@@ -19638,6 +19685,23 @@ window.NF = {
     const a = neuronMesh.instanceColor;
     if (!a) return null;
     return '#' + _sc1.fromArray(a.array, i * 3).getHexString();
+  },
+  /* 某个神经元此刻在实例矩阵 / 位置纹理里真正烘着的坐标和半径。
+     撤销那条「神经元列」快路直接改的就是这两份，自测必须能读到它们本身 ——
+     只读数据模型的话，快路漏刷了也看不出来。 */
+  instPos: (i) => {
+    if (BUILD.active) scenePump(Infinity);
+    const m = nLayer.matBuf.array, o = i * 16;
+    return [m[o + 12], m[o + 13], m[o + 14]];
+  },
+  instScale: (i) => {
+    if (BUILD.active) scenePump(Infinity);
+    return nLayer.matBuf.array[i * 16];
+  },
+  bigTexPos: (i) => {
+    if (!BIG.texArr) return null;
+    const o = i * 4;
+    return [BIG.texArr[o], BIG.texArr[o + 1], BIG.texArr[o + 2]];
   },
   /* 某条连线此刻真正渲染出来的颜色 */
   renderEdgeColor: (e) => {
