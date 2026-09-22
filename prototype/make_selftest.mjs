@@ -1804,6 +1804,73 @@ const TEST = `
     log(NF.restoreFastStats().restores === rfFast2b.restores + 1, '改颜色的撤销也走快路');
     log(NF.renderColor(4) === col4, '改颜色撤销之后实例缓冲里的颜色一位不差',
         col4 + ' -> ' + NF.renderColor(4));
+    /* ②b 加 / 删神经元：边的一个字节都不用动（大数据那条缓冲只装 eSrc / eDst / 权重 / 标志，
+       位置是从纹理里按号读的），只要把神经元那一层重排一遍。判据是「每列只允许尾巴那一块
+       动过」—— 加 / 删一个神经元正好是这个形状；中间哪块也动了就说明这一拍里还夹着别的
+       编辑，那就退回整场重建。整层重写完了还得跟数据对账：漏刷就看不出来。 */
+    NF.forceRebuild();
+    const n0 = NF.graph().n, e0 = NF.graph().e;
+    const bHashE0 = NF.bigBufHash();
+    /* 方向一：n 变大。先在尾巴上放一个没有连线的神经元，删掉它再撤销。
+       （删一个带连线的神经元会把边数组整段前移，那是另一档，见下面第三条） */
+    const nA = NF.addNode(7, 8, 9);
+    const rfFast6 = NF.restoreFastStats();
+    NF.snapshot(); NF.delNodes([nA]); NF.undo();
+    const rfAfter6 = NF.restoreFastStats();
+    log(NF.graph().n === n0 + 1 && NF.graph().e === e0, '删尾巴上一个没有连线的神经元、再撤销：数目回到原样',
+        NF.graph().n + '/' + NF.graph().e + ' vs ' + (n0 + 1) + '/' + e0);
+    log(rfAfter6.restores === rfFast6.restores + 1, '这一档走「只重排神经元层」快路（不再整场重建）',
+        rfFast6.restores + ' -> ' + rfAfter6.restores);
+    log(rfAfter6.neurons - rfFast6.neurons === NF.graph().n, '这一档是整层重写（增删 n 会重建块网格，挑区间没意义）',
+        (rfAfter6.neurons - rfFast6.neurons) + ' 个 / 全场 ' + NF.graph().n);
+    log(NF.debugScene().nBadPos === 0 && NF.debugScene().nBadScale === 0, '重排之后实例矩阵跟数据逐点一致');
+    log((NF.bigBufHash() >>> 0) === (bHashE0 >>> 0), '这一档大数据缓冲一个字节都没动', bHashE0 + ' / ' + NF.bigBufHash());
+    /* 方向二：n 变小 —— 加一个再撤销 */
+    const rfFast7 = NF.restoreFastStats();
+    NF.snapshot(); NF.addNode(1, 2, 3); NF.undo();
+    log(NF.graph().n === n0 + 1 && NF.graph().e === e0, '加神经元的撤销之后数目回到原样',
+        NF.graph().n + '/' + NF.graph().e + ' vs ' + (n0 + 1) + '/' + e0);
+    log(NF.restoreFastStats().restores === rfFast7.restores + 1, '加神经元的撤销也走快路');
+    log(NF.debugScene().nBadPos === 0, '加再撤销之后实例跟数据逐点一致');
+    /* 方向三：删中间那个会把后面的编号整体前移，还带走它的连线 —— 这不是「只在尾巴上动」，
+       必须退回整场重建（而且不能把邻接表留着） */
+    const rfFast8 = NF.restoreFastStats();
+    NF.snapshot(); NF.delNodes([1]); NF.undo();
+    log(NF.restoreFastStats().restores === rfFast8.restores, '删中间的神经元撤销不走快路（编号重排 + 带走连线）',
+        rfFast8.restores + ' -> ' + NF.restoreFastStats().restores);
+    log(NF.graph().n === n0 + 1 && NF.graph().e === e0 && NF.debugScene().nBadPos === 0,
+        '删中间再撤销之后图、边、实例都对得上',
+        NF.graph().n + '/' + NF.graph().e + ' badPos=' + NF.debugScene().nBadPos);
+    /* 收尾：把那个临时神经元删掉，图回到 n0 */
+    NF.snapshot(); NF.delNodes([n0]);
+    log(NF.graph().n === n0 && NF.graph().e === e0, '收尾：临时神经元已摘掉', NF.graph().n + '/' + NF.graph().e);
+    /* ②c 删的是「尾巴上那一段、而且那一段没有一条边挂着」时：五列边数据一个数字都不会变，
+       邻接表连搬都不用搬，场景也不用整场重建 —— 但一个 bit 都不能错，所以拿裁判逐条对账。
+       同时要断言「没有虚报拓扑脏了」：虚报一次，下一拍检查点就要白切 134 MB。 */
+    const nB = NF.addNode(4, 5, 6);
+    const eB = NF.graph().e;
+    const bHashT = NF.bigBufHash();
+    NF.snapshot(); NF.delNodes([nB]);
+    log(NF.graph().n === nB && NF.graph().e === eB, '删掉没有连线的尾巴神经元：' + (nB + 1) + ' -> ' + NF.graph().n + '，边一条没少',
+        NF.graph().e + ' / ' + eB);
+    log(NF.histMarks().tdirty === false, '没有虚报「拓扑脏了」（虚报一次下一拍检查点要白切 134 MB）',
+        JSON.stringify(NF.histMarks()));
+    const adj1 = NF.adjAudit();
+    log(adj1.badStart === 0 && adj1.badList === 0, '邻接表没重建，但逐条跟重算的一模一样', JSON.stringify(adj1));
+    log((NF.bigBufHash() >>> 0) === (bHashT >>> 0), '大数据缓冲一个字节都没动');
+    log(NF.debugScene().nBadPos === 0 && NF.debugScene().nBadScale === 0, '场景实例跟数据逐点一致');
+    NF.undo();
+    log(NF.graph().n === nB + 1 && NF.graph().e === eB, '撤销之后那个神经元回来了', NF.graph().n + '/' + NF.graph().e);
+    log(NF.debugScene().nBadPos === 0, '撤销之后实例跟数据还是逐点一致');
+    /* 反例：删中间那个，编号整体前移、还带走它的连线 —— 这条必须照旧登记 + 重建 */
+    NF.snapshot(); NF.delNodes([1]);
+    log(NF.histMarks().tdirty !== false, '删中间的神经元照旧登记「拓扑脏了」', JSON.stringify(NF.histMarks()));
+    const adj2 = NF.adjAudit();
+    log(adj2.badStart === 0 && adj2.badList === 0, '删中间之后邻接表也对得上', JSON.stringify(adj2));
+    NF.undo();
+    log(NF.graph().n === nB + 1, '删中间那笔也能撤销', String(NF.graph().n));
+    NF.snapshot(); NF.delNodes([nB]);
+    log(NF.graph().n === n0 && NF.graph().e === e0, '收尾：图回到 ' + n0 + '/' + e0, NF.graph().n + '/' + NF.graph().e);
     /* 隐藏神经元：隐藏位同时烘进每条边的打包字（nHid[eSrc]|nHid[eDst]），
        边不是按神经元分块存的，改一格就得扫全场，所以这一列刻意留在快路之外 */
     const rfFast3 = NF.restoreFastStats();

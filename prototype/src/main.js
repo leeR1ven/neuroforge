@@ -1913,15 +1913,15 @@ function restore(s) {
        ② 这一格要还原的 eSrc / eDst 跟现在这份内容一字不差；另外「上一个快照之后没人写过
           边数组」也要成立（histTopoDirty，靠 61 个写入点的登记 + check_histhook 静态闸保证）
      不成立就照旧整张重建 —— 宁可多花 130 ms，也不能留一张对不上的邻接表。 */
-  const keepAdj = !adjStale && !histTopoDirty && adjBasisSeq >= 0 && adjBasisSeq === topoChgSeq &&
-                  s.e === G.e &&
-                  HIST_CI_SRC >= 0 && HIST_CI_DST >= 0 &&
-                  sameHistList(s.cols[HIST_CI_SRC], HIST.cols[HIST_CI_SRC].prev) &&
-                  sameHistList(s.cols[HIST_CI_DST], HIST.cols[HIST_CI_DST].prev);
+  const topoSame = !adjStale && !histTopoDirty && adjBasisSeq >= 0 && adjBasisSeq === topoChgSeq &&
+                   HIST_CI_SRC >= 0 && HIST_CI_DST >= 0 &&
+                   sameHistList(s.cols[HIST_CI_SRC], HIST.cols[HIST_CI_SRC].prev) &&
+                   sameHistList(s.cols[HIST_CI_DST], HIST.cols[HIST_CI_DST].prev);
+  const keepAdj = topoSame && s.e === G.e;
   /* 「这一格跟现在差在哪」必须在**写回之前**数：写回那一步就把每一列的当前值
      换成了 s 那一份，数出来的就永远是「没差」。数得出快路就用快路，数不出就走老路。 */
   const diff = histDiffChunks(s);
-  const fastR = fastRestoreRanges(s, diff);
+  const fastR = fastRestoreRanges(s, diff, topoSame);
   G.n = s.n; G.e = s.e; G.name = s.name;
   /* 先把每个数组的 live 区间按分块写回去。块里存的是原样的字节，所以是无损还原；
      G.n / G.e 必须先设好——count() 读的就是它们。 */
@@ -2012,11 +2012,25 @@ function restore(s) {
        refreshAll 要排在最前面 —— 它顺手重抄「高亮 / 选中 / 鼠标下面」的那些边，
        那些边的颜色是跟着选择走的，得等它算完再让快路覆盖一遍才不打架。 */
     refreshAll();
-    if (fastR.neurons.length) { edgeFastNeurons += rewriteNeuronRanges(fastR.neurons); }
+    if (fastR.nChanged) {
+      /* 神经元数量变了（加 / 删神经元）。边一个字节都不用动：大数据那条缓冲只装
+         eSrc / eDst / 权重 / 标志，位置是从纹理里按号读的，跟 n 无关。
+         减 n 会让 syncChunks() 重建块网格（盒子清空，交给 ensureLayerBoxes 惰性重算），
+         所以这一档不挑区间，整层重写一遍 —— 真工程上 14 万个实测 5.2 ms，
+         比整场重建（同步那一截 45 ms + 后台再烧 285 ms 重抄 1681 万条边）便宜一个量级。
+         位置纹理要是跟着长过（bigPosEnsure 换过数组），下面这一整层正好把它填满。 */
+      nBuilt = G.n;
+      if (BIG.on) BIG.built = G.e;
+      syncChunks();
+      bigPosEnsure();
+      edgeFastNeurons += rewriteNeuronRanges([[0, G.n]]);
+    } else if (fastR.neurons.length) {
+      edgeFastNeurons += rewriteNeuronRanges(fastR.neurons);
+    }
     if (fastR.edges.length) { edgeFastEdges += rewriteEdgeRanges(fastR.edges); }
     /* 块的落位是按成员神经元的质心算的（blockLayout），神经元挪过就得跟着重算。
        没块没算子的时候这一步纯属白跑，所以先问一句。 */
-    if (fastR.neurons.length && (blocks.length || opList.length)) rebuildBlockViews();
+    if ((fastR.nChanged || fastR.neurons.length) && (blocks.length || opList.length)) rebuildBlockViews();
     edgeFastRestores++;
     syncChunks();
     rebuildSelMesh();
@@ -2066,13 +2080,20 @@ function sameIdSet(a, b) {
    不用猜、也不用再比一遍内容（比内容才是那 50 ms）。
 
    判据一律取「能证明的」：证书不全就走老路。走错了只是慢，走错了还硬走才是错。 */
-function fastRestoreRanges(s, diff) {
+function fastRestoreRanges(s, diff, topoSame) {
   if (!diff) return null;                        /* 边界对不上：块号不能当区间用 */
   if (!BIG.on || !BIG.buf || !BIG.layer) return null;
   if (BUILD.active) return null;                 /* 场景正在分片建：不插队 */
   if (adjStale) return null;
   if (SIM.active) return null;                   /* 脉冲动画每帧自己改高亮，别跟它抢 */
-  if (s.e !== G.e || s.n !== G.n) return null;
+  if (s.e !== G.e) return null;                  /* 边数变了：邻接表 / 两条老连线层 / 大数据缓冲全得重来 */
+  /* n 变了（加 / 删神经元）本身不是障碍：大数据那条缓冲只装 eSrc / eDst / 权重 / 标志，
+     跟 n 一点关系都没有，位置是从纹理里按号读的，所以边的一个字节都不用动，
+     只有神经元那一层要重排。但要额外证明「拓扑真没动过」—— 加神经元往往跟着加边，
+     那 e 就变了（上面已经挡住）；这里再挡一次是因为邻接表的判据是另一条路径。 */
+  const nChanged = s.n !== G.n;
+  if (nChanged && !topoSame) return null;
+  if (nChanged && !(nLayer.cap >= s.n)) return null;
   /* 只有「大数据层 + 神经元实例」这一种档位才谈得上「边单独重抄」：
      老两条连线层把颜色烘进实例缓冲，权重一动那两层全都要重来 */
   if (layerMaskForTier(LOD.tier) !== (LAYER_N | LAYER_EBIG)) return null;
@@ -2100,8 +2121,16 @@ function fastRestoreRanges(s, diff) {
     if (!touched) continue;                       /* 这一列一块都没动 */
     const c = HIST.cols[ci];
     const isE = HIST_FAST_COLS.indexOf(ci) >= 0;
-    const isN = !isE && HIST_FAST_NCOLS.indexOf(ci) >= 0;
+    /* n 变了的时候，「隐藏」那一列也会被动到（尾巴那一段长度变了），得放它进来。
+       这么做的前提是下面那条判据：只允许尾巴那一块动过 —— 加 / 删一个神经元就是
+       这个形状；要是中间哪一块也动了，说明这一拍里还夹着别的编辑（比如顺手隐藏了
+       某个神经元），而隐藏位是烘进每条边的打包字里的，那就不能按「只重排神经元」收尾。 */
+    const isN = !isE && (nChanged ? HIST.cols[ci].tag === '' : HIST_FAST_NCOLS.indexOf(ci) >= 0);
     if (!isE && !isN) return null;                /* 认不出的列动了：一律整场重建 */
+    if (isN && nChanged) {
+      const lastK = s.cols[ci].length - 1;
+      if (touched.length !== 1 || touched[0] !== lastK) return null;
+    }
     const st = isN ? c.stride : 1;
     for (let ti = 0; ti < touched.length; ti++) {
       const k = touched[ti];
@@ -2113,7 +2142,7 @@ function fastRestoreRanges(s, diff) {
   }
   /* 鼠标下面那条的深色也烘在同一个字里：顺手一起重抄 */
   if (S.hoverEdge >= 0 && S.hoverEdge < G.e) eR.push([S.hoverEdge, S.hoverEdge + 1]);
-  return { edges: mergeRanges(eR), neurons: mergeRanges(nR) };
+  return { edges: mergeRanges(eR), neurons: mergeRanges(nR), nChanged };
 }
 /* 把可能重叠的分块区间并成不相交的几段（返回空数组 = 真没动过，连重抄都不用） */
 function mergeRanges(list) {
@@ -5346,31 +5375,51 @@ function addEdge(s, d, w) {
 function deleteNeurons(list) {
   if (!list.length) return;
   const del = new Uint8Array(G.n);
-  for (const i of list) if (i >= 0 && i < G.n) del[i] = 1;
-  histLockDirty = 1; histHidDirty = 1; histWDirty = 1; histTopoDirty = 1;
+  let cnt = 0, minDel = -1;
+  for (const i of list) if (i >= 0 && i < G.n && !del[i]) { del[i] = 1; cnt++; if (minDel < 0 || i < minDel) minDel = i; }
+  if (!cnt) return;
+  /* 删的是不是「尾巴上那一段、而且这一段上没有一条边挂着」。
+     是的话：压缩循环一条边都不会丢（w 恒等于 e）、remap 是恒等、邻接表连搬都不用搬
+     （尾巴上那几个号本来就没有表项），于是五列边数据一个数字都不会变 ——
+     那几个「边列脏了」的旗标一个都不能打。打了就是虚报：下一拍检查点会为了这点虚报
+     把 1681 万 × 2 列整份重新切片（134 MB 的安全拷贝，真工程上实测 ~60 ms），
+     重建邻接表再花 135 ms，rebuildScene 又把 1681 万条边重抄一遍（后台 ~400 ms）。
+     邻接表过期就判不出来（不敢信一张过期的表），那就按老规矩全量处理。 */
+  const tailClean = minDel === G.n - cnt && !adjStale && adjStart[minDel] === adjCount;
+  if (!tailClean) { histLockDirty = 1; histHidDirty = 1; histWDirty = 1; histTopoDirty = 1; }
   let w = 0;
-  for (let e = 0; e < G.e; e++) {
-    if (del[eSrc[e]] || del[eDst[e]]) continue;
-    eSrc[w] = eSrc[e]; eDst[w] = eDst[e]; eW[w] = eW[e]; eLock[w] = eLock[e]; eHid[w] = eHid[e]; eId[w] = eId[e];
-    w++;
-  }
-  G.e = w;
+  if (!tailClean) {
+    for (let e = 0; e < G.e; e++) {
+      if (del[eSrc[e]] || del[eDst[e]]) continue;
+      eSrc[w] = eSrc[e]; eDst[w] = eDst[e]; eW[w] = eW[e]; eLock[w] = eLock[e]; eHid[w] = eHid[e]; eId[w] = eId[e];
+      w++;
+    }
+    G.e = w;
+  }   /* tailClean 时一条边都没被删：这个循环和下面的整体重编都是恒等变换，整段跳过 */
   const remap = new Int32Array(G.n);
   const newNames = new Map();
   let k = 0;
-  for (let i = 0; i < G.n; i++) {
-    if (del[i]) { remap[i] = -1; continue; }
-    if (k !== i) {
-      nPos[k * 3] = nPos[i * 3]; nPos[k * 3 + 1] = nPos[i * 3 + 1]; nPos[k * 3 + 2] = nPos[i * 3 + 2];
-      nIO[k] = nIO[i]; nAct[k] = nAct[i]; nBias[k] = nBias[i]; nLock[k] = nLock[i];
-      nColOn[k] = nColOn[i]; nThr[k] = nThr[i];
-      nPlast[k] = nPlast[i]; nHard[k] = nHard[i];
-      nCol[k * 3] = nCol[i * 3]; nCol[k * 3 + 1] = nCol[i * 3 + 1]; nCol[k * 3 + 2] = nCol[i * 3 + 2];
-      selN[k] = selN[i];
-      nGroup[k] = nGroup[i]; nHid[k] = nHid[i];
-      if (nName.has(i)) newNames.set(k, nName.get(i));
+  if (tailClean) {
+    /* 删的正好是尾巴上连续那一段：前面的号一个都不动（k 恒等于 i），
+       所以既不用逐个抄神经元数据，也不用重建名字表。 */
+    k = G.n - cnt;
+    for (let i = 0; i < k; i++) remap[i] = i;
+    for (let i = k; i < G.n; i++) remap[i] = -1;
+  } else {
+    for (let i = 0; i < G.n; i++) {
+      if (del[i]) { remap[i] = -1; continue; }
+      if (k !== i) {
+        nPos[k * 3] = nPos[i * 3]; nPos[k * 3 + 1] = nPos[i * 3 + 1]; nPos[k * 3 + 2] = nPos[i * 3 + 2];
+        nIO[k] = nIO[i]; nAct[k] = nAct[i]; nBias[k] = nBias[i]; nLock[k] = nLock[i];
+        nColOn[k] = nColOn[i]; nThr[k] = nThr[i];
+        nPlast[k] = nPlast[i]; nHard[k] = nHard[i];
+        nCol[k * 3] = nCol[i * 3]; nCol[k * 3 + 1] = nCol[i * 3 + 1]; nCol[k * 3 + 2] = nCol[i * 3 + 2];
+        selN[k] = selN[i];
+        nGroup[k] = nGroup[i]; nHid[k] = nHid[i];
+        if (nName.has(i)) newNames.set(k, nName.get(i));
+      }
+      remap[i] = k; k++;
     }
-    remap[i] = k; k++;
   }
   if (k < G.n) {
     nIO.fill(0, k, G.n); nAct.fill(0, k, G.n); nBias.fill(0, k, G.n);
@@ -5380,13 +5429,23 @@ function deleteNeurons(list) {
   }
   G.n = k;
   gremap(remap, k); gsyncPrimary();
-  nName.clear(); newNames.forEach((v, kk) => nName.set(kk, v));
-  histLockDirty = 1; histHidDirty = 1; histTopoDirty = 1;
-  for (let e = 0; e < G.e; e++) { eSrc[e] = remap[eSrc[e]]; eDst[e] = remap[eDst[e]]; }
+  if (!tailClean) { nName.clear(); newNames.forEach((v, kk) => nName.set(kk, v)); }
+  if (!tailClean) { histLockDirty = 1; histHidDirty = 1; histTopoDirty = 1; }
+  if (!tailClean) for (let e = 0; e < G.e; e++) { eSrc[e] = remap[eSrc[e]]; eDst[e] = remap[eDst[e]]; }
   /* 块里的神经元 id 也要跟着重编号，引用到被删神经元的行列直接摘掉 */
   if (blocks.length) { const r = blockRemapDrop(del, remap); if (r.dropped || r.retagged) selBlocks.clear(); }
   applyEdgeSelection([]);
-  rebuildAdjacency(); rebuildScene(); refreshAll();
+  if (tailClean) {
+    /* 边一条没动，邻接表逐条还是对的（尾巴那几个号本来就没有表项）：留着。
+       场景也不用整场重建，把绘制条数收一收就够了（多出来的那些实例没人画）。 */
+    viewStatsTouch();
+    syncSceneCounts();
+    if (blocks.length) { rebuildBlockAdjacency(); rebuildBlockViews(); }
+    invalidatePick();
+  } else {
+    rebuildAdjacency(); rebuildScene();
+  }
+  refreshAll();
 }
 function deleteEdges(list) {
   if (!list.length) return;
@@ -20411,6 +20470,10 @@ window.NF = {
   /* 构图与编译中间结果的只读视图，供脚本 / 回归测试使用 */
   clear: () => newProject(),
   addNode: (x, y, z) => addNeuron(x || 0, y || 0, z || 0),
+  /* 删除神经元的 raw 入口，跟 addNode 一样不自己拍快照（调用方负责 snapshot / unSnapshot）。
+     注意 deleteNeurons 会把后面的编号整体前移，所以删中间那个等于一次大范围重排，
+     撤销只能退回整场重建；只有「删尾巴上那个」才落得进「只重排神经元层」那条快路。 */
+  delNodes: (list) => { deleteNeurons(list || []); return G.n; },
   addEdge: (s, d, w) => addEdge(s, d, w),
   setW: (e, v) => { eW[e] = v; histWDirty = 1; afterEdgeParamChange([e]); },
   /* ---- 按神经元挑连接 / 批量调参（14.x）---- */
