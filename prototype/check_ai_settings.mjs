@@ -72,7 +72,7 @@ function context() {
   assert.ok(dsBase, 'missing AI_DEEPSEEK_BASE');
   vm.runInContext(constants[0] + '\n' + dsBase[0] + '\n' + ['aiEsc', 'aiThinkNorm', 'aiThinkLabel', 'aiThinkNote', 'aiThinkFields',
     'aiIsGpt6Config', 'aiApplyGpt6Preset', 'aiOpenGpt6Preset', 'aiBaseNormalize', 'aiBaseRoot',
-    'aiBaseHost', 'aiHostLocal', 'aiDeepseekKeySaved', 'aiApplyDeepseekPreset', 'aiUseDeepseek', 'aiOpenDeepseekPreset',
+    'aiBaseHost', 'aiHostLocal', 'aiIsLocal', 'aiLocalNow', 'aiDeepseekKeySaved', 'aiApplyDeepseekPreset', 'aiUseDeepseek', 'aiOpenDeepseekPreset', 'aiAutoMaxTok', 'aiBudgetEaten',
     'aiModelsScope', 'aiModelsScopeSame', 'aiModelsOnce', 'aiShellGet', 'aiLocalProbe'].map(functionSource).join('\n'), c);
   return c;
 }
@@ -446,6 +446,19 @@ await test('the DeepSeek preset writes the full chat endpoint; an existing DeepS
   assert.equal(c2.AI.model, 'deepseek-flash');
   assert.equal(c2.AI.key, 'FAKE-NEW-DS-KEY');
   assert.equal(c2.saves.length, 1); assert.equal(c2.saves[0].force, true);
+});
+
+await test('the budget-eaten detector fires only on an empty answer that spent everything on thinking', () => {
+  const c = context();
+  assert.equal(c.aiBudgetEaten({ content: '', reasoning_content: '想很久', tool_calls: null }, 'length'), true);
+  assert.equal(c.aiBudgetEaten({ content: '有正文', reasoning_content: '想很久' }, 'length'), false);
+  assert.equal(c.aiBudgetEaten({ content: '', tool_calls: [{ id: 'call_1' }] }, 'length'), false);
+  assert.equal(c.aiBudgetEaten({ content: '' }, 'length'), true);
+  assert.equal(c.aiBudgetEaten({ content: '' }, 'stop'), false);
+  assert.equal(c.aiBudgetEaten(null, 'length'), false);
+  /* 开着思考就多给额度（思维链和正文共用一份）；关掉思考还是老的那两个数。 */
+  c.AI.think = 'max'; assert.equal(c.aiAutoMaxTok(true), 32000);
+  c.AI.think = 'off'; assert.equal(c.aiAutoMaxTok(true), 4000);
 });
 
 await test('empty model lists and HTTP errors preserve the configured model; errors keep the last usable list', async () => {

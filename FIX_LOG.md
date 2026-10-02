@@ -1,5 +1,68 @@
 # 修复交接日志
 
+## 2026-10-02：第 80 轮 —— 小任务也要「想半年」：思维链把输出额度吃光了，软件只会干等
+
+### 1. 现象与根因（实测，不是推断）
+
+- 现象：让内置 AI 做一件小事，它一直思考、迟迟不动手，最后只弹一句
+  「模型思考完却没吐出正文：最大输出被思维链吃光了……设置 → 最大输出 填 32000」。
+  用户照做了：**填 32000 还是不够**。
+- 实测（读这台机器上的 %APPDATA%\NeuroForge\settings.json）：base =
+  https://api.deepseek.com/v1/chat/completions、model = deepseek-flash、maxTok = 32000、think = max。
+- **根因一：思维链和正文 / 工具调用共用同一份 max_tokens。** 额度给多大，思考就能占多久——
+  32000 也能被吃光，正文一个字出不来。所以「把最大输出调大」是治不了的：它不是不够，是被思考拿走了。
+- **根因二（「为什么思考那么久」的另一半）：提示词每轮都要原样重发。** 本轮实测：
+  手册正文 48,629 字符（1040 行）+ 131 个工具的 schema 44,126 字符 ≈ **9.3 万字符 ≈ 6.2 万 token**，
+  每次请求都重来一遍。界面里原先写的「约 6.4 万字符 / 约 4 万 token」漏算了工具表那一半。
+- **根因三：slim 的 auto 只对本机端点生效**（aiSlimOn → aiLocalNow）。公网端点永远拿到最重的那一档，
+  而这台机器恰恰是公网 DeepSeek。
+- 顺带抓到**第 79 轮引入的一个真 bug**：aiFetchChat 的 404 分支写的是
+  aiHttpHint(res.status, context.base)，可那个作用域里没有 context（应为 request.context）——
+  非流式请求一旦 HTTP 出错就抛 ReferenceError，把真正的报错吞掉。
+
+### 2. 改法
+
+- 新增 aiBudgetEaten(msg, finish)：**正文空 + 没有 tool_calls +（有 reasoning_content 或 finish_reason=length）**
+  → 判定为「额度被思考吃光」。
+- 命中就 aiBudgetNote()（往对话里留一条说明）+ **自动关掉思考重发一次**（retry 只允许一层，不会无限重发）：
+  - 重发那一次的请求体带 thinking: {type:'disabled'}（Responses 那条路把 reasoningEffort 置空）；
+  - 只给这一次请求的 wire 末尾追加一句 system：**「这一轮不要思考、不要复述手册：直接给结论，或者直接调用工具」**
+    —— 只进这一次的请求，**不进对话历史**（否则会越滚越长）；
+  - 端点已经证明不认思考参数（thinkBad）就什么都不发——那种端点本来也没有思考可关。
+- 四条返回路径全部接上：非流式 chat/completions、非流式 Responses、流式 SSE、流式 Responses（含壳子不给流
+  的一次性解析）。流式重发前把 AI.live / AI.liveThink 清掉，别把上一轮的思考留在屏幕上。
+- 说明里的数字**现算**：新增 aiPromptChars()（手册 + 工具 schema 的字符数）和 aiWan()，
+  被吃光的提示、设置里「完整版（约 x 万字符）」、切换「手册与工具」的 toast、设置面板那一行说明
+  全部改成现算——写死的旧数字（6.4 万字符 / 4 万 token、4.2 万 + 2.2 万、123 个工具）一并改准。
+- 界面上那句失败提示改写：说清「**软件已经自动关思考重发过一次**，还是没出来」，并给出能治根的两步
+  （思考强度降一档 / 手册与工具切「瘦身」）。
+- 修掉上面那个 context → request.context 的 ReferenceError。
+- 手册升 **r62**：在【AI 思考强度】里写清「思维链与正文共用额度」「软件会自动关思考重发」「别让用户去改最大输出」，
+  并订正瘦身那一节的旧体量数字；README 版本号同步。
+
+### 3. 验证
+
+- tools/verify_gpt6_integration.mjs：新增 **2 条端到端**（非流式 + 流式）。第一次喂
+  「空正文 + reasoning_content + finish_reason=length」，第二次喂正常回复，断言：
+  返回的是第二次的正文；第一次请求体 thinking=enabled / reasoning_effort=max，第二次 thinking=disabled
+  且没有 reasoning_effort；第二次的 messages 末尾多一条含「不要思考」的 system，且**没有进对话历史**；
+  notes 里恰好一条 k='budget-eaten'（带思考 token 数和「万字符」）；流式那次最后一帧只有正文、没有残留思考。
+  **14 → 16 groups**。顺带修好这支回归自己的问题：源码是 CRLF，constDeclaration 找 ';\n' 找不到，
+  把 AI_THINK_DISABLED 误报成 unterminated。
+- prototype/check_ai_settings.mjs：新增 detector 六种输入 + aiAutoMaxTok 在 max / off 下的 32000 / 4000；
+  把 aiLocalNow / aiIsLocal 补进它的抽取清单 —— **29 PASS**。
+- 自测页 **1010 PASS / 0 FAIL**；**17 个校验页全过（1380 PASS / 0 FAIL）**；
+  tools/verify_* 全过（16 个 py + 3 个 mjs）；git diff --check 干净。
+
+### 4. 仍然存在的问题 / 给用户的结论
+
+- **慢的根子还在**：公网端点每轮仍要重发约 9.3 万字符提示词，「手册与工具」的 auto 只给本机端点瘦身。
+  想真正快起来：把常驻「思考强度」从「最高 max」降到「高 / 中」，或者把「手册与工具」切成「瘦身」
+  （只发 7 个工具 + 手册大纲，其余现查）。**要不要把 auto 也覆盖公网端点，留给用户定**——
+  那等于默认降低 AI 每轮能直接看到的工具数量，属于行为变更，不悄悄改。
+- 这一轮的兜底只认得上面那一种形态；如果某个端点把额度全花在正文之外的推理上、既不回 reasoning_content、
+  finish_reason 也不是 length，就判不出来（那种只能靠降档位或换端点）。
+
 ## 2026-10-02：第 79 轮 —— 换成 DeepSeek 后返回 404：地址少了一截，软件没帮他补
 
 ### 1. 现象与根因（实测，不是推断）

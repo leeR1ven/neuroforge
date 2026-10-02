@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-const source = fs.readFileSync(new URL('../prototype/src/main.js', import.meta.url), 'utf8');
+const source = fs.readFileSync(new URL('../prototype/src/main.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const adapterSource = fs.readFileSync(new URL('../prototype/src/ai_responses.js', import.meta.url), 'utf8');
 const adapter = await import('data:text/javascript;base64,' + Buffer.from(adapterSource).toString('base64'));
 const clone = (value) => JSON.parse(JSON.stringify(value));
@@ -21,6 +21,15 @@ function extract(name) {
   const end = /^}/m.exec(rest);
   assert.ok(end, 'missing closing brace: ' + name);
   return rest.slice(0, end.index + 1);
+}
+
+/* const 字面量（单行或多行拼接）也要拿到真身：拿源码里的那一份，不要在这里另写一份。 */
+function constDeclaration(name) {
+  const start = source.indexOf('\nconst ' + name + ' = ');
+  assert.ok(start >= 0, 'missing source const: ' + name);
+  const end = source.indexOf(';\n', start);
+  assert.ok(end > start, 'unterminated const: ' + name);
+  return source.slice(start + 1, end + 1);
 }
 
 function arrayDeclaration(name) {
@@ -44,6 +53,8 @@ const actualFunctions = [
   'aiResponsesConnectionTest', 'aiLocalTest', 'aiCfgJson', 'aiSaveCfg', 'aiAdoptCfg', 'aiSysKv',
   /* aiSaveCfg / aiChatFetch 都会先把地址规范成能直接发的端点，404 提示也在那一段 */
   'aiBaseHost', 'aiHostLocal', 'aiBaseNormalize', 'aiHttpHint',
+  /* 思维链吃光额度时的自动兜底（关思考重发） */
+  'aiBudgetEaten', 'aiBudgetNote', 'aiPromptChars', 'aiWan', 'aiFetchChat', 'aiFetchChatStream',
 ];
 
 function harness(overrides = {}) {
@@ -93,7 +104,8 @@ function harness(overrides = {}) {
     aiRender: noop, aiInfo: noop, aiSetUI: noop, aiTrim: noop, aiFillCfg: noop, aiModelListRender: noop,
     aiSysSync: noop, aiSessRender: noop, aiSessPersist: noop, aiSessFlushArchive: noop, toast: noop,
   });
-  vm.runInContext(arrayDeclaration('AI_TOOLS') + '\n' +
+  vm.runInContext(constDeclaration('AI_THINK_DISABLED') + '\n' + constDeclaration('AI_BUDGET_HINT') + '\n' +
+    arrayDeclaration('AI_TOOLS') + '\n' +
     'const AI_BY_NAME = Object.fromEntries(AI_TOOLS.map((t) => [t.name, t]));\n' +
     "const AI_SLIM_TOOLS = ['get_state','list_tools','tool_help','run_tool','get_manual','list_api','run_api'];", ctx);
   for (const name of actualFunctions) vm.runInContext(extract(name), ctx, { filename: 'main.js:' + name });
@@ -375,6 +387,61 @@ await check('旧配置异步回包不能覆盖新服务商 Key，同毫秒保存
   pending[1]([['final', JSON.stringify(fresh)]]);
   await Promise.resolve(); await Promise.resolve();
   assert.equal(JSON.parse(h.storage.get('test.ai')).key, 'TEST_NEW_KEY');
+});
+
+/* 第 80 轮：思维链把输出额度吃光（正文空、只回了 reasoning_content）时，
+   不能只留一句「这条没有文字回复」——软件自动关掉思考重发一次，并在对话里留一条说明。 */
+await check('思维链吃光输出额度时自动关思考重发一次（chat/completions 非流式）', async () => {
+  const h = harness({ base: 'https://api.deepseek.com/v1/chat/completions', model: 'deepseek-flash', think: 'max' });
+  const eaten = {
+    choices: [{ message: { role: 'assistant', content: '', reasoning_content: '（想了很久，把额度用完了）' }, finish_reason: 'length' }],
+    usage: { prompt_tokens: 60000, completion_tokens: 24000, completion_tokens_details: { reasoning_tokens: 23990 } },
+  };
+  const ok = { choices: [{ message: { role: 'assistant', content: '网络没问题，只有 3 层。' }, finish_reason: 'stop' }] };
+  h.queue.push(jsonResponse(eaten), jsonResponse(ok));
+  const reply = await h.ctx.aiFetchChat(h.AI.msgs, true, null, null);
+  assert.equal(reply.content, '网络没问题，只有 3 层。');
+  assert.equal(h.requests.length, 2, '额度被吃光必须自动重发，不能直接把空回复交给界面');
+  /* 第一次按用户选的档位思考；第二次明确关掉思考。 */
+  assert.deepEqual(h.requests[0].body.thinking, { type: 'enabled' });
+  assert.equal(h.requests[0].body.reasoning_effort, 'max');
+  assert.deepEqual(h.requests[1].body.thinking, { type: 'disabled' });
+  assert.equal(h.requests[1].body.reasoning_effort, undefined);
+  assert.equal(h.requests[0].body.max_tokens, h.requests[1].body.max_tokens);
+  /* 重发那一次多一句「不要思考」，只进这一次的线，不回灌对话历史（否则越滚越长）。 */
+  assert.equal(h.requests[0].body.messages.filter((m) => /不要思考/.test(String(m.content))).length, 0);
+  assert.equal(h.requests[1].body.messages.filter((m) => m.role === 'system' && /不要思考/.test(String(m.content))).length, 1);
+  assert.equal(h.AI.msgs.filter((m) => /不要思考/.test(String(m.content))).length, 0);
+  /* 用户看得见发生了什么：一条说明，带这一轮思考了多少 token。 */
+  const notes = h.notes.filter((n) => n.k === 'budget-eaten');
+  assert.equal(notes.length, 1);
+  assert.match(notes[0].text, /思维链/);
+  assert.match(notes[0].text, /23990/);
+  /* 提示词体量是现算的（这里手册没注入，只剩工具表那一半），不是写死的数字 */
+  assert.match(notes[0].text, /万字符/);
+});
+
+await check('思维链吃光输出额度时流式也会自动重发，并清掉上一轮思考', async () => {
+  const h = harness({ base: 'https://api.deepseek.com/v1/chat/completions', model: 'deepseek-flash', think: 'max', stream: true });
+  const sse = (rows) => sseResponse(rows.map((row) => 'data: ' + JSON.stringify(row) + '\n\n').concat('data: [DONE]\n\n'));
+  h.queue.push(
+    sse([{ choices: [{ delta: { reasoning_content: '想很久，额度用完了' } }] },
+      { choices: [{ delta: {}, finish_reason: 'length' }], usage: { completion_tokens: 32000, completion_tokens_details: { reasoning_tokens: 31990 } } }]),
+    sse([{ choices: [{ delta: { content: '只有 3 层。' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] }]));
+  const seen = [];
+  const reply = await h.ctx.aiFetchChatStream(h.AI.msgs, false, null, (content, think) => seen.push({ content, think }), null);
+  assert.equal(reply.content, '只有 3 层。');
+  assert.equal(h.requests.length, 2);
+  assert.equal(h.requests[0].body.stream, true);
+  assert.equal(h.requests[1].body.stream, true);
+  assert.deepEqual(h.requests[1].body.thinking, { type: 'disabled' });
+  assert.equal(h.requests[1].body.messages.filter((m) => /不要思考/.test(String(m.content))).length, 1);
+  /* 重发那一轮是干净的：最后送到屏幕上的只有正文，没有残留的思考。
+     （第一轮的思考会实时显示出来——这是流式的正常表现；被顶掉的是重发后这一段。） */
+  assert.ok(seen.some((x) => String(x.think).includes('想很久，额度用完了')));
+  assert.deepEqual(seen.at(-1), { content: '只有 3 层。', think: '' });
+  assert.equal(h.notes.filter((n) => n.k === 'budget-eaten').length, 1);
 });
 
 console.log('\n' + passed + ' integration groups passed; all HTTP mocked, no real keys or project writes.');

@@ -22566,7 +22566,7 @@ const AI = {
   think: 'default', thinkBad: false, thinkNote: '',
   /* ---- 本地大模型（Ollama / LM Studio / llama.cpp / vLLM 这类跑在自己机器上的端点）----
      它们都给 OpenAI 兼容接口，所以不用另做一套协议；真正要解决的是两件事：
-     (1) 配置别让人猜端口；(2) 小模型带不动这么长的提示词——123 个工具 + 4.2 万字手册
+     (1) 配置别让人猜端口；(2) 小模型带不动这么长的提示词——131 个工具 + 4.9 万字符手册
      大概 4 万 token，8K / 32K 的本地模型直接爆上下文，塞进去也是一问三不知。
      所以有 slim（瘦身）：只发一个 7 件套 + 手册大纲，其余靠 list_tools / tool_help /
      run_tool / get_manual 现查——**能力一点不少，只多一跳**。
@@ -22790,6 +22790,9 @@ function aiFillCfg() {
   aiKeyNote();
   set('ai-temp', String(AI.temp)); set('ai-maxtok', String(AI.maxTok));
   const sl = document.getElementById('ai-slim'); if (sl) sl.value = AI.slim;
+  /* 这行数字跟着手册和工具表走，不要写死（写死过，少算了工具表那一半） */
+  const sh = document.getElementById('ai-slimhint');
+  if (sh) sh.textContent = '完整提示词约 ' + aiWan(aiPromptChars()) + ' 万字符，每轮都要原样重发；瘦身只发 7 个工具 + 手册大纲，其余现查';
   const tmd = document.getElementById('ai-toolmode'); if (tmd) tmd.value = AI.toolMode;
   aiLocalFill();
   aiLocalNote();
@@ -24176,7 +24179,7 @@ function aiStateBrief() {
   };
 }
 /* ---- 16.4a 瘦身模式：给小上下文的本地模型用 ----
-   完整提示词是 手册 4.2 万字 + 工具表 2.2 万字，按中文粗算 4 万 token 上下。
+   完整提示词是 手册 4.9 万字符 + 工具 schema 4.4 万字符，按中文粗算 6 万 token 上下（第 80 轮实测）。
    8K / 32K 的本地模型根本装不下；就算硬塞，工具一多它反而乱调。
    瘦身模式只发：一个 7 件套 + 手册大纲（每节标题 + 首句），其余现查——
    list_tools 列全部、tool_help 看参数、run_tool 代调、get_manual 取整节。
@@ -24188,7 +24191,18 @@ function aiSlimOn() {
   if (AI.slim === 'off') return false;
   return aiLocalNow();
 }
-/* 手册大纲：每节的标题 + 这一节第一句（掐 60 字）。整本 4.2 万字 → 大约一千字。 */
+/* 完整提示词的体量：手册正文 + 工具 schema，这两块每一轮都要原样重发一遍。
+   第 80 轮实测：手册 4.9 万字符 + 131 个工具的 schema 4.4 万字符 ≈ 9.3 万字符（约 6 万 token）。
+   数字在这里现算，不写死——手册和工具表以后长长了，界面上说的也还是真的。 */
+function aiPromptChars() {
+  let manual = 0, tools = 0;
+  if (typeof AI_MANUAL === 'string') manual = AI_MANUAL.length;
+  if (typeof aiToolSchema === 'function') { try { tools = JSON.stringify(aiToolSchema()).length; } catch (e) { tools = 0; } }
+  return manual + tools;
+}
+/* 92755 → 9.3（万字符） */
+function aiWan(n) { return Math.round((n || 0) / 1000) / 10; }
+/* 手册大纲：每节的标题 + 这一节第一句（掐 60 字）。整本 4.9 万字符 → 大约一千字。 */
 function aiManualOutline() {
   const lines = AI_MANUAL.split('\n');
   const out = [];
@@ -24315,7 +24329,7 @@ function aiToolSchemaOne(t) {
            parameters: { type: 'object', properties: props, required: req } } };
 }
 function aiToolSchema() {
-  /* 瘦身模式只发那 7 件套：123 个工具的 schema 有 2.2 万字，小模型塞不下、也用不好。
+  /* 瘦身模式只发那 7 件套：131 个工具的 schema 有 4.4 万字符，小模型塞不下、也用不好。
      剩下的靠 list_tools / tool_help / run_tool 现查，能力一样，只多一跳。 */
   const list = aiSlimOn() ? AI_SLIM_TOOLS.map((n) => AI_BY_NAME[n]).filter(Boolean) : AI_TOOLS;
   return list.map(aiToolSchemaOne);
@@ -24381,7 +24395,7 @@ function aiLocalNote(msg) {
   const keyN = AI.key ? (AI.key.length + ' 位 Key') : '没填 Key';
   el.innerHTML = loc
     ? ('<b style="color:#5ac8a0">本机/内网端点</b>（' + aiEsc(h) + '）：<b>不用填 Key</b>，请求不出公网；' +
-       '提示词现在是' + (aiSlimOn() ? '<b>瘦身版</b>（' + Math.round(aiManualOutline().length / 100) / 10 + ' 千字）' : '完整版（约 6.4 万字符）')) +
+       '提示词现在是' + (aiSlimOn() ? '<b>瘦身版</b>（' + Math.round(aiManualOutline().length / 100) / 10 + ' 千字）' : '完整版（约 ' + aiWan(aiPromptChars()) + ' 万字符）')) +
       '。不知道模型名就按「刷新模型列表」，再从「选择模型」里挑选。'
     : ('云端端点（' + aiEsc(h) + '，' + keyN + '）：提示词和对话会发到这台机器外面。' +
        '想换成自己机器上的大模型，按「探测本机」，或者从左边那一栏挑一个——那种不用 Key、也不出网。') +
@@ -24971,8 +24985,36 @@ function aiAutoMaxTok(stream) {
   if (aiLocalNow() || aiThinkNorm(AI.think) === 'off') return stream ? 4000 : 3000;
   return stream ? 32000 : 24000;
 }
+/* 思维链把输出额度吃光了长什么样：正文空、没有工具调用，但确实思考过
+   （finish_reason = length，或者回来的 reasoning_content 不是空）。 */
+function aiBudgetEaten(msg, finish) {
+  if (!msg) return false;
+  if (String(msg.content || '').trim()) return false;
+  if (msg.tool_calls && msg.tool_calls.length) return false;
+  if (String(msg.reasoning_content || '').trim()) return true;
+  return finish === 'length';
+}
+/* 自动兜底用的两句：一句壳里发的“这一次不许思考”，一句给用户看的发生了什么。
+   为什么要自动：让用户去改「最大输出」治不了根——额度给多大，思维链就能想多久，
+   一样能吃完（实测：32000 也会被吃光）。关掉思考以后额度全归正文，几秒就有结果。 */
+const AI_THINK_DISABLED = { thinking: { type: 'disabled' } };
+const AI_BUDGET_HINT = '注意：你上一条回复把全部输出额度都用在思考上了，正文和工具调用一个都没出来。' +
+  '这一次**不要思考、不要复述手册**：直接给结论，或者直接调用工具把事情做完。回答要短。';
+function aiBudgetNote() {
+  const det = (AI.usage && AI.usage.completion_tokens_details) || {};
+  const rt = det.reasoning_tokens | 0;
+  const cap = (AI.maxTok | 0) > 0 ? (AI.maxTok | 0) : aiAutoMaxTok(true);
+  const bulk = aiPromptChars();
+  aiPush({ role: 'note', k: 'budget-eaten',
+    text: '这一轮的输出额度（' + cap + '）被思维链吃光了' + (rt ? '（思考了 ' + rt + ' 个 token）' : '') +
+      '，正文一个字都没出来。已经自动关掉思考重发一次。' +
+      '为什么会想那么久：一是「思考强度」档位越高它想得越久（「最高 max」是最久的那档），' +
+      '二是提示词每轮都要重发一遍' + (bulk ? '（现在 ' + aiWan(bulk) + ' 万字符：手册正文 + 工具说明）' : '') + '。' +
+      '想快起来：把「思考强度」降一档，或者把「手册与工具」切成「瘦身」（只发 7 个工具 + 手册大纲，其余现查）。' });
+  aiInfo();
+}
 
-async function aiChatFetch(stream, messages, useTools, V, signal, maxTokens) {
+async function aiChatFetch(stream, messages, useTools, V, signal, maxTokens, retry) {
   const rawBase = V ? V.base : AI.base, model = V ? V.model : AI.model;
   /* 最后一道保险：地址不管是旧配置里留下的、手填的、还是 AI 设的，发之前都收拾成能直接发的端点。
      确实补上了就顺手写回去：下次不用再补，设置里也能看见真正发出去的那一截。 */
@@ -24984,12 +25026,18 @@ async function aiChatFetch(stream, messages, useTools, V, signal, maxTokens) {
   const responses = usesResponses(base, model);
   const context = { base: responses ? responsesURL(base) : base, model: model };
   for (let attempt = 0; ; attempt++) {
-    const think = !responses && attempt === 0 ? (V ? null : aiThinkFields()) : null;
+    /* retry = 上一次思维链把额度吃光了，这一次明确要求不思考。
+       thinkBad（端点压根不认这些字段）就什么都不发——那种端点本来也没有思考可关。 */
+    const think = !responses && attempt === 0
+      ? (V ? null : (retry ? (AI.thinkBad ? null : AI_THINK_DISABLED) : aiThinkFields()))
+      : null;
     /* 默认档位下也把上一轮的思维链回传：DeepSeek 官方要求「请求里带 tools 时 reasoning_content 要带上」。
        万一端点不认这个字段，下面那条 4xx 分支会把两者一起摘掉重发。 */
     const withRC = !responses && attempt === 0 && !V && !AI.thinkBad && (aiThinkNorm(AI.think) === 'default' || !!think);
     aiMsgsSysSync(messages);
     const wire = aiMsgsSanitize(messages);
+    /* 重发那一次多说一句：不要思考，直接给结果。只进这一次请求的线，不进对话历史。 */
+    if (retry) wire.push({ role: 'system', content: AI_BUDGET_HINT });
     let sentRC = false;
     if (withRC) for (let i = 0; i < wire.length; i++) if (wire[i] && wire[i].reasoning_content !== undefined) { sentRC = true; break; }
     const url = context.base;
@@ -24999,7 +25047,7 @@ async function aiChatFetch(stream, messages, useTools, V, signal, maxTokens) {
     const body = responses
       ? buildResponsesRequest({ model, messages: aiResponsesMessages(wire, context),
           tools: useTools ? aiToolSchema() : [], stream: !!stream,
-          maxOutputTokens: maxTok, reasoningEffort: AI.think })
+          maxOutputTokens: maxTok, reasoningEffort: retry ? '' : AI.think })
       : { model, messages: aiMsgsWire(wire, withRC), temperature: aiTempNorm(), max_tokens: maxTok, stream: !!stream };
     if (!responses) {
       if (think) Object.assign(body, think);
@@ -25051,25 +25099,34 @@ async function aiChatFetch(stream, messages, useTools, V, signal, maxTokens) {
     return { res: res, think: think, responses: responses, context: context };
   }
 }
-async function aiFetchChat(messages, useTools, vis, signal) {
+async function aiFetchChat(messages, useTools, vis, signal, retry) {
   const V = vis || null;
-  const request = await aiChatFetch(false, messages, useTools, V, signal, aiAutoMaxTok(false));
+  const request = await aiChatFetch(false, messages, useTools, V, signal, aiAutoMaxTok(false), retry);
   const res = request.res;
   const text = await res.text();
   if (!res.ok) {
-    const err = new Error('接口返回 HTTP ' + res.status + '：' + text.slice(0, 400) + aiHttpHint(res.status, context.base));
+    const err = new Error('接口返回 HTTP ' + res.status + '：' + text.slice(0, 400) + aiHttpHint(res.status, request.context.base));
     err.status = res.status;
     throw err;
   }
   let data;
   try { data = JSON.parse(text); } catch (e) { throw new Error('返回的不是 JSON：' + text.slice(0, 200)); }
   if (signal && signal.aborted) throw new DOMException('已取消', 'AbortError');
-  if (request.responses) return aiResponsesResult(decodeResponses(data), request.context);
+  if (request.responses) {
+    const rmsg = aiResponsesResult(decodeResponses(data), request.context);
+    if (!retry && aiBudgetEaten(rmsg, AI.lastFinish)) { aiBudgetNote(); return aiFetchChat(messages, useTools, vis, signal, true); }
+    return rmsg;
+  }
   if (data && data.error) throw new Error('接口报错：' + aiJson(data.error, 300));
   const ch = data && data.choices && data.choices[0];
   if (!ch || !ch.message) throw new Error('返回里没有 choices[0].message');
   if (data.usage) AI.usage = data.usage;
   AI.lastFinish = ch.finish_reason || '';
+  /* 思维链把输出额度吃光了：自己关掉思考重发一次，不把这件事丢给用户。 */
+  if (!retry && aiBudgetEaten(ch.message, AI.lastFinish)) {
+    aiBudgetNote();
+    return aiFetchChat(messages, useTools, vis, signal, true);
+  }
   return ch.message;
 }
 
@@ -25077,9 +25134,9 @@ async function aiFetchChat(messages, useTools, vis, signal) {
    返回的东西跟 aiFetchChat 一样（一个 message 对象），调用方不用管走的哪条路。
    端点不认 stream 的话由调用方退回非流式（见 aiAsk）。
    tool_calls 在流里是一段一段挤出来的：按 index 攒，name 和 arguments 都是拼接。 */
-async function aiFetchChatStream(messages, useTools, vis, onDelta, signal) {
+async function aiFetchChatStream(messages, useTools, vis, onDelta, signal, retry) {
   const V = vis || null;
-  const request = await aiChatFetch(true, messages, useTools, V, signal, aiAutoMaxTok(true));
+  const request = await aiChatFetch(true, messages, useTools, V, signal, aiAutoMaxTok(true), retry);
   const res = request.res;
   if (!res.ok) {
     let t = '';
@@ -25088,7 +25145,15 @@ async function aiFetchChatStream(messages, useTools, vis, onDelta, signal) {
     err.status = res.status;
     throw err;
   }
-  if (request.responses) return aiResponsesResult(await readResponsesStream(res, onDelta, signal), request.context);
+  if (request.responses) {
+    const rmsg = aiResponsesResult(await readResponsesStream(res, onDelta, signal), request.context);
+    if (!retry && aiBudgetEaten(rmsg, AI.lastFinish)) {
+      aiBudgetNote();
+      AI.live = ''; AI.liveThink = '';
+      return aiFetchChatStream(messages, useTools, vis, onDelta, signal, true);
+    }
+    return rmsg;
+  }
   if (res.__nfNoStream || !res.body || typeof res.body.getReader !== 'function') {
     /* 壳子不给流：退回一次性解析（跟非流式一样） */
     const text = await res.text();
@@ -25098,6 +25163,11 @@ async function aiFetchChatStream(messages, useTools, vis, onDelta, signal) {
     if (!ch || !ch.message) throw new Error('返回里没有 choices[0].message');
     if (data.usage) AI.usage = data.usage;
     AI.lastFinish = ch.finish_reason || '';
+    if (!retry && aiBudgetEaten(ch.message, AI.lastFinish)) {
+      aiBudgetNote();
+      AI.live = ''; AI.liveThink = '';
+      return aiFetchChatStream(messages, useTools, vis, onDelta, signal, true);
+    }
     return ch.message;
   }
   const reader = res.body.getReader();
@@ -25152,7 +25222,13 @@ async function aiFetchChatStream(messages, useTools, vis, onDelta, signal) {
   const calls = [];
   for (let i = 0; i < acc.length; i++) if (acc[i]) calls.push(acc[i]);
   for (let i = 0; i < calls.length; i++) if (!calls[i].id) calls[i].id = 'call_' + i;
-  return { content: content, reasoning_content: think, tool_calls: calls.length ? calls : null };
+  const msg = { content: content, reasoning_content: think, tool_calls: calls.length ? calls : null };
+  if (!retry && aiBudgetEaten(msg, AI.lastFinish)) {
+    aiBudgetNote();
+    AI.live = ''; AI.liveThink = '';   /* 上一轮的思考别留在屏幕上，重发那一轮重新显示 */
+    return aiFetchChatStream(messages, useTools, vis, onDelta, signal, true);
+  }
+  return msg;
 }
 
 /* 两条通道都解析：原生 tool_calls 优先，其次回复里的 json 命令块 */
@@ -25348,7 +25424,8 @@ async function aiAsk(text, image) {
            所以直接把该动哪个开关写出来。 */
         const ranOut = !raw && (AI.lastFinish === 'length' || !!String(msg.reasoning_content || '').trim());
         const say = raw || (ranOut
-          ? '（模型思考完却没吐出正文：最大输出被思维链吃光了。设置 → 最大输出 填 32000，或把思考强度降一档，再发一次）'
+          ? '（模型把输出额度全用在思考上了，正文没出来。软件已经自动关掉思考重发过一次，还是没出来。' +
+            '请把设置 → 思考强度 从「最高」降到「高」或「中」，或者把「手册与工具」切成「瘦身」，再发一次）'
           : '(这条没有文字回复)');
         AI.live = ''; AI.liveThink = '';
         aiPush({ role: 'assistant', text: say, think: msg.reasoning_content || '' });
@@ -26304,7 +26381,7 @@ function aiBind() {
     AI.slim = (e.target.value === 'on' || e.target.value === 'off') ? e.target.value : 'auto';
     aiSaveCfg(); aiLocalNote(); aiInfo();
     toast('手册与工具：' + (aiSlimOn() ? '瘦身' : '完整') + '（约 ' +
-      Math.round((aiSlimOn() ? aiManualOutline().length : AI_MANUAL.length) / 100) / 10 + ' 千字提示词）', 'ok');
+      aiWan(aiSlimOn() ? aiManualOutline().length : aiPromptChars()) + ' 万字符提示词）', 'ok');
   });
   bind('ai-toolmode', 'change', (e) => {
     AI.toolMode = (e.target.value === 'native' || e.target.value === 'text') ? e.target.value : 'auto';

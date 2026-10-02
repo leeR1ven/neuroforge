@@ -1074,7 +1074,7 @@ input[type=color]{padding:1px;height:24px;cursor:pointer}
           <option value="auto">自动（本机端点就瘦身）</option>
           <option value="on">瘦身（小上下文模型）</option>
           <option value="off">完整</option>
-        </select><span style="text-align:left;width:auto;color:#93a5b9">完整提示词约 6.4 万字符（约 4 万 token）；瘦身只发 7 个工具 + 手册大纲，其余现查</span></label>
+        </select><span id="ai-slimhint" style="text-align:left;width:auto;color:#93a5b9">完整提示词约 9.3 万字符，每轮都要原样重发；瘦身只发 7 个工具 + 手册大纲，其余现查</span></label>
         <label><span>工具调用</span><select id="ai-toolmode" style="flex:none;width:150px">
           <option value="auto">自动（不认 tools 就退回文字）</option>
           <option value="native">只用原生 tools</option>
