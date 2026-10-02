@@ -1,5 +1,52 @@
 # 修复交接日志
 
+## 2026-10-02：第 79 轮 —— 换成 DeepSeek 后返回 404：地址少了一截，软件没帮他补
+
+### 1. 现象与根因（实测，不是推断）
+
+- 现象：用户把内置 AI 从 OpenAI GPT-6 切成 DeepSeek 之后，请求一律返回 HTTP 404。
+- 实测（读这台机器上的 %APPDATA%\NeuroForge\settings.json）：落盘的 base 是
+  https://api.deepseek.com —— **裸根地址，没有 /v1/chat/completions**。
+- 根因：aiBaseNormalize 本身写得没错（空路径会补 /v1/chat/completions），但它**只在「本地地址」那条路上被调用**：
+  设置面板 ai-base 的处理器上挂着一个 if (v && aiIsLocal(v) ...) 的闸门，注释还明确写着
+  「公网地址一个字都不动」。于是公网根地址被原样存盘、原样 POST → DeepSeek 的根路径没有对话接口 → 404。
+  给 AI 用的 ai_endpoint 工具会规范化，但**手填 / NF.aiConfig / 预设按钮**最终都走 aiSaveCfg 落盘，
+  而那条路上一点规范化都没有——所以「地址少一截」能一路存到设置文件里。
+- 另一条实测：不带 Key 打 https://api.deepseek.com 和 .../v1/chat/completions **都回 401**：
+  DeepSeek 的网关先鉴权再路由，所以没有 Key 时区分不出路径对不对。这也解释了为什么这个坑不容易被自测发现
+  ——纯离线的回归测不到它，只能靠「读真实配置 + 逻辑核对」抓出来。
+
+### 2. 改法（一处规则，四个入口）
+
+- **aiBaseNormalize 成了唯一的规整规则**，并且只补「明显缺一截」的地址：空路径 → /v1/chat/completions；
+  以 /models 结尾 → 换成 /chat/completions；以 /v1（/v1beta 这类版本号）结尾 → 补 /chat/completions。
+  路径里还有别的东西（自定义网关、/deployments/x/chat/completions?api-version=...）**一个字都不动**。
+  另外没写协议时：本机 / 内网默认 http，公网默认 https（以前一律 http，公网网关多半只开 443）。
+- 四个入口全部接上：
+  - **读配置**（aiCfgFromJson，localStorage 和设置文件都走它）—— 存量配置里的裸根地址一进来就修好，用户不用动手；
+  - **落盘**（aiSaveCfg）—— 手填 / NF.aiConfig / 预设按钮 / AI 工具全部汇到这一行；
+  - **发请求前**（aiChatFetch）—— 最后一道保险，并且**补完顺手写回去**（设置里能看到真正发出去的那一截）；
+  - **界面失焦**（ai-base 的 change）—— 取消 aiIsLocal 闸门，公网根地址当场补全并 toast 出来。
+- **404 的报错不再让人猜**：aiHttpHint 把这次真正发出去的 URL 念出来，并指明要写到 /v1/chat/completions 这一层。
+- **加了一个 DeepSeek 一键按钮**（设置面板第一排，挨着 OpenAI GPT-6）：填的是写全的端点 + deepseek-flash；
+  已经在这家且 Key 还在的，只补地址、不重填 Key；从别家切过来则弹框要用户自己给 Key
+  —— **Key 不跨服务商复用**这条老规矩（B02）没破。
+- 手册升到 **r61**，新增一节【接口地址怎么填（换到 DeepSeek 报 404 就是这个）】；README 里的版本号同步。
+
+### 3. 验证
+
+- prototype/check_ai_settings.mjs：新增 1 条（DeepSeek 预设的两种分支 + 三条写入路径都要过规范化），
+  并把「四种写法落到同一个端点」的用例并进了地址规范化那条 —— 28 PASS。
+- prototype/check_b02_keys.mjs：Key 绑定服务地址那 6 条全过（规整后的地址在 aiSvcSame 眼里仍然同源）。
+- 自测页：**1010 PASS / 0 FAIL**（第 35 组那三条「配置落盘」改成断言「只填到 /v1 会被补成完整端点」）。
+- 17 个校验页全过；tools/verify_* 全过；git diff --check 干净。
+
+### 4. 仍然存在的问题
+
+- 不带 Key 时无法从 DeepSeek 的响应里区分「路径错」和「没鉴权」，所以这个坑只能靠上述规则 + 一次性自测覆盖；
+  真要说的话，aiHttpHint 已经把它变成了「看得懂的 404」。
+- 视觉端点（visBase）走同一套规整，但「视觉模型到底认不认图」仍然只由接口回话决定，软件不下结论。
+
 ## 2026-09-22：第 78 轮 —— 训练出来的权重能灌回图里了（F09）：结构指纹 + 权重文档 + 回填
 
 ### 1. 范围与结论

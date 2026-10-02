@@ -22615,12 +22615,14 @@ function aiLoadCfg() {
 }
 function aiCfgFromJson(j) {
   if (typeof j.key === 'string') AI.key = j.key;
-  if (typeof j.base === 'string' && j.base) AI.base = j.base;
+  /* 地址从这里进来就先规范一遍：旧配置里存着裸根地址（https://api.deepseek.com）的，
+     不用用户动手，下一次发请求就是对的端点了。 */
+  if (typeof j.base === 'string' && j.base) AI.base = aiBaseNormalize(j.base);
   if (typeof j.model === 'string' && j.model) AI.model = j.model;
   if (typeof j.extra === 'string') AI.extra = j.extra;
   if (typeof j.autoRun === 'boolean') AI.autoRun = j.autoRun;
   if (typeof j.noAsk === 'boolean') AI.noAsk = j.noAsk;
-  if (typeof j.visBase === 'string') AI.visBase = j.visBase;
+  if (typeof j.visBase === 'string') AI.visBase = aiBaseNormalize(j.visBase);
   if (typeof j.visModel === 'string') AI.visModel = j.visModel;
   if (typeof j.visKey === 'string') AI.visKey = j.visKey;
   if (typeof j.stream === 'boolean') AI.stream = j.stream;
@@ -22673,6 +22675,10 @@ function aiBakKey() {
 function aiSaveCfg(force) {
   AI.key = String(AI.key || "").trim();
   AI.visKey = String(AI.visKey || "").trim();
+  /* 地址落盘前统一收拾干净。这里是唯一的出口：界面手填、NF.aiConfig、AI 工具、
+     预设按钮——全部走这一行，所以只要在这儿规范，就不会再有“地址少一截 → 404”这种事。 */
+  if (AI.base) AI.base = aiBaseNormalize(AI.base) || AI.base;
+  if (AI.visBase) AI.visBase = aiBaseNormalize(AI.visBase) || AI.visBase;
   /* 换了接口（云端 ↔ 本机）系统提示词那一版就不对了：在这儿顺手换掉，不用等到发出去才发现。 */
   aiMsgsSysSync(AI.msgs);
   if (!force) {
@@ -22889,6 +22895,79 @@ function aiOpenGpt6Preset() {
     document.addEventListener('keydown', onKey, true); el.addEventListener('mousedown', onOutside);
     el.querySelector('#ai-gpt6-cancel').addEventListener('click', () => finish(false));
     el.querySelector('#ai-gpt6-apply').addEventListener('click', apply);
+    input.focus();
+  });
+}
+/* DeepSeek 一键预设。为什么要有这个按钮：这家的根地址长得像能用（https://api.deepseek.com），
+   手填很容易只填到根，发出去就是 404。按钮填的是写全的端点，不会踩这个坑。
+   跟 GPT-6 一样：换服务商要用户自己给 Key——Key 不跨服务商复用（审计 B02）。
+   已经在这家、Key 也还在的（比如只是地址少了一截）：只把地址和模型补正，Key 原样留着，不弹框。 */
+const AI_DEEPSEEK_BASE = 'https://api.deepseek.com/v1/chat/completions';
+function aiDeepseekKeySaved() {
+  try { return new URL(AI.base).hostname.toLowerCase() === 'api.deepseek.com' && !!String(AI.key || '').trim(); } catch (e) { return false; }
+}
+function aiApplyDeepseekPreset(key) {
+  const value = String(key || '').trim();
+  if (!value || AI.busy) return false;
+  AI.base = AI_DEEPSEEK_BASE; AI.model = 'deepseek-flash'; AI.key = value;
+  AI.visBase = ''; AI.visModel = ''; AI.visKey = '';
+  AI.thinkBad = false; AI.thinkNote = ''; AI.streamBad = false; AI.netVia = ''; AI.netNote = '';
+  aiSaveCfg(true);   /* 用户明确换凭证：同时更新备份，不能捡回旧服务商的 Key。 */
+  aiFillCfg(); aiInfo();
+  toast('已应用 DeepSeek。视觉跟随主接口；发送消息或测试连接时才会发起请求。', 'ok');
+  return true;
+}
+function aiUseDeepseek() {
+  if (AI.busy) { toast('AI 正在回复，请停止或等回复结束后再切换接口。', 'warn'); return false; }
+  AI.base = AI_DEEPSEEK_BASE;
+  if (!AI.model || /^deepseek/i.test(AI.model)) AI.model = 'deepseek-flash';
+  AI.thinkBad = false; AI.thinkNote = ''; AI.streamBad = false; AI.netVia = ''; AI.netNote = '';
+  aiSaveCfg(); aiFillCfg(); aiInfo();
+  toast('已切到 DeepSeek：' + AI.model + '，地址 ' + AI.base + '（Key 沿用）', 'ok');
+  return true;
+}
+function aiOpenDeepseekPreset() {
+  if (AI.busy) { toast('AI 正在回复，请停止或等回复结束后再切换接口。', 'warn'); return Promise.resolve(false); }
+  /* 已经在这家（只是地址可能少了一截）：直接补正，不弹框、不重填 Key。 */
+  if (aiDeepseekKeySaved() && (!AI.model || /^deepseek/i.test(AI.model))) return Promise.resolve(aiUseDeepseek());
+  const savedDeepseekKey = aiDeepseekKeySaved();
+  const keyHelp = savedDeepseekKey
+    ? '<b>已保存 DeepSeek API Key。</b>此输入框仅用于更换 Key，所以保持空白，无需重复填写。点“取消”继续使用原 Key。原有 Key 不会跨服务商复用。'
+    : '原有 Key 不会跨服务商复用，请填写 <b>DeepSeek API Key</b>。';
+  return new Promise((resolve) => {
+    const el = nfAskBox('<div role="dialog" aria-modal="true" aria-labelledby="ai-ds-title" style="' + NF_CARD + '">' +
+      '<div id="ai-ds-title" style="padding:12px 16px;border-bottom:1px solid #2a3546;font-weight:600">DeepSeek</div>' +
+      '<div style="padding:14px 16px;line-height:1.75">应用后主接口切换为 <b>deepseek-flash</b>，地址为 ' + aiEsc(AI_DEEPSEEK_BASE) + '（写全的端点；只填 https://api.deepseek.com 这种根地址发出去是 404），视觉也跟随主接口。' +
+      '<br>' + keyHelp + '取消会保留当前所有配置；应用仅保存设置，不会立即发送请求。</div>' +
+      '<div style="padding:0 16px"><label for="ai-ds-key">DeepSeek API Key</label>' +
+      '<input id="ai-ds-key" type="password" autocomplete="off" spellcheck="false" placeholder="' + (savedDeepseekKey ? '仅更换 Key 时填写；取消继续使用已保存的 Key' : '填写 DeepSeek API Key') + '" style="width:100%;box-sizing:border-box;margin-top:6px;padding:8px;border-radius:6px;border:1px solid #2a3546;background:#0a0f17;color:#dbe6f3;font:inherit">' +
+      '<div id="ai-ds-error" role="status" style="min-height:24px;color:#e0a24a;padding-top:4px"></div></div>' +
+      '<div style="display:flex;gap:10px;justify-content:flex-end;padding:0 16px 14px">' +
+      '<button id="ai-ds-cancel" style="' + NF_BTN + '">取消</button>' +
+      '<button id="ai-ds-apply" style="' + NF_BTN_PRI + '">应用</button></div></div>');
+    const input = el.querySelector('#ai-ds-key'), error = el.querySelector('#ai-ds-error');
+    let done = false;
+    const finish = (applied) => {
+      if (done) return;
+      done = true; input.value = ''; document.removeEventListener('keydown', onKey, true);
+      el.removeEventListener('mousedown', onOutside); nfAskClose(); resolve(applied);
+    };
+    const apply = () => {
+      if (!input.value.trim()) {
+        error.textContent = savedDeepseekKey ? '已保存 Key；无需更换时请点“取消”继续使用。更换时请填写新的 DeepSeek API Key。' : '请填写 DeepSeek API Key；当前配置尚未改变。';
+        input.focus(); return;
+      }
+      if (!aiApplyDeepseekPreset(input.value)) { error.textContent = 'AI 正在回复，请停止或等回复结束后再应用。'; return; }
+      finish(true);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(false); }
+      else if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); e.stopPropagation(); apply(); }
+    };
+    const onOutside = (e) => { if (e.target === el) finish(false); };
+    document.addEventListener('keydown', onKey, true); el.addEventListener('mousedown', onOutside);
+    el.querySelector('#ai-ds-cancel').addEventListener('click', () => finish(false));
+    el.querySelector('#ai-ds-apply').addEventListener('click', apply);
     input.focus();
   });
 }
@@ -24309,12 +24388,18 @@ function aiLocalNote(msg) {
       (aiSlimOn() ? ' 现在发的是瘦身提示词。' : '');
 }
 /* 把一个地址规范成能直接发的轻量端点：只给根（或只给 /v1）也能用。
-   为什么要这一步：本地服务的文档里地址写法各不相同（http://127.0.0.1:11434 / .../v1 / .../v1/chat/completions），
-   让用户（和 AI）去背哪个对哪个不对，不如这里一次性收拾干净。 */
+   为什么要这一步：各家文档里地址写法各不相同（https://api.deepseek.com / .../v1 / .../v1/chat/completions），
+   让用户（和 AI）去背哪个对哪个不对，不如这里一次性收拾干净。
+   这不是小事：只填根地址（比如 https://api.deepseek.com）直接发出去就是 **404**，
+   看起来像“服务没开”，其实只是地址少了一截。规则只有一条：**只补“明显缺一截”的地址**
+   （空路径、/v1 这种版本号结尾、/models 结尾）；路径里还有别的东西（自定义网关、带 deployment 的）
+   一个字都不动——那种端点的路径本来就是怪的。 */
 function aiBaseNormalize(v) {
   let b = String(v || '').trim();
   if (!b) return '';
-  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(b)) b = 'http://' + b;
+  /* 没写协议时的默认：本机 / 内网用 http（Ollama 这些多半没证书），公网用 https。
+     公网默认成 http 是个坑：很多网关只开 443，而且页面从 https 载入时 http 请求会被当成混合内容拦下来。 */
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(b)) b = (aiHostLocal(aiBaseHost(b)) ? 'http://' : 'https://') + b;
   try {
     const u = new URL(b);
     let path = u.pathname.replace(/\/+$/, '');
@@ -24664,6 +24749,14 @@ function aiNetOnce() {
     '代价是这条通道发不出流式，回答会一次性出来。' });
   aiInfo();
 }
+/* 404 是 4xx 里最容易自己修好的一类：不是服务没开，是地址少一截。
+   把真正发出去的地址念出来，别让人对着一句「404」猜。其他状态码不插话。 */
+function aiHttpHint(status, url) {
+  if (status !== 404) return '';
+  return '。这次请求发到的是 ' + String(url || '') + '——404 基本都是路径不对：OpenAI 兼容端点要写到 /v1/chat/completions 这一层' +
+    '（DeepSeek 官方的 https://api.deepseek.com 是根地址，直接当接口发就是 404）。' +
+    '把「接口地址」改成 https://api.deepseek.com/v1/chat/completions 就行；只填到 .../v1 也行，软件会自动补全。';
+}
 /* 直连失败时给的话：分三种原因说清，别让人对着「连不上」发呆 */
 function aiNetHint(url) {
   if (!aiIsLocal(url)) return '。如果是跨域或被网络挡住了，检查「接口地址」，或换一个 OpenAI 兼容端点。';
@@ -24880,7 +24973,14 @@ function aiAutoMaxTok(stream) {
 }
 
 async function aiChatFetch(stream, messages, useTools, V, signal, maxTokens) {
-  const base = V ? V.base : AI.base, model = V ? V.model : AI.model;
+  const rawBase = V ? V.base : AI.base, model = V ? V.model : AI.model;
+  /* 最后一道保险：地址不管是旧配置里留下的、手填的、还是 AI 设的，发之前都收拾成能直接发的端点。
+     确实补上了就顺手写回去：下次不用再补，设置里也能看见真正发出去的那一截。 */
+  const base = aiBaseNormalize(rawBase) || rawBase;
+  if (base && base !== rawBase) {
+    if (V) { V.base = base; if (AI.visBase === rawBase) AI.visBase = base; }
+    else { AI.base = base; aiSaveCfg(); }
+  }
   const responses = usesResponses(base, model);
   const context = { base: responses ? responsesURL(base) : base, model: model };
   for (let attempt = 0; ; attempt++) {
@@ -24940,7 +25040,7 @@ async function aiChatFetch(stream, messages, useTools, V, signal, maxTokens) {
       /* 报文在说消息数组不合法，就跟思考字段没关系：把真实的错抛上去，
          别把「这个端点不认思考参数」这个错结论锁死。 */
       if (AI.thinkBad || aiErrIsMsgArray(t)) {
-        const err = new Error('接口返回 HTTP ' + res.status + '：' + String(t).slice(0, 400));
+        const err = new Error('接口返回 HTTP ' + res.status + '：' + String(t).slice(0, 400) + aiHttpHint(res.status, url));
         err.status = res.status;
         throw err;
       }
@@ -24957,7 +25057,7 @@ async function aiFetchChat(messages, useTools, vis, signal) {
   const res = request.res;
   const text = await res.text();
   if (!res.ok) {
-    const err = new Error('接口返回 HTTP ' + res.status + '：' + text.slice(0, 400));
+    const err = new Error('接口返回 HTTP ' + res.status + '：' + text.slice(0, 400) + aiHttpHint(res.status, context.base));
     err.status = res.status;
     throw err;
   }
@@ -24984,7 +25084,7 @@ async function aiFetchChatStream(messages, useTools, vis, onDelta, signal) {
   if (!res.ok) {
     let t = '';
     try { t = await res.text(); } catch (e) {}
-    const err = new Error('接口返回 HTTP ' + res.status + '：' + String(t).slice(0, 400));
+    const err = new Error('接口返回 HTTP ' + res.status + '：' + String(t).slice(0, 400) + aiHttpHint(res.status, request.context.base));
     err.status = res.status;
     throw err;
   }
@@ -26161,6 +26261,7 @@ function aiBind() {
   });
   const bind = (id, ev2, fn) => { const el = document.getElementById(id); if (el) el.addEventListener(ev2, fn); };
   bind('ai-openai-gpt6', 'click', () => { aiOpenGpt6Preset(); });
+  bind('ai-deepseek', 'click', () => { aiOpenDeepseekPreset(); });
   /* Key 这类东西**边打边存**：以前只在失焦（change）时才写，用户打完直接关窗口就白输一遍。
      现在停下来 400ms 就写一次，关窗口前还会再冲一次（见这个函数末尾的 pagehide）。 */
   const liveSave = (id, apply) => {
@@ -26178,14 +26279,12 @@ function aiBind() {
   liveSave('ai-key', (el) => { AI.key = String(el.value || "").trim(); aiModelListRender(); });
   liveSave('ai-vkey', (el) => { AI.visKey = String(el.value || "").trim(); });
   bind('ai-base', 'change', (e) => {
-    let v = e.target.value.trim();
-    /* 本地服务的地址写法什么样都有（只写 host、写 /v1、写全路径）。本地地址就顺手补全，
-       省得「地址填对了但少一截」被当成服务没开。公网地址一个字都不动：有些端点
-       的路径就是很怪（比如带 deployment 的那种）。 */
-    if (v && aiIsLocal(v) && !/\/chat\/completions$/i.test(v)) {
-      const nb = aiBaseNormalize(v);
-      if (nb && nb !== v) { v = nb; toast('本地地址补全成 ' + nb, 'ok'); }
-    }
+    /* 只给根（https://api.deepseek.com）或者只给 /v1 的地址，这里一律补成完整端点：
+       根路径直接发出去就是 404（DeepSeek 就是这样），不能再把公网地址原样存起来。
+       规整规则见 aiBaseNormalize：只补“明显缺一截”的，路径里有自己东西的（自定义网关 / 带 deployment）不动。 */
+    let v = String(e.target.value || '').trim();
+    const nb = aiBaseNormalize(v);
+    if (nb && nb !== v) { v = nb; toast('接口地址补全成 ' + nb, 'ok'); }
     if (v) e.target.value = v;
     AI.base = v || AI.base;
     AI.netVia = '';              /* 换了地址，重新判断走直连还是内部通道 */

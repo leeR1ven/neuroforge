@@ -39,7 +39,10 @@ function harness() {
   box.aiCfgJson = () => ({ key: box.AI.key, base: box.AI.base, model: box.AI.model,
     visBase: box.AI.visBase, visModel: '', visKey: box.AI.visKey, at: box.AI.cfgAt });
   const ctx = vm.createContext(box);
-  vm.runInContext(block('aiSvcOf') + '\n' + block('aiSvcSame') + '\n' + block('aiSaveCfg') +
+  /* aiSaveCfg 现在会把地址先规范一遍（根地址补成 /v1/chat/completions），
+     所以规范那几个函数也要一并载进来。 */
+  vm.runInContext(block('aiSvcOf') + '\n' + block('aiSvcSame') + '\n' + block('aiBaseHost') + '\n' +
+    block('aiHostLocal') + '\n' + block('aiBaseNormalize') + '\n' + block('aiSaveCfg') +
     '\nvar SAVE = aiSaveCfg; var SVC = aiSvcSame;', ctx);
   box.store = store;
   return box;

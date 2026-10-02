@@ -55,7 +55,8 @@ function context() {
   c.nfAskBox = (html) => {
     c.dialogHtml = html;
     c.dialog = element();
-    c.dialogFields = new Map(['ai-gpt6-key', 'ai-gpt6-error', 'ai-gpt6-cancel', 'ai-gpt6-apply'].map((id) => [id, element()]));
+    c.dialogFields = new Map(['ai-gpt6-key', 'ai-gpt6-error', 'ai-gpt6-cancel', 'ai-gpt6-apply',
+      'ai-ds-key', 'ai-ds-error', 'ai-ds-cancel', 'ai-ds-apply'].map((id) => [id, element()]));
     c.dialog.querySelector = (selector) => c.dialogFields.get(selector.replace(/^#/, ''));
     return c.dialog;
   };
@@ -67,8 +68,11 @@ function context() {
   vm.createContext(c);
   const constants = source.match(/^const AI_THINK = \[[\s\S]*?^\];/m);
   assert.ok(constants, 'missing AI_THINK');
-  vm.runInContext(constants[0] + '\n' + ['aiEsc', 'aiThinkNorm', 'aiThinkLabel', 'aiThinkNote', 'aiThinkFields',
+  const dsBase = source.match(/^const AI_DEEPSEEK_BASE = '[^']*';/m);
+  assert.ok(dsBase, 'missing AI_DEEPSEEK_BASE');
+  vm.runInContext(constants[0] + '\n' + dsBase[0] + '\n' + ['aiEsc', 'aiThinkNorm', 'aiThinkLabel', 'aiThinkNote', 'aiThinkFields',
     'aiIsGpt6Config', 'aiApplyGpt6Preset', 'aiOpenGpt6Preset', 'aiBaseNormalize', 'aiBaseRoot',
+    'aiBaseHost', 'aiHostLocal', 'aiDeepseekKeySaved', 'aiApplyDeepseekPreset', 'aiUseDeepseek', 'aiOpenDeepseekPreset',
     'aiModelsScope', 'aiModelsScopeSame', 'aiModelsOnce', 'aiShellGet', 'aiLocalProbe'].map(functionSource).join('\n'), c);
   return c;
 }
@@ -97,6 +101,13 @@ await test('URL normalization preserves Responses, version roots, custom paths a
     ['https://service.invalid/v3/models', 'https://service.invalid/v3/chat/completions'],
     ['https://service.invalid/deployments/demo/chat/completions?api-version=2026-09-22', 'https://service.invalid/deployments/demo/chat/completions?api-version=2026-09-22'],
     ['https://service.invalid/custom/infer?route=test', 'https://service.invalid/custom/infer?route=test'],
+    /* 用户真实碰到的那一类：只填到根地址（发出去 404）。四种写法必须落到同一个端点。 */
+    ['https://api.deepseek.com', 'https://api.deepseek.com/v1/chat/completions'],
+    ['https://api.deepseek.com/', 'https://api.deepseek.com/v1/chat/completions'],
+    ['https://api.deepseek.com/v1', 'https://api.deepseek.com/v1/chat/completions'],
+    ['https://api.deepseek.com/v1/', 'https://api.deepseek.com/v1/chat/completions'],
+    ['api.deepseek.com/v1/chat/completions', 'https://api.deepseek.com/v1/chat/completions'],
+    ['https://api.deepseek.com/v1/responses', 'https://api.deepseek.com/v1/responses'],
   ];
   for (const [input, expected] of pairs) assert.equal(c.aiBaseNormalize(input), expected, input);
 });
@@ -401,6 +412,40 @@ await test('responses from an old endpoint or key cannot repopulate or overwrite
       assert.equal(c.AI.model, 'old-model'); assert.equal(c.saves.length, 0);
     }
   }
+});
+
+await test('the DeepSeek preset writes the full chat endpoint; an existing DeepSeek key is kept, a foreign one must be re-entered', async () => {
+  assert.match(template, /id="ai-deepseek"[^>]*>DeepSeek<\/button>/);
+  assert.match(source, /bind\('ai-deepseek', 'click', \(\) => \{ aiOpenDeepseekPreset\(\); \}\)/);
+  /* 三条写入路径都要过规范：读旧配置、落盘、发请求前。 */
+  assert.match(source, /AI\.base = aiBaseNormalize\(j\.base\)/);
+  assert.match(source, /if \(AI\.base\) AI\.base = aiBaseNormalize\(AI\.base\) \|\| AI\.base;/);
+
+  /* 已经在这家（只是地址少了一截）：不弹框，只补地址，Key 不丢 */
+  const c = context();
+  c.AI.base = 'https://api.deepseek.com'; c.AI.model = 'deepseek-flash'; c.AI.key = 'FAKE-DS-KEY';
+  assert.equal(await c.aiOpenDeepseekPreset(), true);
+  assert.equal(c.dialog, undefined);
+  assert.equal(c.AI.base, 'https://api.deepseek.com/v1/chat/completions');
+  assert.equal(c.AI.model, 'deepseek-flash');
+  assert.equal(c.AI.key, 'FAKE-DS-KEY');
+  assert.equal(c.saves.length, 1); assert.equal(c.saves[0].force, undefined);
+
+  /* 从别家切过来：Key 不跨服务商复用，要用户自己填 */
+  const c2 = context();
+  const done = c2.aiOpenDeepseekPreset();
+  assert.ok(c2.dialogHtml.includes('https://api.deepseek.com/v1/chat/completions'));
+  assert.ok(!c2.dialogHtml.includes(c2.AI.key));
+  c2.dialogFields.get('ai-ds-apply').fire('click');
+  assert.match(c2.dialogFields.get('ai-ds-error').textContent, /请填写 DeepSeek API Key/);
+  assert.equal(c2.saves.length, 0);
+  c2.dialogFields.get('ai-ds-key').value = 'FAKE-NEW-DS-KEY';
+  c2.dialogFields.get('ai-ds-apply').fire('click');
+  assert.equal(await done, true);
+  assert.equal(c2.AI.base, 'https://api.deepseek.com/v1/chat/completions');
+  assert.equal(c2.AI.model, 'deepseek-flash');
+  assert.equal(c2.AI.key, 'FAKE-NEW-DS-KEY');
+  assert.equal(c2.saves.length, 1); assert.equal(c2.saves[0].force, true);
 });
 
 await test('empty model lists and HTTP errors preserve the configured model; errors keep the last usable list', async () => {

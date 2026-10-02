@@ -3691,18 +3691,19 @@ const TEST = `
           log(NF.aiState().cfgDir === boot35.dir && NF.aiState().cfgFile === boot35.settings,
               '配置落盘：状态里的目录跟这一步报的一致');
         } else {
+          /* 只给到 /v1 的地址会被规范成 /v1/chat/completions 再落盘（不补的话发出去就是 404）。 */
           NF.aiConfig({ base: 'https://example.invalid/v1', model: 'q35-model' });
           await raf();
           const j35 = (() => { try { return JSON.parse(localStorage.getItem('nf.ai') || '{}'); } catch (e) { return null; } })();
-          log(!!j35 && j35.base === 'https://example.invalid/v1' && j35.model === 'q35-model' && typeof j35.at === 'number',
-              '配置落盘：改完设置立刻写进本机存储，并带上时间戳', JSON.stringify(j35).slice(0, 110));
+          log(!!j35 && j35.base === 'https://example.invalid/v1/chat/completions' && j35.model === 'q35-model' && typeof j35.at === 'number',
+              '配置落盘：改完设置立刻写进本机存储、带上时间戳，并把只填到 /v1 的地址补成完整端点', JSON.stringify(j35).slice(0, 110));
           log(!!boot35 && boot35.ok === false && String(boot35.why || '').indexOf('localStorage') >= 0,
               '配置落盘：浏览器版跑开机读配置会老实说只有本机存储一份', JSON.stringify(boot35));
-          log(NF.aiState().base === 'https://example.invalid/v1' && NF.aiState().model === 'q35-model',
-              '配置落盘：读回来还是刚才那份，没有被就地改掉');
+          log(NF.aiState().base === 'https://example.invalid/v1/chat/completions' && NF.aiState().model === 'q35-model',
+              '配置落盘：读回来还是刚才那份（地址已规范化），没有被就地改掉');
           NF.aiConfig({ base: 'https://api.deepseek.com/v1', model: 'deepseek-flash' });
           await raf();
-          log(NF.aiState().base === 'https://api.deepseek.com/v1' && NF.aiState().model === 'deepseek-flash',
+          log(NF.aiState().base === 'https://api.deepseek.com/v1/chat/completions' && NF.aiState().model === 'deepseek-flash',
               '配置落盘：改回来也立刻生效（这一组不给用户留副作用）');
         }
 

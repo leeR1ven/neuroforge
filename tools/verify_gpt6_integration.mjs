@@ -42,6 +42,8 @@ const actualFunctions = [
   'aiSessSig', 'aiSessSnap', 'aiSessDropOldest', 'aiSessTrim', 'aiSessDoc', 'aiSessMs', 'aiNoteKey',
   'aiLogClean', 'aiSessNorm', 'aiSessLabel', 'aiSessUse', 'aiSessImport',
   'aiResponsesConnectionTest', 'aiLocalTest', 'aiCfgJson', 'aiSaveCfg', 'aiAdoptCfg', 'aiSysKv',
+  /* aiSaveCfg / aiChatFetch 都会先把地址规范成能直接发的端点，404 提示也在那一段 */
+  'aiBaseHost', 'aiHostLocal', 'aiBaseNormalize', 'aiHttpHint',
 ];
 
 function harness(overrides = {}) {

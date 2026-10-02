@@ -14,7 +14,7 @@
       接口清单是每次开对话时从活的 NF 对象上现扫的，永远和代码同步。
    ========================================================================== */
 
-export const AI_MANUAL_VERSION = 'r60';
+export const AI_MANUAL_VERSION = 'r61';
 
 /* 顶部菜单里的命令（cmd 值 = 界面上的 data-cmd，可以用 menu 工具直接调用） */
 export const AI_MENU_COMMANDS = [
@@ -469,6 +469,18 @@ C. 手动点（A 模式点视口）
   新建工程 = 一段干净的新对话。细节见下面【对话存档】那一节。
 - 每次提问默认最多来回 80 轮工具调用（「设置 → 最多来回」里可改 4–400），到上限会停下来等用户再说一句。
 - 你说的每一步都会进对话记录并显示给用户看，所以别在文字里重复贴一遍。
+
+【接口地址怎么填（换到 DeepSeek 报 404 就是这个）】—— r61 新增
+- 只填到根（https://api.deepseek.com）或者只填到版本号（https://api.deepseek.com/v1）都会被自动补成
+  完整端点 https://api.deepseek.com/v1/chat/completions：手填失焦时补、读旧配置时补、落盘前补、发请求前也补。
+  你给用户设地址时，给根、给 /v1、给全路径都行；但心里要清楚：**直接 POST 根路径就是 404**，
+  不是“服务没开”。报错里会带上这次真正发出去的地址，先看那一行。
+- “设置”里第一排有 DeepSeek 和 OpenAI GPT-6 两个一键按钮。DeepSeek 按钮填的是写全的地址 + deepseek-flash；
+  已经在这家且 Key 还在的，只补地址、不重填 Key。**Key 不跨服务商复用**：从 OpenAI 切到 DeepSeek
+  会要用户自己填新 Key（不能把 A 家的凭证发给 B 家）。
+- 自定义网关、带 deployment 的怪路径（.../deployments/x/chat/completions?api-version=...）一个字都不动。
+- 脚本接口：NF.aiConfig({base}) 会顺手规范化，NF.aiState().base 看到的就是真正发出去的那个地址；
+  一键切用 NF.aiEndpoint({ base: 'https://api.deepseek.com' })。
 
 【剪枝与清理】（增强 → 剪枝与清理，或 NF.pruneByWeight / NF.pruneRandom / NF.pruneUnused / NF.pruneOrphans）
 - 按权重阈值剪：|w| < 阈值 的连接可以「归 0」（连接还在，可视化还在，编译出来等于没接）

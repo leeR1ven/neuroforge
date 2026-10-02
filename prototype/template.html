@@ -1052,8 +1052,9 @@ input[type=color]{padding:1px;height:24px;cursor:pointer}
         <div class="hint" id="ai-modelnote" role="status" style="margin:0 0 4px"></div>
         <div class="hint" id="ai-locnote" style="margin:0 0 4px"></div>
         <div class="row" style="flex-wrap:wrap;gap:6px;margin-bottom:5px">
+          <button id="ai-deepseek" type="button" title="一键切到 DeepSeek 官方：地址写到 https://api.deepseek.com/v1/chat/completions（只填根地址直接发出去就是 404，这里直接写全），模型 deepseek-flash。已经在这家且 Key 还在的，只补地址，不重填 Key。">DeepSeek</button>
           <button id="ai-openai-gpt6" type="button" title="填写 OpenAI API Key 后应用 GPT-6 预设；取消保持当前配置，不会自动发送请求">OpenAI GPT-6</button>
-          <span class="hint">填写 OpenAI Key 后切换；原有 Key 不会跨服务商复用。</span>
+          <span class="hint">一键切换服务商；换到别家时原有 Key 不会跨服务商复用。</span>
         </div>
         <div class="row" style="flex-wrap:wrap;gap:4px">
           <select id="ai-local-preset" style="flex:1 1 150px" title="常见本地推理服务：选中后按「填地址」就填好了，不用自己记端口"></select>
@@ -1065,6 +1066,7 @@ input[type=color]{padding:1px;height:24px;cursor:pointer}
         <label><span>API Key</span><input id="ai-key" type="password" placeholder="sk-...（存在本机，不上传别处；打完自动保存）"></label>
         <div class="hint" id="ai-keynote" style="margin:0 0 2px"></div>
         <label><span>接口地址</span><input id="ai-base" type="text" placeholder="https://api.deepseek.com/v1/chat/completions"></label>
+        <div class="hint" id="ai-basehint" data-i18n="h-aibase" style="margin:0 0 2px">地址只填到 <b>https://api.deepseek.com</b> 或 <b>.../v1</b> 也行，按回车 / 离开输入框时会自动补成 /v1/chat/completions（<b>只填根地址直接发出去就是 404</b>，这就是很多人换到 DeepSeek 后报 404 的原因）。自定义网关、带 deployment 那种路径一个字都不动。</div>
         <label><span>温度</span><input id="ai-temp" type="text" style="flex:none;width:62px" placeholder="0.2"><span id="ai-tempnote" style="text-align:left;width:auto;color:#93a5b9">0–2，越大越放飞。本地小模型老重复 / 老跑偏时动它</span></label>
         <label><span>最大输出</span><input id="ai-maxtok" type="text" style="flex:none;width:72px" placeholder="0"><span style="text-align:left;width:auto;color:#93a5b9">一次最多吐多少 token，0 = 用默认（3000 / 流式 4000）。本地模型显存小就压到 512–2048</span></label>
         <label><span>思考强度</span><select id="ai-think"></select></label>
